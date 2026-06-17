@@ -158,6 +158,27 @@ export async function deleteSession(sessionId: string): Promise<void> {
   return invoke<void>("delete_session", { sessionId });
 }
 
+export async function cancelSession(sessionId: string): Promise<EventRecord> {
+  assertTauri();
+  return invoke<EventRecord>("cancel_session", { sessionId });
+}
+
+export async function updateSessionTitle(input: {
+  sessionId: string;
+  title: string;
+}): Promise<SessionRecord> {
+  assertTauri();
+  return invoke<SessionRecord>("update_session_title", { input });
+}
+
+export async function updateSessionMode(input: {
+  sessionId: string;
+  mode: AgentMode;
+}): Promise<SessionRecord> {
+  assertTauri();
+  return invoke<SessionRecord>("update_session_mode", { input });
+}
+
 export async function getSessionEvents(
   sessionId: string
 ): Promise<SessionEventsResponse> {

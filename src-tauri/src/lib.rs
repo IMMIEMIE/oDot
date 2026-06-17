@@ -12,7 +12,7 @@ use tauri::AppHandle;
 use types::{
     ContextSummaryRecord, CreateSessionInput, EventRecord, ProjectFile, ProviderConfigFileResponse,
     ProviderInput, ProviderRecord, SessionEventsResponse, SessionRecord, ShellPolicy,
-    SnapshotRecord, SubmitPromptInput,
+    SnapshotRecord, SubmitPromptInput, UpdateSessionModeInput, UpdateSessionTitleInput,
 };
 
 #[tauri::command]
@@ -66,6 +66,30 @@ fn list_sessions(app: AppHandle) -> Result<Vec<SessionRecord>, String> {
 fn delete_session(app: AppHandle, session_id: String) -> Result<(), String> {
     let conn = storage::open_db(&app)?;
     storage::delete_session(&conn, &session_id)
+}
+
+#[tauri::command]
+fn cancel_session(app: AppHandle, session_id: String) -> Result<EventRecord, String> {
+    let conn = storage::open_db(&app)?;
+    storage::cancel_session(&conn, &session_id)
+}
+
+#[tauri::command]
+fn update_session_title(
+    app: AppHandle,
+    input: UpdateSessionTitleInput,
+) -> Result<SessionRecord, String> {
+    let conn = storage::open_db(&app)?;
+    storage::update_session_title(&conn, &input.session_id, &input.title)
+}
+
+#[tauri::command]
+fn update_session_mode(
+    app: AppHandle,
+    input: UpdateSessionModeInput,
+) -> Result<SessionRecord, String> {
+    let conn = storage::open_db(&app)?;
+    storage::update_session_mode(&conn, &input.session_id, input.mode)
 }
 
 #[tauri::command]
@@ -168,6 +192,9 @@ pub fn run() {
             create_session,
             list_sessions,
             delete_session,
+            cancel_session,
+            update_session_title,
+            update_session_mode,
             get_session_events,
             submit_prompt,
             continue_session,

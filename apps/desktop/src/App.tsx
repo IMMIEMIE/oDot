@@ -3,6 +3,7 @@ import {
   Bot,
   BrainCircuit,
   Check,
+  ChevronLeft,
   ChevronDown,
   ChevronRight,
   Clock3,
@@ -12,6 +13,7 @@ import {
   History,
   KeyRound,
   Loader2,
+  Pencil,
   Play,
   RefreshCw,
   RotateCcw,
@@ -23,11 +25,12 @@ import {
   Wrench,
   X
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent, ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import {
   approveToolCall,
+  cancelSession,
   compactSession,
   continueSession,
   createSession,
@@ -43,6 +46,8 @@ import {
   saveProviderConfig,
   saveShellPolicy,
   submitPrompt,
+  updateSessionMode,
+  updateSessionTitle,
   type AgentMode,
   type EventRecord,
   type ProjectFile,
@@ -65,6 +70,8 @@ type Notice = {
   tone: "info" | "success" | "error";
   text: string;
 };
+
+type ThemeMode = "system" | "light" | "dark";
 
 type TreeNode = {
   type: "dir" | "file";
@@ -105,20 +112,73 @@ export function App() {
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
   const [isCreatingSession, setIsCreatingSession] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isContinuing, setIsContinuing] = useState(false);
+  const [isStopping, setIsStopping] = useState(false);
   const [isMutating, setIsMutating] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
+  const [editingSessionTitle, setEditingSessionTitle] = useState("");
+  const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
+    const stored = localStorage.getItem("odot.themeMode");
+    return stored === "light" || stored === "dark" || stored === "system" ? stored : "system";
+  });
+  const timelineEndRef = useRef<HTMLDivElement | null>(null);
+  const liveRefreshTimerRef = useRef<number | undefined>(undefined);
+  const stopRefreshTimerRef = useRef<number | undefined>(undefined);
+  const activeRunIdRef = useRef(0);
+  const stopBaselineSeqRef = useRef(0);
   const [leftWidth, setLeftWidth] = useState(() => {
     const stored = Number(localStorage.getItem("odot.leftWidth"));
     return Number.isFinite(stored) && stored >= 300 ? stored : 420;
   });
+  const [isRightPaneCollapsed, setIsRightPaneCollapsed] = useState(false);
 
   useEffect(() => {
     void bootstrap();
+    return () => {
+      if (liveRefreshTimerRef.current) {
+        window.clearInterval(liveRefreshTimerRef.current);
+      }
+      if (stopRefreshTimerRef.current) {
+        window.clearInterval(stopRefreshTimerRef.current);
+      }
+    };
   }, []);
 
   useEffect(() => {
     localStorage.setItem("odot.leftWidth", String(leftWidth));
   }, [leftWidth]);
+
+  useEffect(() => {
+    localStorage.setItem("odot.themeMode", themeMode);
+  }, [themeMode]);
+
+  useEffect(() => {
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+
+    function applyTheme(mode: ThemeMode) {
+      const resolvedTheme = mode === "system" ? (media.matches ? "dark" : "light") : mode;
+      document.documentElement.dataset.theme = resolvedTheme;
+      document.documentElement.style.colorScheme = resolvedTheme;
+    }
+
+    applyTheme(themeMode);
+    const onChange = () => applyTheme(themeMode);
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
+  }, [themeMode]);
+
+  useEffect(() => {
+    function syncRightPaneByViewport() {
+      if (window.innerWidth < 1000) {
+        setIsRightPaneCollapsed(true);
+      }
+    }
+
+    syncRightPaneByViewport();
+    window.addEventListener("resize", syncRightPaneByViewport);
+    return () => window.removeEventListener("resize", syncRightPaneByViewport);
+  }, []);
 
   const selectedProvider = useMemo(
     () => providers.find((provider) => provider.id === selectedProviderId),
@@ -169,6 +229,29 @@ export function App() {
       }),
     [configContent, eventsResponse, prompt, selectedProviderId]
   );
+
+  const latestExecutablePlanEvent = useMemo(() => {
+    if (selectedSession?.mode !== "plan") {
+      return null;
+    }
+    return (
+      [...eventsResponse.events]
+        .reverse()
+        .find(
+          (event) =>
+            event.type === "assistant.message" &&
+            valueAsString(event.data.text).trim()
+        ) ?? null
+    );
+  }, [eventsResponse.events, selectedSession?.mode]);
+
+  const latestEventId = eventsResponse.events.at(-1)?.id ?? "";
+  const isAgentWorking = isSubmitting || isContinuing;
+  const isPromptLocked = isAgentWorking || isStopping || pendingToolEvents.length > 0;
+
+  useLayoutEffect(() => {
+    timelineEndRef.current?.scrollIntoView({ block: "end" });
+  }, [latestEventId, streamingEventId]);
 
   async function bootstrap() {
     setIsBooting(true);
@@ -369,22 +452,13 @@ export function App() {
     if (!projectRoot.trim()) {
       throw new Error("请先选择项目目录。");
     }
-    if (selectedSession && sessionMatchesCurrentConfig(selectedSession)) {
+    if (selectedSession) {
       return selectedSession;
     }
 
     setSelectedSessionId("");
     setEventsResponse(EMPTY_EVENTS);
     return createCurrentSession();
-  }
-
-  function sessionMatchesCurrentConfig(session: SessionRecord) {
-    return (
-      session.providerId === selectedProviderId &&
-      session.projectRoot === projectRoot &&
-      session.mode === mode &&
-      session.shellMode === shellMode
-    );
   }
 
   async function createCurrentSession() {
@@ -411,15 +485,17 @@ export function App() {
   }
 
   async function handleSubmitPrompt() {
-    if (!prompt.trim() || isSubmitting) {
+    if (!prompt.trim() || isPromptLocked) {
       return;
     }
-    let liveRefreshTimer: number | undefined;
+    const runId = activeRunIdRef.current + 1;
+    activeRunIdRef.current = runId;
     setIsSubmitting(true);
+    setNotice({ tone: "info", text: "Agent 正在工作" });
     try {
       const session = await ensureSession();
       const previousMaxSeq = eventsResponse.events.at(-1)?.seq ?? 0;
-      liveRefreshTimer = window.setInterval(() => {
+      liveRefreshTimerRef.current = window.setInterval(() => {
         void getSessionEvents(session.id)
           .then((partialResponse) => setEventsResponse(partialResponse))
           .catch(() => undefined);
@@ -432,6 +508,9 @@ export function App() {
         sessionId: session.id,
         prompt: finalPrompt
       });
+      if (activeRunIdRef.current !== runId) {
+        return;
+      }
       const latestAssistantEvent = [...response.events]
         .reverse()
         .find(
@@ -442,44 +521,213 @@ export function App() {
       setStreamingEventId(latestAssistantEvent?.id ?? null);
       await refreshSessions();
       setPrompt("");
-      setNotice({ tone: "success", text: "Agent 步骤已完成" });
+      setNotice({
+        tone: "success",
+        text: hasUnresolvedPendingTools(response.events)
+          ? "等待命令确认"
+          : "Agent 已结束"
+      });
     } catch (error) {
+      if (activeRunIdRef.current !== runId) {
+        return;
+      }
       reportError(error);
       if (selectedSessionId) {
         await loadEvents(selectedSessionId).catch(() => undefined);
       }
     } finally {
-      if (liveRefreshTimer) {
-        window.clearInterval(liveRefreshTimer);
+      if (activeRunIdRef.current === runId) {
+        if (liveRefreshTimerRef.current) {
+          window.clearInterval(liveRefreshTimerRef.current);
+          liveRefreshTimerRef.current = undefined;
+        }
+        setIsSubmitting(false);
       }
-      setIsSubmitting(false);
+    }
+  }
+
+  async function handleExecutePlan(planEvent: EventRecord) {
+    if (!selectedSession || isPromptLocked) {
+      return;
+    }
+
+    const planText = valueAsString(planEvent.data.text).trim();
+    if (!planText) {
+      setNotice({ tone: "error", text: "没有可执行的计划内容" });
+      return;
+    }
+
+    const runId = activeRunIdRef.current + 1;
+    activeRunIdRef.current = runId;
+    setIsSubmitting(true);
+    setNotice({ tone: "info", text: "正在执行计划" });
+    try {
+      const executionSession = await updateSessionMode({
+        sessionId: selectedSession.id,
+        mode: "agent"
+      });
+      setMode("agent");
+      setSessions((current) =>
+        current.map((session) =>
+          session.id === executionSession.id ? executionSession : session
+        )
+      );
+
+      liveRefreshTimerRef.current = window.setInterval(() => {
+        void getSessionEvents(executionSession.id)
+          .then((partialResponse) => setEventsResponse(partialResponse))
+          .catch(() => undefined);
+      }, 700);
+
+      const response = await submitPrompt({
+        sessionId: executionSession.id,
+        prompt: buildPlanExecutionPrompt(planText)
+      });
+      if (activeRunIdRef.current !== runId) {
+        return;
+      }
+      const latestAssistantEvent = [...response.events]
+        .reverse()
+        .find((event) => event.type === "assistant.message");
+      setEventsResponse(response);
+      setStreamingEventId(latestAssistantEvent?.id ?? null);
+      await refreshSessions();
+      setNotice({
+        tone: "success",
+        text: hasUnresolvedPendingTools(response.events)
+          ? "等待命令确认"
+          : "计划执行已结束"
+      });
+    } catch (error) {
+      if (activeRunIdRef.current !== runId) {
+        return;
+      }
+      reportError(error);
+    } finally {
+      if (activeRunIdRef.current === runId) {
+        if (liveRefreshTimerRef.current) {
+          window.clearInterval(liveRefreshTimerRef.current);
+          liveRefreshTimerRef.current = undefined;
+        }
+        setIsSubmitting(false);
+      }
+    }
+  }
+
+  async function handleStopAgent() {
+    const sessionId = selectedSessionId;
+    const baselineSeq = eventsResponse.events.at(-1)?.seq ?? 0;
+    stopBaselineSeqRef.current = baselineSeq;
+    activeRunIdRef.current += 1;
+    if (liveRefreshTimerRef.current) {
+      window.clearInterval(liveRefreshTimerRef.current);
+      liveRefreshTimerRef.current = undefined;
+    }
+    if (stopRefreshTimerRef.current) {
+      window.clearInterval(stopRefreshTimerRef.current);
+      stopRefreshTimerRef.current = undefined;
+    }
+    setIsSubmitting(false);
+    setIsContinuing(false);
+    setIsStopping(true);
+    setNotice({ tone: "info", text: "正在停止 Agent" });
+    if (!sessionId) {
+      setIsStopping(false);
+      return;
+    }
+    try {
+      await cancelSession(sessionId);
+      stopRefreshTimerRef.current = window.setInterval(() => {
+        void getSessionEvents(sessionId)
+          .then((response) => {
+            setEventsResponse(response);
+            const stopped = response.events.some(
+              (event) =>
+                event.type === "agent.stopped" &&
+                event.seq > stopBaselineSeqRef.current
+            );
+            if (stopped) {
+              if (stopRefreshTimerRef.current) {
+                window.clearInterval(stopRefreshTimerRef.current);
+                stopRefreshTimerRef.current = undefined;
+              }
+              setIsStopping(false);
+              setNotice({ tone: "success", text: "Agent 已停止" });
+            }
+          })
+          .catch(() => undefined);
+      }, 700);
+    } catch (error) {
+      setIsStopping(false);
+      reportError(error);
     }
   }
 
   async function handleApprove(eventId: string) {
-    let liveRefreshTimer: number | undefined;
+    const runId = activeRunIdRef.current + 1;
+    activeRunIdRef.current = runId;
     setIsMutating(true);
+    setIsContinuing(true);
+    setNotice({ tone: "info", text: "Agent 正在继续" });
     try {
       const sessionId = selectedSessionId;
       await approveToolCall(eventId);
       if (sessionId) {
-        liveRefreshTimer = window.setInterval(() => {
+        liveRefreshTimerRef.current = window.setInterval(() => {
           void getSessionEvents(sessionId)
             .then((partialResponse) => setEventsResponse(partialResponse))
             .catch(() => undefined);
         }, 700);
         const response = await continueSession(sessionId);
+        if (activeRunIdRef.current !== runId) {
+          return;
+        }
         setEventsResponse(response);
+        setNotice({
+          tone: "success",
+          text: hasUnresolvedPendingTools(response.events)
+            ? "等待命令确认"
+            : "Agent 已结束"
+        });
       } else {
         await loadEvents();
+        setNotice({ tone: "success", text: "命令已批准" });
       }
-      setNotice({ tone: "success", text: "命令已批准" });
     } catch (error) {
+      if (activeRunIdRef.current !== runId) {
+        return;
+      }
       reportError(error);
     } finally {
-      if (liveRefreshTimer) {
-        window.clearInterval(liveRefreshTimer);
+      if (activeRunIdRef.current === runId) {
+        if (liveRefreshTimerRef.current) {
+          window.clearInterval(liveRefreshTimerRef.current);
+          liveRefreshTimerRef.current = undefined;
+        }
+        setIsContinuing(false);
+        setIsMutating(false);
       }
+    }
+  }
+
+  async function handleApproveAndAllow(event: EventRecord) {
+    const command = pendingCommand(event).trim();
+    if (!command) {
+      return;
+    }
+
+    setIsMutating(true);
+    try {
+      const nextPolicy = {
+        autoAllowlist: Array.from(
+          new Set([...shellPolicy.autoAllowlist, command.toLowerCase()])
+        )
+      };
+      const savedPolicy = await saveShellPolicy(nextPolicy);
+      setShellPolicy(savedPolicy);
+      await handleApprove(event.id);
+    } catch (error) {
+      reportError(error);
       setIsMutating(false);
     }
   }
@@ -558,6 +806,36 @@ export function App() {
     }
   }
 
+  function startEditingSession(session: SessionRecord) {
+    setEditingSessionId(session.id);
+    setEditingSessionTitle(session.title);
+  }
+
+  function cancelEditingSession() {
+    setEditingSessionId(null);
+    setEditingSessionTitle("");
+  }
+
+  async function saveSessionTitle(sessionId: string) {
+    const title = editingSessionTitle.trim();
+    if (!title) {
+      setNotice({ tone: "error", text: "会话标题不能为空" });
+      return;
+    }
+
+    setIsMutating(true);
+    try {
+      await updateSessionTitle({ sessionId, title });
+      await refreshSessions();
+      cancelEditingSession();
+      setNotice({ tone: "success", text: "会话标题已更新" });
+    } catch (error) {
+      reportError(error);
+    } finally {
+      setIsMutating(false);
+    }
+  }
+
   function reportError(error: unknown) {
     const fullError = errorMessage(error);
     setLastError(fullError);
@@ -607,7 +885,7 @@ export function App() {
     <div
       className="appShell"
       style={{
-        gridTemplateColumns: `${leftWidth}px 6px minmax(0, 1fr) 344px`
+        gridTemplateColumns: `${leftWidth}px 6px minmax(0, 1fr) ${isRightPaneCollapsed ? 44 : 344}px`
       }}
     >
       <aside className="leftPane">
@@ -704,7 +982,10 @@ export function App() {
           <button
             className="commandButton"
             disabled={
-              isCreatingSession || !selectedProviderId || !projectRoot.trim()
+              isCreatingSession ||
+              isAgentWorking ||
+              !selectedProviderId ||
+              !projectRoot.trim()
             }
             onClick={() => void createCurrentSession().catch(() => undefined)}
           >
@@ -713,32 +994,63 @@ export function App() {
           </button>
           <div className="stackList">
             {availableSessions.map((session) => (
-              <button
+              <div
                 key={session.id}
                 className={`listRow ${
                   session.id === selectedSessionId ? "active" : ""
                 }`}
-                onClick={() => void selectSession(session)}
               >
                 <Clock3 size={15} />
-                <span>
-                  <strong>{session.title}</strong>
-                  <small>
-                    {modeLabel(session.mode)} / {shellModeLabel(session.shellMode)}
-                  </small>
-                </span>
-                <span
+                {editingSessionId === session.id ? (
+                  <input
+                    className="sessionTitleInput"
+                    value={editingSessionTitle}
+                    autoFocus
+                    onChange={(event) => setEditingSessionTitle(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        void saveSessionTitle(session.id);
+                      }
+                      if (event.key === "Escape") {
+                        cancelEditingSession();
+                      }
+                    }}
+                    onBlur={() => void saveSessionTitle(session.id)}
+                  />
+                ) : (
+                  <button
+                    type="button"
+                    className="sessionSelectButton"
+                    disabled={isAgentWorking}
+                    onClick={() => void selectSession(session)}
+                    onDoubleClick={() => startEditingSession(session)}
+                  >
+                    <strong>{session.title}</strong>
+                    <small>
+                      {modeLabel(session.mode)} / {shellModeLabel(session.shellMode)}
+                    </small>
+                  </button>
+                )}
+                <button
+                  type="button"
                   className="rowIconAction"
-                  role="button"
+                  aria-label={`重命名会话 ${session.title}`}
+                  disabled={editingSessionId === session.id || isMutating || isAgentWorking}
+                  onClick={() => startEditingSession(session)}
+                >
+                  <Pencil size={14} />
+                </button>
+                <button
+                  type="button"
+                  className="rowIconAction danger"
                   aria-label={`删除会话 ${session.title}`}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    void handleDeleteSession(session.id);
-                  }}
+                  disabled={isMutating || isAgentWorking}
+                  onClick={() => void handleDeleteSession(session.id)}
                 >
                   <Trash2 size={14} />
-                </span>
-              </button>
+                </button>
+              </div>
             ))}
             {!availableSessions.length && <EmptyLine text="暂无可用会话" />}
           </div>
@@ -774,7 +1086,9 @@ export function App() {
             />
           </div>
           <div className={`notice ${notice.tone}`}>
-            {isBooting && <Loader2 className="spin" size={15} />}
+            {(isBooting || isAgentWorking || isStopping) && (
+              <Loader2 className="spin" size={15} />
+            )}
             <span>{notice.text}</span>
           </div>
         </header>
@@ -804,11 +1118,20 @@ export function App() {
           </div>
 
           <div className="timeline">
+            {selectedSession?.mode === "agent" && eventsResponse.events.length > 0 && (
+              <ExecutionTimelineEvent events={eventsResponse.events} />
+            )}
             {eventsResponse.events.map((event) => (
               <TimelineEvent
                 key={event.id}
                 event={event}
                 stream={event.id === streamingEventId}
+                canExecutePlan={
+                  event.id === latestExecutablePlanEvent?.id &&
+                  !isPromptLocked &&
+                  !isMutating
+                }
+                onExecutePlan={handleExecutePlan}
               />
             ))}
             {!eventsResponse.events.length && (
@@ -817,13 +1140,23 @@ export function App() {
                 <span>输入提示词开始</span>
               </div>
             )}
+            <div ref={timelineEndRef} />
           </div>
 
           <div className="promptBar">
             <textarea
               value={prompt}
+              disabled={isPromptLocked}
               onChange={(event) => setPrompt(event.target.value)}
-              placeholder="让 oDot 检查、规划、修改、验证或回滚代码。"
+              placeholder={
+                isAgentWorking
+                  ? "Agent 正在工作，结束后才能继续发送。"
+                  : isStopping
+                    ? "Agent 正在停止，确认截断后才能继续发送。"
+                  : pendingToolEvents.length
+                    ? "请先处理待确认命令。"
+                    : "让 oDot 检查、规划、修改、验证或回滚代码。"
+              }
               onKeyDown={(event) => {
                 if (
                   event.key === "Enter" &&
@@ -836,71 +1169,104 @@ export function App() {
               }}
             />
             <button
-              className="runButton"
-              disabled={!prompt.trim() || isSubmitting || !selectedProviderId}
-              onClick={() => void handleSubmitPrompt()}
+              className={`runButton ${isAgentWorking ? "stop" : ""}`}
+              disabled={
+                isAgentWorking
+                  ? false
+                  : !prompt.trim() || isPromptLocked || !selectedProviderId
+              }
+              onClick={() =>
+                isAgentWorking
+                  ? void handleStopAgent()
+                  : void handleSubmitPrompt()
+              }
             >
-              {isSubmitting ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
-              运行
+              {isAgentWorking ? <X size={18} /> : <Play size={18} />}
+              {isAgentWorking ? "停止" : "运行"}
             </button>
           </div>
         </section>
       </main>
 
-      <aside className="rightPane">
-        {lastError && (
-          <section className="rightSection errorSection">
-            <SectionTitle icon={<AlertTriangle size={16} />} title="错误详情" />
-            <pre className="errorDetails">{lastError}</pre>
-            <button className="iconTextButton" onClick={() => setLastError(null)}>
-              <X size={16} />
-              清除
-            </button>
-          </section>
-        )}
+      <aside className={`rightPane ${isRightPaneCollapsed ? "collapsed" : ""}`}>
+        <div className="rightPaneToggleRow">
+          <button
+            className="iconButton ghost rightPaneToggle"
+            type="button"
+            aria-label={isRightPaneCollapsed ? "展开右侧面板" : "折叠右侧面板"}
+            onClick={() => setIsRightPaneCollapsed((current) => !current)}
+          >
+            {isRightPaneCollapsed ? <ChevronLeft size={16} /> : <ChevronRight size={16} />}
+          </button>
+        </div>
 
-        <section className="rightSection">
-          <SectionTitle icon={<Terminal size={16} />} title="命令确认" />
-          <div className="stackList">
-            {pendingToolEvents.map((event) => (
-              <div className="approvalRow" key={event.id}>
-                <code>{pendingCommand(event)}</code>
-                <div>
+        {!isRightPaneCollapsed && (
+          <>
+            {lastError && (
+              <section className="rightSection errorSection">
+                <SectionTitle icon={<AlertTriangle size={16} />} title="错误详情" />
+                <pre className="errorDetails">{lastError}</pre>
+                <button className="iconTextButton" onClick={() => setLastError(null)}>
+                  <X size={16} />
+                  清除
+                </button>
+              </section>
+            )}
+
+            <section className="rightSection">
+              <SectionTitle icon={<Terminal size={16} />} title="命令确认" />
+              <div className="stackList">
+                {pendingToolEvents.map((event) => (
+                  <div className="approvalRow" key={event.id}>
+                    <code>{pendingCommand(event)}</code>
+                    <div>
                   <button
                     className="iconButton success"
                     disabled={isMutating}
                     onClick={() => void handleApprove(event.id)}
+                    title="接受"
                   >
                     <Check size={16} />
+                  </button>
+                  <button
+                    className="iconButton trust"
+                    disabled={isMutating}
+                    onClick={() => void handleApproveAndAllow(event)}
+                    title="接受并加入白名单"
+                  >
+                    <Save size={16} />
                   </button>
                   <button
                     className="iconButton danger"
                     disabled={isMutating}
                     onClick={() => void handleReject(event.id)}
+                    title="拒绝"
                   >
-                    <X size={16} />
-                  </button>
-                </div>
+                        <X size={16} />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                {!pendingToolEvents.length && <EmptyLine text="暂无待确认命令" />}
               </div>
-            ))}
-            {!pendingToolEvents.length && <EmptyLine text="暂无待确认命令" />}
-          </div>
-        </section>
+            </section>
 
-        <section className="rightSection snapshotsSection">
-          <SectionTitle icon={<RotateCcw size={16} />} title="变更快照" />
-          <div className="snapshotList">
-            {eventsResponse.snapshots.map((snapshot) => (
-              <SnapshotItem
-                key={snapshot.id}
-                snapshot={snapshot}
-                disabled={isMutating}
-                onRollback={handleRollback}
-              />
-            ))}
-            {!eventsResponse.snapshots.length && <EmptyLine text="暂无快照" />}
-          </div>
-        </section>
+            <section className="rightSection snapshotsSection">
+              <SectionTitle icon={<RotateCcw size={16} />} title="变更快照" />
+              <div className="snapshotList">
+                {eventsResponse.snapshots.map((snapshot) => (
+                  <SnapshotItem
+                    key={snapshot.id}
+                    snapshot={snapshot}
+                    disabled={isMutating}
+                    onRollback={handleRollback}
+                  />
+                ))}
+                {!eventsResponse.snapshots.length && <EmptyLine text="暂无快照" />}
+              </div>
+            </section>
+          </>
+        )}
       </aside>
 
       {isSettingsOpen && (
@@ -910,7 +1276,9 @@ export function App() {
           providers={providers}
           selectedProviderId={selectedProviderId}
           shellPolicy={shellPolicy}
+          themeMode={themeMode}
           isSaving={isSavingConfig}
+          onThemeModeChange={setThemeMode}
           onClose={() => setIsSettingsOpen(false)}
           onSave={saveSettings}
         />
@@ -925,7 +1293,9 @@ function SettingsModal({
   providers,
   selectedProviderId,
   shellPolicy,
+  themeMode,
   isSaving,
+  onThemeModeChange,
   onClose,
   onSave
 }: {
@@ -934,7 +1304,9 @@ function SettingsModal({
   providers: ProviderRecord[];
   selectedProviderId: string;
   shellPolicy: ShellPolicy;
+  themeMode: ThemeMode;
   isSaving: boolean;
+  onThemeModeChange: (mode: ThemeMode) => void;
   onClose: () => void;
   onSave: (content: string, policy: ShellPolicy) => Promise<void>;
 }) {
@@ -1062,6 +1434,18 @@ function SettingsModal({
               />
             </label>
             <label className="settingsWide">
+              <span>主题模式</span>
+              <Segmented
+                value={themeMode}
+                options={[
+                  ["system", "跟随系统"],
+                  ["light", "浅色"],
+                  ["dark", "深色"]
+                ]}
+                onChange={(value) => onThemeModeChange(value as ThemeMode)}
+              />
+            </label>
+            <label className="settingsWide">
               <span>自动命令白名单</span>
               <textarea
                 className="allowlistEditor"
@@ -1179,17 +1563,20 @@ function FileTreeNode({
 
 function TimelineEvent({
   event,
-  stream = false
+  stream = false,
+  canExecutePlan = false,
+  onExecutePlan
 }: {
   event: EventRecord;
   stream?: boolean;
+  canExecutePlan?: boolean;
+  onExecutePlan?: (event: EventRecord) => Promise<void>;
 }) {
-  const isLong = isLongEvent(event);
-  const [expanded, setExpanded] = useState(!isLong);
+  const [expanded, setExpanded] = useState(defaultTimelineExpanded(event));
 
   useEffect(() => {
-    setExpanded(!isLongEvent(event));
-  }, [event.id, isLong]);
+    setExpanded(defaultTimelineExpanded(event));
+  }, [event.id, event.type]);
 
   return (
     <article className={`timelineEvent ${eventTone(event.type)}`}>
@@ -1206,7 +1593,14 @@ function TimelineEvent({
           </button>
           <span>#{event.seq}</span>
         </header>
-        {expanded && <EventDetail event={event} stream={stream} />}
+        {expanded && (
+          <EventDetail
+            event={event}
+            stream={stream}
+            canExecutePlan={canExecutePlan}
+            onExecutePlan={onExecutePlan}
+          />
+        )}
       </div>
     </article>
   );
@@ -1214,20 +1608,36 @@ function TimelineEvent({
 
 function EventDetail({
   event,
-  stream = false
+  stream = false,
+  canExecutePlan = false,
+  onExecutePlan
 }: {
   event: EventRecord;
   stream?: boolean;
+  canExecutePlan?: boolean;
+  onExecutePlan?: (event: EventRecord) => Promise<void>;
 }) {
   if (event.type === "prompt.submitted") {
     return <p>{valueAsString(event.data.prompt)}</p>;
   }
   if (event.type === "assistant.message" || event.type === "reasoning.summary") {
     return (
-      <MarkdownText
-        text={valueAsString(event.data.text)}
-        stream={stream && event.type === "assistant.message"}
-      />
+      <div className="assistantDetail">
+        <MarkdownText
+          text={valueAsString(event.data.text)}
+          stream={stream && event.type === "assistant.message"}
+        />
+        {canExecutePlan && event.type === "assistant.message" && (
+          <button
+            type="button"
+            className="executePlanButton"
+            onClick={() => void onExecutePlan?.(event)}
+          >
+            <Play size={16} />
+            执行该计划
+          </button>
+        )}
+      </div>
     );
   }
   if (event.type === "tool.called") {
@@ -1260,42 +1670,11 @@ function EventDetail({
   return <pre>{JSON.stringify(event.data, null, 2)}</pre>;
 }
 
-const LONG_EVENT_CHARS = 1600;
-const LONG_EVENT_LINES = 24;
 const LONG_MARKDOWN_CHARS = 1200;
 const LONG_MARKDOWN_LINES = 18;
 
-function isLongEvent(event: EventRecord) {
-  const text = eventTextForLength(event);
-  return (
-    text.length > LONG_EVENT_CHARS ||
-    text.split(/\r?\n/).length > LONG_EVENT_LINES
-  );
-}
-
-function eventTextForLength(event: EventRecord) {
-  if (event.type === "assistant.message" || event.type === "reasoning.summary") {
-    return valueAsString(event.data.text);
-  }
-  if (event.type === "tool.success" || event.type === "tool.failed") {
-    const result = event.data.result as Record<string, unknown> | undefined;
-    return [
-      valueAsString(event.data.error),
-      valueAsString(result?.patch),
-      valueAsString(result?.stdout),
-      valueAsString(result?.stderr)
-    ]
-      .filter(Boolean)
-      .join("\n");
-  }
-  if (event.type === "prompt.submitted") {
-    return valueAsString(event.data.prompt);
-  }
-  try {
-    return JSON.stringify(event.data, null, 2);
-  } catch {
-    return "";
-  }
+function defaultTimelineExpanded(event: EventRecord) {
+  return event.type === "assistant.message" || event.type === "reasoning.summary";
 }
 
 function MarkdownText({
@@ -1361,6 +1740,176 @@ function isLongMarkdown(text: string) {
   );
 }
 
+type ExecutionNode = {
+  id: string;
+  label: string;
+  detail: string;
+  status: "done" | "running" | "waiting" | "failed";
+};
+
+function ExecutionTimelineEvent({ events }: { events: EventRecord[] }) {
+  return (
+    <article className="timelineEvent executionTimelineEvent">
+      <div className="eventIcon">
+        <History size={16} />
+      </div>
+      <div className="eventBody executionEventBody">
+        <header>
+          <div className="eventHeaderStatic">
+            <ChevronDown size={15} />
+            <strong>计划执行 Timeline</strong>
+          </div>
+          <span>{buildExecutionNodes(events).length} 节点</span>
+        </header>
+        <ExecutionTimeline events={events} />
+      </div>
+    </article>
+  );
+}
+
+function ExecutionTimeline({ events }: { events: EventRecord[] }) {
+  const nodes = buildExecutionNodes(events);
+  return (
+    <div className="executionTimeline">
+      {nodes.map((node) => (
+        <div className={`executionNode ${node.status}`} key={node.id}>
+          <div className="executionMarker">{executionStatusIcon(node.status)}</div>
+          <div className="executionContent">
+            <strong>{node.label}</strong>
+            <small>{node.detail}</small>
+          </div>
+        </div>
+      ))}
+      {!nodes.length && <EmptyLine text="暂无执行节点" />}
+    </div>
+  );
+}
+
+function buildExecutionNodes(events: EventRecord[]): ExecutionNode[] {
+  const nodes: ExecutionNode[] = [];
+  const resultByToolCall = new Map<string, EventRecord>();
+  const resolvedPending = new Set(
+    events
+      .map((event) => valueAsString(event.data.pendingEventId))
+      .filter(Boolean)
+  );
+
+  for (const event of events) {
+    const toolCallEventId = valueAsString(event.data.toolCallEventId);
+    if (
+      toolCallEventId &&
+      (event.type === "tool.success" ||
+        event.type === "tool.failed" ||
+        event.type === "tool.pending")
+    ) {
+      resultByToolCall.set(toolCallEventId, event);
+    }
+  }
+
+  for (const event of events) {
+    if (event.type === "prompt.submitted") {
+      nodes.push({
+        id: event.id,
+        label: "执行请求",
+        detail: truncateInline(valueAsString(event.data.prompt), 80),
+        status: "done"
+      });
+      continue;
+    }
+
+    if (event.type === "step.started") {
+      const step = Number(event.data.step ?? 0);
+      const failed = events.find(
+        (item) => item.type === "step.failed" && Number(item.data.step ?? 0) === step
+      );
+      const ended = events.find(
+        (item) => item.type === "step.ended" && Number(item.data.step ?? 0) === step
+      );
+      nodes.push({
+        id: event.id,
+        label: `第 ${step} 轮执行`,
+        detail: failed ? valueAsString(failed.data.error) : ended ? "本轮已结束" : "正在执行",
+        status: failed ? "failed" : ended ? "done" : "running"
+      });
+      continue;
+    }
+
+    if (event.type === "tool.called") {
+      const name = valueAsString(event.data.name);
+      const result = resultByToolCall.get(event.id);
+      const status =
+        result?.type === "tool.failed"
+          ? "failed"
+          : result?.type === "tool.pending" && !resolvedPending.has(result.id)
+            ? "waiting"
+            : result
+              ? "done"
+              : "running";
+      nodes.push({
+        id: event.id,
+        label: `工具：${toolLabel(name) || name || "未知工具"}`,
+        detail: toolCallDetail(event),
+        status
+      });
+      continue;
+    }
+
+    if (event.type === "assistant.message") {
+      nodes.push({
+        id: event.id,
+        label: "阶段说明",
+        detail: truncateInline(valueAsString(event.data.text), 90),
+        status: "done"
+      });
+      continue;
+    }
+
+    if (event.type === "agent.cancelRequested" || event.type === "agent.stopped") {
+      nodes.push({
+        id: event.id,
+        label: event.type === "agent.stopped" ? "已停止" : "请求停止",
+        detail: valueAsString(event.data.reason),
+        status: event.type === "agent.stopped" ? "done" : "waiting"
+      });
+      continue;
+    }
+
+    if (event.type === "step.failed") {
+      nodes.push({
+        id: event.id,
+        label: "执行失败",
+        detail: valueAsString(event.data.error),
+        status: "failed"
+      });
+    }
+  }
+
+  return nodes;
+}
+
+function toolCallDetail(event: EventRecord) {
+  const input = event.data.input as Record<string, unknown> | undefined;
+  return (
+    valueAsString(input?.path) ||
+    valueAsString(input?.command) ||
+    valueAsString(input?.query) ||
+    "等待工具结果"
+  );
+}
+
+function executionStatusIcon(status: ExecutionNode["status"]) {
+  if (status === "failed") {
+    return <AlertTriangle size={14} />;
+  }
+  if (status === "running") {
+    return <Loader2 className="spin" size={14} />;
+  }
+  if (status === "waiting") {
+    return <Clock3 size={14} />;
+  }
+  return <Check size={14} />;
+}
+
 function SnapshotItem({
   snapshot,
   disabled,
@@ -1371,12 +1920,15 @@ function SnapshotItem({
   onRollback: (snapshotId: string) => Promise<void>;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const stats = patchLineStats(snapshot.patch);
   return (
     <article className="snapshotItem">
       <button className="snapshotHeader" onClick={() => setExpanded(!expanded)}>
         <FileCode2 size={15} />
         <span>{snapshot.path}</span>
         <small>{snapshot.afterContent === null ? "删除" : "写入"}</small>
+        <b className="patchStat add">+{stats.added}</b>
+        <b className="patchStat del">-{stats.deleted}</b>
       </button>
       {expanded && <pre>{snapshot.patch}</pre>}
       <button
@@ -1389,6 +1941,22 @@ function SnapshotItem({
       </button>
     </article>
   );
+}
+
+function patchLineStats(patch: string) {
+  let added = 0;
+  let deleted = 0;
+  for (const line of patch.split(/\r?\n/)) {
+    if (line.startsWith("+++") || line.startsWith("---")) {
+      continue;
+    }
+    if (line.startsWith("+")) {
+      added += 1;
+    } else if (line.startsWith("-")) {
+      deleted += 1;
+    }
+  }
+  return { added, deleted };
 }
 
 function SectionTitle({ icon, title }: { icon: ReactNode; title: string }) {
@@ -1528,6 +2096,8 @@ function eventLabel(event: EventRecord) {
     "tool.rejected": "已拒绝工具",
     "plan.candidateTool": "候选工具",
     "policy.blocked": "策略拦截",
+    "agent.cancelRequested": "请求停止",
+    "agent.stopped": "Agent 已停止",
     "rollback.applied": "已回滚",
     "context.compacted": "上下文压缩"
   };
@@ -1545,8 +2115,27 @@ function pendingCommand(event: EventRecord) {
   );
 }
 
+function hasUnresolvedPendingTools(events: EventRecord[]) {
+  const resolved = new Set(
+    events
+      .map((event) => valueAsString(event.data.pendingEventId))
+      .filter(Boolean)
+  );
+  return events.some(
+    (event) => event.type === "tool.pending" && !resolved.has(event.id)
+  );
+}
+
 function valueAsString(value: unknown) {
   return typeof value === "string" ? value : "";
+}
+
+function truncateInline(value: string, maxChars: number) {
+  const compact = value.replace(/\s+/g, " ").trim();
+  if (compact.length <= maxChars) {
+    return compact;
+  }
+  return `${compact.slice(0, maxChars)}...`;
 }
 
 function errorMessage(error: unknown) {
@@ -1569,6 +2158,19 @@ function errorSummary(error: string) {
 
 function preferredConfigProviderId(config: ProviderConfigFileResponse) {
   return config.selectedProviderId ?? config.providers[0]?.id ?? "";
+}
+
+function buildPlanExecutionPrompt(planText: string) {
+  return `请执行下面这份计划。
+
+执行要求：
+- 按计划逐步修改代码，不要跳过必要的读取、搜索和验证。
+- 每完成一个重要阶段，在 message 中用一句话说明当前进度。
+- 工具调用 JSON 必须严格遵守协议：toolCalls 的每个元素只能包含 name 和 input，不要在 toolCalls 元素里添加 done 字段。
+- 如果工具失败，请根据错误信息自我修正后继续。
+
+计划内容：
+${planText}`;
 }
 
 function modeLabel(value: AgentMode) {

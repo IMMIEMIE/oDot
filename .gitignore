@@ -9,3 +9,6 @@ Thumbs.db
 .odot/backups/
 *.log
 
+/error.txt
+/odot.json
+/oDot-build.bat

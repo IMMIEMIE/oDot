@@ -6,7 +6,17 @@ use crate::{
 use encoding_rs::GBK;
 use rusqlite::Connection;
 use serde_json::{json, Value};
-use std::{fs, path::PathBuf, process::Command};
+use std::{
+    fs,
+    io::Read,
+    path::PathBuf,
+    process::{Child, Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
+
+const DEFAULT_SHELL_TIMEOUT_SECONDS: u64 = 60;
+const MAX_SHELL_TIMEOUT_SECONDS: u64 = 600;
 
 #[derive(Debug)]
 pub struct ToolOutcome {
@@ -132,6 +142,7 @@ pub fn approve_tool_call(conn: &Connection, event_id: &str) -> Result<EventRecor
         .pointer("/pending/command")
         .and_then(Value::as_str)
         .ok_or_else(|| "等待确认的 shell 事件中没有命令内容。".to_string())?;
+    let options = shell_run_options(event.data.pointer("/pending").unwrap_or(&Value::Null));
     storage::append_event(
         conn,
         &session.id,
@@ -142,7 +153,11 @@ pub fn approve_tool_call(conn: &Connection, event_id: &str) -> Result<EventRecor
         }),
     )?;
 
-    let result = run_shell_command(&session.project_root, command)?;
+    let result = if options.background {
+        run_shell_command_background(&session.project_root, command)?
+    } else {
+        run_shell_command(&session.project_root, command, options.timeout_seconds)?
+    };
     let event_type = if result.get("exitCode").and_then(Value::as_i64).unwrap_or(1) == 0 {
         "tool.success"
     } else {
@@ -268,19 +283,28 @@ fn execute_tool_inner(
         }
         "shell" => {
             let command = required_string(&call.input, "command")?;
+            let options = shell_run_options(&call.input);
             if execution_mode == ToolExecutionMode::Plan {
                 return Ok(ToolRun::Pending(json!({
                     "command": command,
+                    "background": options.background,
+                    "timeoutSeconds": options.timeout_seconds,
                     "reason": "计划模式下 shell 命令必须由用户确认。"
                 })));
             }
             if shell_needs_approval(&command, shell_mode, shell_policy) {
                 return Ok(ToolRun::Pending(json!({
                     "command": command,
+                    "background": options.background,
+                    "timeoutSeconds": options.timeout_seconds,
                     "reason": shell_approval_reason(&command, shell_mode, shell_policy)
                 })));
             }
-            let result = run_shell_command(&session.project_root, &command)?;
+            let result = if options.background {
+                run_shell_command_background(&session.project_root, &command)?
+            } else {
+                run_shell_command(&session.project_root, &command, options.timeout_seconds)?
+            };
             if shell_exit_code(&result) == 0 {
                 Ok(ToolRun::Success(result))
             } else {
@@ -338,7 +362,7 @@ fn search_project(root: &str, query: &str) -> Result<Vec<Value>, String> {
                 continue;
             }
 
-            let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+            let content = decode_text_file(&path)?;
             let relative = path
                 .strip_prefix(&root)
                 .map_err(|error| error.to_string())?
@@ -369,13 +393,96 @@ fn search_project(root: &str, query: &str) -> Result<Vec<Value>, String> {
     Ok(matches)
 }
 
-fn run_shell_command(root: &str, command: &str) -> Result<Value, String> {
+#[derive(Debug, Clone, Copy)]
+struct ShellRunOptions {
+    background: bool,
+    timeout_seconds: u64,
+}
+
+fn shell_run_options(input: &Value) -> ShellRunOptions {
+    let timeout_seconds = optional_u64_any(input, &["timeoutSeconds", "timeout_seconds"])
+        .unwrap_or(DEFAULT_SHELL_TIMEOUT_SECONDS)
+        .clamp(1, MAX_SHELL_TIMEOUT_SECONDS);
+    ShellRunOptions {
+        background: optional_bool(input, "background").unwrap_or(false),
+        timeout_seconds,
+    }
+}
+
+fn run_shell_command(root: &str, command: &str, timeout_seconds: u64) -> Result<Value, String> {
     let root = PathBuf::from(root);
-    let output = if cfg!(target_os = "windows") {
+    let mut child = shell_command(&root, command)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("运行 shell 命令失败: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .map(read_pipe)
+        .ok_or_else(|| "无法读取 shell 标准输出。".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .map(read_pipe)
+        .ok_or_else(|| "无法读取 shell 标准错误。".to_string())?;
+    let started_at = Instant::now();
+    let timeout = Duration::from_secs(timeout_seconds);
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            break status;
+        }
+        if started_at.elapsed() >= timeout {
+            timed_out = true;
+            terminate_process_tree(&mut child);
+            break child.wait().map_err(|error| error.to_string())?;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    let stdout = stdout
+        .join()
+        .map_err(|_| "读取 shell 标准输出失败。".to_string())?;
+    let stderr = stderr
+        .join()
+        .map_err(|_| "读取 shell 标准错误失败。".to_string())?;
+
+    Ok(json!({
+        "command": command,
+        "exitCode": status.code().unwrap_or(-1),
+        "timedOut": timed_out,
+        "timeoutSeconds": timeout_seconds,
+        "stdout": truncate(&decode_process_output(&stdout), 30_000),
+        "stderr": truncate(&decode_process_output(&stderr), 30_000)
+    }))
+}
+
+fn run_shell_command_background(root: &str, command: &str) -> Result<Value, String> {
+    let root = PathBuf::from(root);
+    let child = shell_command(&root, command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("启动后台 shell 命令失败: {error}"))?;
+    let pid = child.id();
+    Ok(json!({
+        "command": command,
+        "exitCode": 0,
+        "background": true,
+        "pid": pid,
+        "stdout": "",
+        "stderr": ""
+    }))
+}
+
+fn shell_command(root: &PathBuf, command: &str) -> Command {
+    if cfg!(target_os = "windows") {
         let command = format!(
             "$OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = $OutputEncoding; {command}"
         );
-        Command::new("powershell")
+        let mut process = Command::new("powershell");
+        process
             .args([
                 "-NoProfile",
                 "-ExecutionPolicy",
@@ -383,25 +490,49 @@ fn run_shell_command(root: &str, command: &str) -> Result<Value, String> {
                 "-Command",
                 &command,
             ])
-            .current_dir(root)
-            .output()
+            .current_dir(root);
+        process
     } else {
-        Command::new("sh")
-            .args(["-lc", command])
-            .current_dir(root)
-            .output()
+        let mut process = Command::new("sh");
+        process.args(["-lc", command]).current_dir(root);
+        process
     }
-    .map_err(|error| format!("运行 shell 命令失败: {error}"))?;
+}
 
-    Ok(json!({
-        "command": command,
-        "exitCode": output.status.code().unwrap_or(-1),
-        "stdout": truncate(&decode_process_output(&output.stdout), 30_000),
-        "stderr": truncate(&decode_process_output(&output.stderr), 30_000)
-    }))
+fn read_pipe<T>(mut pipe: T) -> thread::JoinHandle<Vec<u8>>
+where
+    T: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        bytes
+    })
+}
+
+fn terminate_process_tree(child: &mut Child) {
+    let pid = child.id().to_string();
+    if cfg!(target_os = "windows") {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid, "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
 }
 
 fn decode_process_output(bytes: &[u8]) -> String {
+    decode_bytes(bytes)
+}
+
+fn decode_text_file(path: &std::path::Path) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    Ok(decode_bytes(&bytes))
+}
+
+fn decode_bytes(bytes: &[u8]) -> String {
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
     match String::from_utf8(bytes.to_vec()) {
         Ok(value) => value,
         Err(_) => {
@@ -491,6 +622,15 @@ fn optional_string_any(input: &Value, keys: &[&str]) -> Option<String> {
         .map(|value| value.to_string())
 }
 
+fn optional_bool(input: &Value, key: &str) -> Option<bool> {
+    input.get(key).and_then(Value::as_bool)
+}
+
+fn optional_u64_any(input: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| input.get(*key).and_then(Value::as_u64))
+}
+
 fn truncate(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         return value.to_string();
@@ -509,6 +649,34 @@ mod tests {
         ShellPolicy {
             auto_allowlist: items.iter().map(|item| item.to_string()).collect(),
         }
+    }
+
+    fn slow_command() -> &'static str {
+        if cfg!(target_os = "windows") {
+            "Start-Sleep -Seconds 5"
+        } else {
+            "sleep 5"
+        }
+    }
+
+    #[test]
+    fn shell_options_read_timeout_and_background() {
+        let options = shell_run_options(&json!({
+            "command": "npm run dev",
+            "timeoutSeconds": 900,
+            "background": true
+        }));
+
+        assert!(options.background);
+        assert_eq!(options.timeout_seconds, MAX_SHELL_TIMEOUT_SECONDS);
+    }
+
+    #[test]
+    fn shell_command_times_out() {
+        let result = run_shell_command(".", slow_command(), 1).unwrap();
+
+        assert_eq!(result["timedOut"], true);
+        assert_ne!(shell_exit_code(&result), 0);
     }
 
     #[test]

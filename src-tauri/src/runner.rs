@@ -17,6 +17,7 @@ pub async fn submit_prompt(
     input: SubmitPromptInput,
 ) -> Result<SessionEventsResponse, String> {
     let session = storage::get_session(conn, &input.session_id)?;
+    storage::set_session_status(conn, &session.id, "active")?;
 
     storage::append_event(
         conn,
@@ -37,6 +38,7 @@ pub async fn continue_session(
     session_id: String,
 ) -> Result<SessionEventsResponse, String> {
     let session = storage::get_session(conn, &session_id)?;
+    storage::set_session_status(conn, &session.id, "active")?;
     run_session_steps(
         app,
         conn,
@@ -61,9 +63,10 @@ async fn run_session_steps(
                 "step": step_index
             }),
         )?;
+        if stop_if_cancelled(conn, &session.id, step_index)? {
+            break;
+        }
 
-        let system_prompt = build_system_prompt(session.mode.as_str());
-        let user_prompt = build_user_prompt(conn, &session.id, current_prompt)?;
         let request_config = match config_file::load_provider_request_config(
             app,
             &session.project_root,
@@ -71,6 +74,9 @@ async fn run_session_steps(
         ) {
             Ok(value) => value,
             Err(error) => {
+                if stop_if_cancelled(conn, &session.id, step_index)? {
+                    break;
+                }
                 storage::append_event(
                     conn,
                     &session.id,
@@ -83,10 +89,18 @@ async fn run_session_steps(
                 return Err(error);
             }
         };
-        let raw_response =
+        let system_prompt = build_system_prompt(
+            session.mode.as_str(),
+            provider::supports_native_tools(&request_config),
+        );
+        let user_prompt = build_user_prompt(conn, &session.id, current_prompt)?;
+        let completion =
             match provider::complete(&request_config, &system_prompt, &user_prompt).await {
                 Ok(value) => value,
                 Err(error) => {
+                    if stop_if_cancelled(conn, &session.id, step_index)? {
+                        break;
+                    }
                     storage::append_event(
                         conn,
                         &session.id,
@@ -100,20 +114,28 @@ async fn run_session_steps(
                 }
             };
 
-        let turn = match parse_model_turn(&raw_response) {
-            Ok(value) => value,
-            Err(error) => {
-                storage::append_event(
-                    conn,
-                    &session.id,
-                    "step.failed",
-                    json!({
-                        "step": step_index,
-                        "error": error,
-                        "rawResponse": raw_response
-                    }),
-                )?;
-                return Err(error);
+        if stop_if_cancelled(conn, &session.id, step_index)? {
+            break;
+        }
+
+        let turn = if let Some(turn) = completion.turn {
+            turn
+        } else {
+            match parse_model_turn(&completion.raw_response) {
+                Ok(value) => value,
+                Err(error) => {
+                    storage::append_event(
+                        conn,
+                        &session.id,
+                        "step.failed",
+                        json!({
+                            "step": step_index,
+                            "error": error,
+                            "rawResponse": completion.raw_response
+                        }),
+                    )?;
+                    return Err(error);
+                }
             }
         };
 
@@ -186,7 +208,12 @@ async fn run_session_steps(
                 }
 
                 let mut has_pending = false;
+                let mut stopped = false;
                 for call in &turn.tool_calls {
+                    if stop_if_cancelled(conn, &session.id, step_index)? {
+                        stopped = true;
+                        break;
+                    }
                     let outcome = tools::execute_tool_with_mode(
                         conn,
                         &session,
@@ -195,6 +222,9 @@ async fn run_session_steps(
                         tools::ToolExecutionMode::Plan,
                     )?;
                     has_pending |= outcome.pending;
+                }
+                if stopped {
+                    break;
                 }
 
                 storage::append_event(
@@ -227,9 +257,17 @@ async fn run_session_steps(
                 }
 
                 let mut has_pending = false;
+                let mut stopped = false;
                 for call in &turn.tool_calls {
+                    if stop_if_cancelled(conn, &session.id, step_index)? {
+                        stopped = true;
+                        break;
+                    }
                     let outcome = tools::execute_tool(conn, &session, &session.shell_mode, call)?;
                     has_pending |= outcome.pending;
+                }
+                if stopped {
+                    break;
                 }
 
                 storage::append_event(
@@ -251,6 +289,38 @@ async fn run_session_steps(
     }
 
     Ok(storage::session_events_response(conn, &session.id)?)
+}
+
+fn stop_if_cancelled(
+    conn: &Connection,
+    session_id: &str,
+    step_index: usize,
+) -> Result<bool, String> {
+    if !storage::is_session_cancel_requested(conn, session_id)? {
+        return Ok(false);
+    }
+
+    storage::append_event(
+        conn,
+        session_id,
+        "agent.stopped",
+        json!({
+            "step": step_index,
+            "reason": "用户停止了 Agent"
+        }),
+    )?;
+    storage::append_event(
+        conn,
+        session_id,
+        "step.ended",
+        json!({
+            "step": step_index,
+            "done": true,
+            "stopped": true
+        }),
+    )?;
+    storage::set_session_status(conn, session_id, "active")?;
+    Ok(true)
 }
 
 pub fn compact_session(
@@ -302,10 +372,35 @@ fn maybe_auto_compact(conn: &Connection, session_id: &str) -> Result<(), String>
     Ok(())
 }
 
-fn build_system_prompt(mode: &str) -> String {
+fn build_system_prompt(mode: &str, native_tools: bool) -> String {
     let shell_environment = shell_environment_prompt();
-    format!(
-        r#"You are oDot, a local coding agent.
+    if native_tools {
+        format!(
+            r#"You are oDot, a local coding agent.
+Use the provided tools for project inspection and code changes. Do not write tool calls as JSON text in your message.
+Do not reveal hidden chain-of-thought. If useful, include only a short public progress note.
+
+Tool guidance:
+- read: read a relative project file.
+- search: search project files.
+- edit: replace exact text in an existing file. Prefer edit for code changes.
+- write: create a new file or intentionally replace a whole small file. Avoid full-file rewrites for existing large files unless necessary.
+- delete: delete a file.
+- shell: run verification commands. Foreground commands time out by default; use background=true for long-running dev servers such as npm run dev.
+
+Shell environment:
+{shell_environment}
+
+Current mode: {mode}.
+ask mode: answer using current context; do not request tools.
+plan mode: use read/search tools and approved shell commands to inspect the task, but do not edit, write, or delete files. When you have enough information, provide a concrete implementation plan as the final answer.
+agent mode: use tools to read, search, edit, write, delete, and run safe verification commands.
+If a tool fails or a shell command returns a non-zero exitCode, inspect stdout/stderr/error and try a corrected tool call. Do not stop after the first failed tool unless the failure is genuinely unrecoverable.
+Use relative paths only and keep changes scoped to the user's request."#
+        )
+    } else {
+        format!(
+            r#"You are oDot, a local coding agent.
 Return strict JSON only. Do not wrap the JSON in Markdown.
 Do not reveal hidden chain-of-thought. Use "summary" for a short public reasoning summary.
 
@@ -326,9 +421,9 @@ Tool inputs:
 - read: {{"path":"relative/path"}}
 - search: {{"query":"text"}}
 - edit: {{"path":"relative/path","oldString":"exact text","newString":"replacement text"}}
-- write: {{"path":"relative/path","content":"complete file content","expectedHash":"optional sha256"}}
+- write: {{"path":"relative/path","content":"complete file content","expectedHash":"optional sha256"}}. Prefer edit for existing large files; use write for new files or intentional full replacement.
 - delete: {{"path":"relative/path"}}
-- shell: {{"command":"test/lint/build command"}}
+- shell: {{"command":"test/lint/build command","timeoutSeconds":60,"background":false}}. Use background=true for long-running dev servers such as npm run dev.
 
 Shell environment:
 {shell_environment}
@@ -340,7 +435,8 @@ agent mode: use tools to read, search, edit, write, delete, and run safe verific
 If you call any tool, leave "done" false. Wait for the next turn to inspect tool results before giving the final answer.
 If a tool fails or a shell command returns a non-zero exitCode, inspect stdout/stderr/error and try a corrected tool call. Do not stop after the first failed tool unless the failure is genuinely unrecoverable.
 Use relative paths only and keep changes scoped to the user's request."#
-    )
+        )
+    }
 }
 
 fn shell_environment_prompt() -> &'static str {
@@ -383,8 +479,210 @@ fn build_user_prompt(
 
 fn parse_model_turn(raw_response: &str) -> Result<ModelTurn, String> {
     let json_text = util::extract_json_object(raw_response)?;
-    serde_json::from_str(&json_text)
-        .map_err(|error| format!("模型响应不符合工具调用 JSON 协议: {error}"))
+    let mut candidates = vec![json_text.clone()];
+    if let Some(repaired) = repair_tool_call_done_fields(&json_text) {
+        candidates.push(repaired.clone());
+        if let Some(repaired_again) = repair_extra_object_before_done(&repaired) {
+            candidates.push(repaired_again);
+        }
+    }
+    if let Some(repaired) = repair_extra_object_before_done(&json_text) {
+        candidates.push(repaired);
+    }
+    for repaired in repair_extra_object_before_tool_array_end(&json_text) {
+        candidates.push(repaired);
+    }
+
+    let mut first_error = None;
+    for candidate in candidates {
+        match serde_json::from_str(&candidate) {
+            Ok(turn) => return Ok(turn),
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error.to_string());
+                }
+            }
+        }
+    }
+
+    Err(format!(
+        "模型响应不符合工具调用 JSON 协议: {}",
+        first_error.unwrap_or_else(|| "未知解析错误".to_string())
+    ))
+}
+
+fn repair_extra_object_before_tool_array_end(json_text: &str) -> Vec<String> {
+    let bytes = json_text.as_bytes();
+    let mut repairs = Vec::new();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] != b'}' {
+            index += 1;
+            continue;
+        }
+        let close_array = skip_ascii_ws(bytes, index + 1);
+        if !matches!(bytes.get(close_array), Some(b']')) {
+            index += 1;
+            continue;
+        }
+        let mut cursor = skip_ascii_ws(bytes, close_array + 1);
+        if !matches!(bytes.get(cursor), Some(b',')) {
+            index += 1;
+            continue;
+        }
+        cursor += 1;
+        cursor = skip_ascii_ws(bytes, cursor);
+        if !bytes
+            .get(cursor..)
+            .map(|rest| rest.starts_with(br#""done""#))
+            .unwrap_or(false)
+        {
+            index += 1;
+            continue;
+        }
+
+        let mut repaired = String::with_capacity(json_text.len() - 1);
+        repaired.push_str(&json_text[..index]);
+        repaired.push_str(&json_text[index + 1..]);
+        repairs.push(repaired);
+        index += 1;
+    }
+
+    repairs
+}
+
+fn repair_tool_call_done_fields(json_text: &str) -> Option<String> {
+    let bytes = json_text.as_bytes();
+    let mut output = String::with_capacity(json_text.len());
+    let mut changed = false;
+    let mut last = 0;
+    let mut index = 0;
+
+    while index + 2 < bytes.len() {
+        if bytes[index] == b'}' && bytes[index + 1] == b'}' {
+            if let Some(done_end) = match_extra_done_field(bytes, index) {
+                output.push_str(&json_text[last..index + 2]);
+                last = done_end + 1;
+                index = last;
+                changed = true;
+                continue;
+            }
+        }
+        index += 1;
+    }
+
+    if changed {
+        output.push_str(&json_text[last..]);
+        Some(output)
+    } else {
+        None
+    }
+}
+
+fn match_extra_done_field(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut index = start + 2;
+    index = skip_ascii_ws(bytes, index);
+    if *bytes.get(index)? != b',' {
+        return None;
+    }
+    index += 1;
+    index = skip_ascii_ws(bytes, index);
+    if !bytes.get(index..)?.starts_with(br#""done""#) {
+        return None;
+    }
+    index += br#""done""#.len();
+    index = skip_ascii_ws(bytes, index);
+    if *bytes.get(index)? != b':' {
+        return None;
+    }
+    index += 1;
+    index = skip_ascii_ws(bytes, index);
+    if bytes.get(index..)?.starts_with(b"false") {
+        index += b"false".len();
+    } else if bytes.get(index..)?.starts_with(b"true") {
+        index += b"true".len();
+    } else {
+        return None;
+    }
+    index = skip_ascii_ws(bytes, index);
+    if *bytes.get(index)? == b'}' {
+        Some(index)
+    } else {
+        None
+    }
+}
+
+fn repair_extra_object_before_done(json_text: &str) -> Option<String> {
+    let bytes = json_text.as_bytes();
+    let mut index = bytes.len();
+
+    while index > 0 {
+        index -= 1;
+        if bytes[index] != b'}' {
+            continue;
+        }
+        if previous_non_ws(bytes, index)? != b']' {
+            continue;
+        }
+        let mut cursor = index + 1;
+        cursor = skip_ascii_ws(bytes, cursor);
+        if *bytes.get(cursor)? != b',' {
+            continue;
+        }
+        cursor += 1;
+        cursor = skip_ascii_ws(bytes, cursor);
+        if !bytes.get(cursor..)?.starts_with(br#""done""#) {
+            continue;
+        }
+        cursor += br#""done""#.len();
+        cursor = skip_ascii_ws(bytes, cursor);
+        if *bytes.get(cursor)? != b':' {
+            continue;
+        }
+        cursor += 1;
+        cursor = skip_ascii_ws(bytes, cursor);
+        if bytes.get(cursor..)?.starts_with(b"false") {
+            cursor += b"false".len();
+        } else if bytes.get(cursor..)?.starts_with(b"true") {
+            cursor += b"true".len();
+        } else {
+            continue;
+        }
+        cursor = skip_ascii_ws(bytes, cursor);
+        if *bytes.get(cursor)? != b'}' {
+            continue;
+        }
+        cursor += 1;
+        cursor = skip_ascii_ws(bytes, cursor);
+        if cursor != bytes.len() {
+            continue;
+        }
+
+        let mut repaired = String::with_capacity(json_text.len() - 1);
+        repaired.push_str(&json_text[..index]);
+        repaired.push_str(&json_text[index + 1..]);
+        return Some(repaired);
+    }
+
+    None
+}
+
+fn previous_non_ws(bytes: &[u8], mut index: usize) -> Option<u8> {
+    while index > 0 {
+        index -= 1;
+        if !matches!(bytes[index], b' ' | b'\n' | b'\r' | b'\t') {
+            return Some(bytes[index]);
+        }
+    }
+    None
+}
+
+fn skip_ascii_ws(bytes: &[u8], mut index: usize) -> usize {
+    while matches!(bytes.get(index), Some(b' ' | b'\n' | b'\r' | b'\t')) {
+        index += 1;
+    }
+    index
 }
 
 fn summarize_events(events: &[crate::types::EventRecord]) -> String {
@@ -427,4 +725,64 @@ fn truncate(value: &str, max_chars: usize) -> String {
     let mut truncated = value.chars().take(max_chars).collect::<String>();
     truncated.push_str("...[已截断]");
     truncated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repairs_done_field_inserted_after_tool_call() {
+        let raw = r#"{
+          "summary": "start",
+          "message": "progress",
+          "toolCalls": [
+            {"name": "write", "input": {"path": "a.js", "content": "export {};\n"}},"done": false},
+            {"name": "shell", "input": {"command": "npm run typecheck"}},"done": false}
+          ],
+          "done": false
+        }"#;
+
+        let turn = parse_model_turn(raw).expect("repaired model turn");
+
+        assert_eq!(turn.tool_calls.len(), 2);
+        assert_eq!(turn.tool_calls[0].name, "write");
+        assert_eq!(turn.tool_calls[1].name, "shell");
+    }
+
+    #[test]
+    fn repairs_extra_object_close_before_top_level_done() {
+        let raw = r#"{
+          "summary": "start",
+          "message": "progress",
+          "toolCalls": [
+            {"name": "write", "input": {"path": "App.vue", "content": "<style>.x { color: red; }</style>"}}
+          ]},"done": false}"#;
+
+        let turn = parse_model_turn(raw).expect("repaired model turn");
+
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "write");
+        assert!(!turn.done);
+    }
+
+    #[test]
+    fn repairs_extra_object_close_before_tool_array_end() {
+        let raw = r#"{
+          "summary": "start",
+          "message": "progress",
+          "toolCalls": [
+            {"name": "write", "input": {"path": "App.vue", "content": "<template>\n  <canvas></canvas>\n</template>\n<style>\n* {\n  margin: 0;\n}\n</style>"}}
+          ],
+          "done": false
+        }"#;
+        let broken = raw.replace("}}\n          ]", "}}}\n          ]");
+
+        let turn = parse_model_turn(&broken).expect("repaired model turn");
+
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "write");
+        assert_eq!(turn.tool_calls[0].input["path"], "App.vue");
+        assert!(!turn.done);
+    }
 }

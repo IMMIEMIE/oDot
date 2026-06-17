@@ -248,6 +248,82 @@ pub fn get_session(conn: &Connection, id: &str) -> Result<SessionRecord, String>
     .map_err(|error| not_found_error(error, "session", id))
 }
 
+pub fn set_session_status(conn: &Connection, session_id: &str, status: &str) -> Result<(), String> {
+    let updated_at = util::now_string();
+    conn.execute(
+        "UPDATE session SET status = ?1, updated_at = ?2 WHERE id = ?3",
+        params![status, &updated_at, session_id],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub fn cancel_session(conn: &Connection, session_id: &str) -> Result<EventRecord, String> {
+    set_session_status(conn, session_id, "cancel_requested")?;
+    append_event(
+        conn,
+        session_id,
+        "agent.cancelRequested",
+        serde_json::json!({
+            "reason": "用户停止了 Agent"
+        }),
+    )
+}
+
+pub fn is_session_cancel_requested(conn: &Connection, session_id: &str) -> Result<bool, String> {
+    let status: String = conn
+        .query_row(
+            "SELECT status FROM session WHERE id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| not_found_error(error, "session", session_id))?;
+    Ok(status == "cancel_requested")
+}
+
+pub fn update_session_title(
+    conn: &Connection,
+    session_id: &str,
+    title: &str,
+) -> Result<SessionRecord, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("会话标题不能为空。".to_string());
+    }
+
+    let updated_at = util::now_string();
+    let changed = conn
+        .execute(
+            "UPDATE session SET title = ?1, updated_at = ?2 WHERE id = ?3",
+            params![title, &updated_at, session_id],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err(format!("未找到会话: {session_id}"));
+    }
+
+    get_session(conn, session_id)
+}
+
+pub fn update_session_mode(
+    conn: &Connection,
+    session_id: &str,
+    mode: AgentMode,
+) -> Result<SessionRecord, String> {
+    let updated_at = util::now_string();
+    let changed = conn
+        .execute(
+            "UPDATE session SET mode = ?1, updated_at = ?2 WHERE id = ?3",
+            params![mode.as_str(), &updated_at, session_id],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err(format!("未找到会话: {session_id}"));
+    }
+
+    get_session(conn, session_id)
+}
+
 pub fn delete_session(conn: &Connection, id: &str) -> Result<(), String> {
     let tx = conn
         .unchecked_transaction()

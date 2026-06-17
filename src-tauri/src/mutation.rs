@@ -3,6 +3,7 @@ use crate::{
     types::{SessionRecord, SnapshotRecord},
     util::{create_unified_diff_preview, normalize_project_path, resolve_writable_inside},
 };
+use encoding_rs::GBK;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use std::{
@@ -211,8 +212,13 @@ fn read_text_file(path: &Path) -> Result<TextFile, String> {
     let bytes = fs::read(path).map_err(|error| error.to_string())?;
     let has_bom = bytes.starts_with(&[0xEF, 0xBB, 0xBF]);
     let text_bytes = if has_bom { &bytes[3..] } else { &bytes };
-    let text = String::from_utf8(text_bytes.to_vec())
-        .map_err(|_| format!("文件不是有效的 UTF-8 文本: {}", path.display()))?;
+    let text = match String::from_utf8(text_bytes.to_vec()) {
+        Ok(value) => value,
+        Err(_) => {
+            let (decoded, _, _) = GBK.decode(text_bytes);
+            decoded.into_owned()
+        }
+    };
     let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
 
     Ok(TextFile {
