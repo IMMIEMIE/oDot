@@ -30,6 +30,7 @@ import type { PointerEvent, ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import {
   approveToolCall,
+  cancelJob,
   cancelSession,
   compactSession,
   continueSession,
@@ -37,19 +38,22 @@ import {
   deleteSession,
   fetchProjectFiles,
   getSessionEvents,
+  tailSessionEvents,
   listSessions,
   loadShellPolicy,
   loadProviderConfig,
   pickProjectDirectory,
   rejectToolCall,
+  replyPermission,
   rollbackSnapshot,
   saveProviderConfig,
   saveShellPolicy,
-  submitPrompt,
+  promptSession,
   updateSessionMode,
   updateSessionTitle,
   type AgentMode,
   type EventRecord,
+  type PermissionReply,
   type ProjectFile,
   type ProviderConfigFileResponse,
   type ProviderRecord,
@@ -63,7 +67,11 @@ import {
 const EMPTY_EVENTS: SessionEventsResponse = {
   events: [],
   snapshots: [],
-  summaries: []
+  summaries: [],
+  inputs: [],
+  runs: [],
+  permissions: [],
+  jobs: []
 };
 
 type Notice = {
@@ -402,6 +410,13 @@ export function App() {
     return response;
   }
 
+  async function loadEventTail(sessionId: string) {
+    const afterSeq = eventsResponse.events.at(-1)?.seq ?? 0;
+    const response = await tailSessionEvents({ sessionId, afterSeq });
+    setEventsResponse((current) => mergeSessionEvents(current, response));
+    return response;
+  }
+
   async function loadFiles(root = projectRoot) {
     if (!root.trim()) {
       setFiles([]);
@@ -496,17 +511,17 @@ export function App() {
       const session = await ensureSession();
       const previousMaxSeq = eventsResponse.events.at(-1)?.seq ?? 0;
       liveRefreshTimerRef.current = window.setInterval(() => {
-        void getSessionEvents(session.id)
-          .then((partialResponse) => setEventsResponse(partialResponse))
-          .catch(() => undefined);
+        void loadEventTail(session.id).catch(() => undefined);
       }, 700);
       const selectedFileText = Array.from(selectedPaths).sort().join("\n");
       const finalPrompt = selectedFileText
         ? `${prompt}\n\n已选择文件:\n${selectedFileText}`
         : prompt;
-      const response = await submitPrompt({
+      const response = await promptSession({
         sessionId: session.id,
-        prompt: finalPrompt
+        prompt: finalPrompt,
+        delivery: "queue",
+        resume: true
       });
       if (activeRunIdRef.current !== runId) {
         return;
@@ -574,14 +589,14 @@ export function App() {
       );
 
       liveRefreshTimerRef.current = window.setInterval(() => {
-        void getSessionEvents(executionSession.id)
-          .then((partialResponse) => setEventsResponse(partialResponse))
-          .catch(() => undefined);
+        void loadEventTail(executionSession.id).catch(() => undefined);
       }, 700);
 
-      const response = await submitPrompt({
+      const response = await promptSession({
         sessionId: executionSession.id,
-        prompt: buildPlanExecutionPrompt(planText)
+        prompt: buildPlanExecutionPrompt(planText),
+        delivery: "queue",
+        resume: true
       });
       if (activeRunIdRef.current !== runId) {
         return;
@@ -674,9 +689,7 @@ export function App() {
       await approveToolCall(eventId);
       if (sessionId) {
         liveRefreshTimerRef.current = window.setInterval(() => {
-          void getSessionEvents(sessionId)
-            .then((partialResponse) => setEventsResponse(partialResponse))
-            .catch(() => undefined);
+          void loadEventTail(sessionId).catch(() => undefined);
         }, 700);
         const response = await continueSession(sessionId);
         if (activeRunIdRef.current !== runId) {
@@ -738,6 +751,32 @@ export function App() {
       await rejectToolCall(eventId);
       await loadEvents();
       setNotice({ tone: "success", text: "命令已拒绝" });
+    } catch (error) {
+      reportError(error);
+    } finally {
+      setIsMutating(false);
+    }
+  }
+
+  async function handlePermissionReply(requestId: string, reply: PermissionReply) {
+    setIsMutating(true);
+    try {
+      await replyPermission({ requestId, reply });
+      await loadEvents();
+      setNotice({ tone: reply === "reject" ? "error" : "success", text: "权限已处理" });
+    } catch (error) {
+      reportError(error);
+    } finally {
+      setIsMutating(false);
+    }
+  }
+
+  async function handleCancelJob(jobId: string) {
+    setIsMutating(true);
+    try {
+      await cancelJob(jobId);
+      await loadEvents();
+      setNotice({ tone: "success", text: "后台任务已停止" });
     } catch (error) {
       reportError(error);
     } finally {
@@ -1248,6 +1287,68 @@ export function App() {
                   </div>
                 ))}
                 {!pendingToolEvents.length && <EmptyLine text="暂无待确认命令" />}
+              </div>
+            </section>
+
+            <section className="rightSection">
+              <SectionTitle icon={<KeyRound size={16} />} title="权限请求" />
+              <div className="stackList">
+                {eventsResponse.permissions
+                  .filter((request) => request.status === "pending")
+                  .map((request) => (
+                    <div className="approvalRow" key={request.id}>
+                      <code>{request.action}: {request.resources.join(", ")}</code>
+                      <div>
+                        <button
+                          className="iconButton success"
+                          disabled={isMutating}
+                          onClick={() => void handlePermissionReply(request.id, "once")}
+                          title="本次允许"
+                        >
+                          <Check size={16} />
+                        </button>
+                        <button
+                          className="iconButton trust"
+                          disabled={isMutating}
+                          onClick={() => void handlePermissionReply(request.id, "always")}
+                          title="总是允许"
+                        >
+                          <Save size={16} />
+                        </button>
+                        <button
+                          className="iconButton danger"
+                          disabled={isMutating}
+                          onClick={() => void handlePermissionReply(request.id, "reject")}
+                          title="拒绝"
+                        >
+                          <X size={16} />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                {!eventsResponse.permissions.some((request) => request.status === "pending") && (
+                  <EmptyLine text="暂无权限请求" />
+                )}
+              </div>
+            </section>
+
+            <section className="rightSection">
+              <SectionTitle icon={<Clock3 size={16} />} title="后台任务" />
+              <div className="stackList">
+                {eventsResponse.jobs.map((job) => (
+                  <div className="approvalRow" key={job.id}>
+                    <code>{job.status} #{job.pid} {job.command}</code>
+                    <button
+                      className="iconButton danger"
+                      disabled={isMutating || job.status !== "running"}
+                      onClick={() => void handleCancelJob(job.id)}
+                      title="停止任务"
+                    >
+                      <X size={16} />
+                    </button>
+                  </div>
+                ))}
+                {!eventsResponse.jobs.length && <EmptyLine text="暂无后台任务" />}
               </div>
             </section>
 
@@ -2124,6 +2225,25 @@ function hasUnresolvedPendingTools(events: EventRecord[]) {
   return events.some(
     (event) => event.type === "tool.pending" && !resolved.has(event.id)
   );
+}
+
+function mergeSessionEvents(
+  current: SessionEventsResponse,
+  incoming: SessionEventsResponse
+): SessionEventsResponse {
+  const byId = new Map(current.events.map((event) => [event.id, event]));
+  for (const event of incoming.events) {
+    byId.set(event.id, event);
+  }
+  return {
+    events: Array.from(byId.values()).sort((a, b) => a.seq - b.seq),
+    snapshots: incoming.snapshots.length ? incoming.snapshots : current.snapshots,
+    summaries: incoming.summaries.length ? incoming.summaries : current.summaries,
+    inputs: incoming.inputs ?? current.inputs,
+    runs: incoming.runs ?? current.runs,
+    permissions: incoming.permissions ?? current.permissions,
+    jobs: incoming.jobs ?? current.jobs
+  };
 }
 
 function valueAsString(value: unknown) {

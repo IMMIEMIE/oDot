@@ -10,9 +10,10 @@ mod workspace;
 
 use tauri::AppHandle;
 use types::{
-    ContextSummaryRecord, CreateSessionInput, EventRecord, ProjectFile, ProviderConfigFileResponse,
-    ProviderInput, ProviderRecord, SessionEventsResponse, SessionRecord, ShellPolicy,
-    SnapshotRecord, SubmitPromptInput, UpdateSessionModeInput, UpdateSessionTitleInput,
+    ContextSummaryRecord, CreateSessionInput, EventRecord, ProjectFile, PromptSessionInput,
+    ProviderConfigFileResponse, ProviderInput, ProviderRecord, ReplyPermissionInput,
+    SessionEventsResponse, SessionRecord, ShellPolicy, SnapshotRecord, SubmitPromptInput,
+    TailSessionEventsInput, UpdateSessionModeInput, UpdateSessionTitleInput,
 };
 
 #[tauri::command]
@@ -99,6 +100,29 @@ fn get_session_events(app: AppHandle, session_id: String) -> Result<SessionEvent
 }
 
 #[tauri::command]
+fn tail_session_events(
+    app: AppHandle,
+    input: TailSessionEventsInput,
+) -> Result<SessionEventsResponse, String> {
+    let conn = storage::open_db(&app)?;
+    Ok(SessionEventsResponse {
+        events: storage::list_events_after(&conn, &input.session_id, input.after_seq.unwrap_or(0))?,
+        snapshots: storage::list_snapshots(&conn, &input.session_id)?,
+        summaries: storage::list_context_summaries(&conn, &input.session_id)?,
+        inputs: storage::list_session_inputs(&conn, &input.session_id)?,
+        runs: storage::list_session_runs(&conn, &input.session_id)?,
+        permissions: storage::list_permission_requests(&conn, &input.session_id)?,
+        jobs: storage::list_background_jobs(&conn, &input.session_id)?,
+    })
+}
+
+#[tauri::command]
+fn interrupt_session(app: AppHandle, session_id: String) -> Result<EventRecord, String> {
+    let conn = storage::open_db(&app)?;
+    storage::cancel_session(&conn, &session_id)
+}
+
+#[tauri::command]
 async fn submit_prompt(
     app: AppHandle,
     input: SubmitPromptInput,
@@ -106,6 +130,29 @@ async fn submit_prompt(
     tauri::async_runtime::spawn_blocking(move || {
         let conn = storage::open_db(&app)?;
         tauri::async_runtime::block_on(runner::submit_prompt(&app, &conn, input))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn prompt_session(
+    app: AppHandle,
+    input: PromptSessionInput,
+) -> Result<SessionEventsResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = storage::open_db(&app)?;
+        tauri::async_runtime::block_on(runner::prompt_session(&app, &conn, input))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn wait_session(app: AppHandle, session_id: String) -> Result<SessionEventsResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = storage::open_db(&app)?;
+        tauri::async_runtime::block_on(runner::resume_session(&app, &conn, session_id))
     })
     .await
     .map_err(|error| error.to_string())?
@@ -138,6 +185,35 @@ async fn approve_tool_call(app: AppHandle, event_id: String) -> Result<EventReco
 fn reject_tool_call(app: AppHandle, event_id: String) -> Result<EventRecord, String> {
     let conn = storage::open_db(&app)?;
     tools::reject_tool_call(&conn, &event_id)
+}
+
+#[tauri::command]
+fn reply_permission(
+    app: AppHandle,
+    input: ReplyPermissionInput,
+) -> Result<types::PermissionRequestRecord, String> {
+    let conn = storage::open_db(&app)?;
+    let request = storage::get_permission_request(&conn, &input.request_id)?;
+    let session = storage::get_session(&conn, &request.session_id)?;
+    storage::reply_permission_request(&conn, &input.request_id, input.reply, &session.project_root)
+}
+
+#[tauri::command]
+fn wait_job(app: AppHandle, job_id: String) -> Result<serde_json::Value, String> {
+    let conn = storage::open_db(&app)?;
+    tools::wait_job(&conn, &job_id)
+}
+
+#[tauri::command]
+fn cancel_job(app: AppHandle, job_id: String) -> Result<serde_json::Value, String> {
+    let conn = storage::open_db(&app)?;
+    tools::cancel_job(&conn, &job_id)
+}
+
+#[tauri::command]
+fn read_job_logs(app: AppHandle, job_id: String) -> Result<serde_json::Value, String> {
+    let conn = storage::open_db(&app)?;
+    tools::read_job_logs(&conn, &job_id)
 }
 
 #[tauri::command]
@@ -196,10 +272,18 @@ pub fn run() {
             update_session_title,
             update_session_mode,
             get_session_events,
+            tail_session_events,
+            interrupt_session,
             submit_prompt,
+            prompt_session,
+            wait_session,
             continue_session,
             approve_tool_call,
             reject_tool_call,
+            reply_permission,
+            wait_job,
+            cancel_job,
+            read_job_logs,
             rollback_snapshot,
             compact_session,
             load_shell_policy,

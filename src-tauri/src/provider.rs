@@ -257,6 +257,17 @@ fn native_tool_definitions() -> Value {
         {
             "type": "function",
             "function": {
+                "name": "grep",
+                "description": "Search project text files for a query. Alias of search.",
+                "parameters": object_schema(
+                    json!({ "query": { "type": "string", "description": "Search text." } }),
+                    &["query"]
+                )
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "edit",
                 "description": "Replace one exact text span in an existing file. Prefer this for code changes.",
                 "parameters": object_schema(
@@ -307,6 +318,45 @@ fn native_tool_definitions() -> Value {
                         "background": { "type": "boolean", "description": "Start the command and return immediately. Use for npm run dev and other servers." }
                     }),
                     &["command"]
+                )
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Execute one shell command. Use background=true for long-running dev servers.",
+                "parameters": object_schema(
+                    json!({
+                        "command": { "type": "string", "description": "Command to run." },
+                        "workdir": { "type": "string", "description": "Optional working directory, relative to the project root unless absolute." },
+                        "timeoutSeconds": { "type": "integer", "description": "Optional foreground timeout in seconds, 1-600. Default 60." },
+                        "background": { "type": "boolean", "description": "Start the command and return immediately. Use for npm run dev and other servers." },
+                        "description": { "type": "string", "description": "Short purpose of the command." }
+                    }),
+                    &["command"]
+                )
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "question",
+                "description": "Ask the user a blocking question when user input is required.",
+                "parameters": object_schema(
+                    json!({ "question": { "type": "string", "description": "Question to ask." } }),
+                    &["question"]
+                )
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "todo_write",
+                "description": "Update the agent todo list for visible progress.",
+                "parameters": object_schema(
+                    json!({ "todos": { "type": "array", "description": "Todo items." } }),
+                    &["todos"]
                 )
             }
         }

@@ -1,9 +1,10 @@
 use crate::{
     provider,
     types::{
-        AgentMode, ContextSummaryRecord, CreateSessionInput, EventRecord, ProviderInput,
-        ProviderKind, ProviderRecord, SessionEventsResponse, SessionRecord, ShellMode, ShellPolicy,
-        SnapshotRecord,
+        AgentMode, BackgroundJobRecord, ContextSummaryRecord, CreateSessionInput, EventRecord,
+        PermissionReply, PermissionRequestRecord, ProviderInput, ProviderKind, ProviderRecord,
+        SessionEventsResponse, SessionInputDelivery, SessionInputRecord, SessionRecord,
+        SessionRunRecord, ShellMode, ShellPolicy, SnapshotRecord,
     },
     util,
 };
@@ -96,6 +97,60 @@ fn init_db(conn: &Connection) -> Result<(), String> {
           key TEXT PRIMARY KEY,
           value_json TEXT NOT NULL,
           updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS session_input (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          prompt TEXT NOT NULL,
+          delivery TEXT NOT NULL,
+          resume INTEGER NOT NULL,
+          status TEXT NOT NULL,
+          promoted_event_id TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS session_run (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          status TEXT NOT NULL,
+          started_at TEXT NOT NULL,
+          ended_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS permission_request (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          action TEXT NOT NULL,
+          resources_json TEXT NOT NULL,
+          save_json TEXT NOT NULL,
+          source_json TEXT NOT NULL,
+          status TEXT NOT NULL,
+          reply TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS permission_saved (
+          id TEXT PRIMARY KEY,
+          project_root TEXT NOT NULL,
+          action TEXT NOT NULL,
+          resource TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          UNIQUE(project_root, action, resource)
+        );
+
+        CREATE TABLE IF NOT EXISTS background_job (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          command TEXT NOT NULL,
+          cwd TEXT NOT NULL,
+          pid INTEGER NOT NULL,
+          status TEXT NOT NULL,
+          log_path TEXT,
+          started_at TEXT NOT NULL,
+          ended_at TEXT
         );
         "#,
     )
@@ -333,6 +388,23 @@ pub fn delete_session(conn: &Connection, id: &str) -> Result<(), String> {
         params![id],
     )
     .map_err(|error| error.to_string())?;
+    tx.execute(
+        "DELETE FROM session_input WHERE session_id = ?1",
+        params![id],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute("DELETE FROM session_run WHERE session_id = ?1", params![id])
+        .map_err(|error| error.to_string())?;
+    tx.execute(
+        "DELETE FROM permission_request WHERE session_id = ?1",
+        params![id],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "DELETE FROM background_job WHERE session_id = ?1",
+        params![id],
+    )
+    .map_err(|error| error.to_string())?;
     tx.execute("DELETE FROM snapshot WHERE session_id = ?1", params![id])
         .map_err(|error| error.to_string())?;
     tx.execute("DELETE FROM event WHERE session_id = ?1", params![id])
@@ -514,6 +586,356 @@ pub fn list_context_summaries(
     collect_rows(rows)
 }
 
+pub fn list_events_after(
+    conn: &Connection,
+    session_id: &str,
+    after_seq: i64,
+) -> Result<Vec<EventRecord>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, seq, type, data_json, created_at
+             FROM event WHERE session_id = ?1 AND seq > ?2 ORDER BY seq ASC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map(params![session_id, after_seq], event_from_row)
+        .map_err(|error| error.to_string())?;
+    collect_rows(rows)
+}
+
+pub fn admit_session_input(
+    conn: &Connection,
+    id: Option<String>,
+    session_id: &str,
+    prompt: &str,
+    delivery: SessionInputDelivery,
+    resume: bool,
+) -> Result<SessionInputRecord, String> {
+    let id = id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    if let Ok(existing) = get_session_input(conn, &id) {
+        if existing.session_id == session_id
+            && existing.prompt == prompt
+            && existing.delivery.as_str() == delivery.as_str()
+            && existing.resume == resume
+        {
+            return Ok(existing);
+        }
+        return Err(format!("输入 ID 已被不同内容占用: {id}"));
+    }
+
+    get_session(conn, session_id)?;
+    let now = util::now_string();
+    conn.execute(
+        r#"
+        INSERT INTO session_input
+          (id, session_id, prompt, delivery, resume, status, promoted_event_id, created_at, updated_at)
+        VALUES
+          (?1, ?2, ?3, ?4, ?5, 'pending', NULL, ?6, ?7)
+        "#,
+        params![&id, session_id, prompt, delivery.as_str(), resume as i64, &now, &now],
+    )
+    .map_err(|error| error.to_string())?;
+    get_session_input(conn, &id)
+}
+
+pub fn get_session_input(conn: &Connection, id: &str) -> Result<SessionInputRecord, String> {
+    conn.query_row(
+        "SELECT id, session_id, prompt, delivery, resume, status, promoted_event_id, created_at, updated_at
+         FROM session_input WHERE id = ?1",
+        params![id],
+        session_input_from_row,
+    )
+    .map_err(|error| not_found_error(error, "session_input", id))
+}
+
+pub fn next_pending_session_input(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<SessionInputRecord>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, prompt, delivery, resume, status, promoted_event_id, created_at, updated_at
+             FROM session_input WHERE session_id = ?1 AND status = 'pending'
+             ORDER BY CASE delivery WHEN 'steer' THEN 0 ELSE 1 END, created_at ASC LIMIT 1",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut rows = stmt
+        .query_map(params![session_id], session_input_from_row)
+        .map_err(|error| error.to_string())?;
+    rows.next().transpose().map_err(|error| error.to_string())
+}
+
+pub fn mark_session_input_promoted(
+    conn: &Connection,
+    input_id: &str,
+    event_id: &str,
+) -> Result<(), String> {
+    let now = util::now_string();
+    conn.execute(
+        "UPDATE session_input SET status = 'promoted', promoted_event_id = ?1, updated_at = ?2 WHERE id = ?3",
+        params![event_id, &now, input_id],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub fn list_session_inputs(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<SessionInputRecord>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, prompt, delivery, resume, status, promoted_event_id, created_at, updated_at
+             FROM session_input WHERE session_id = ?1 ORDER BY created_at ASC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map(params![session_id], session_input_from_row)
+        .map_err(|error| error.to_string())?;
+    collect_rows(rows)
+}
+
+pub fn begin_session_run(conn: &Connection, session_id: &str) -> Result<SessionRunRecord, String> {
+    if let Some(active) = active_session_run(conn, session_id)? {
+        return Ok(active);
+    }
+    let id = Uuid::new_v4().to_string();
+    let now = util::now_string();
+    conn.execute(
+        "INSERT INTO session_run (id, session_id, status, started_at, ended_at)
+         VALUES (?1, ?2, 'running', ?3, NULL)",
+        params![&id, session_id, &now],
+    )
+    .map_err(|error| error.to_string())?;
+    get_session_run(conn, &id)
+}
+
+pub fn active_session_run(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<SessionRunRecord>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, status, started_at, ended_at
+             FROM session_run WHERE session_id = ?1 AND status = 'running'
+             ORDER BY started_at DESC LIMIT 1",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut rows = stmt
+        .query_map(params![session_id], session_run_from_row)
+        .map_err(|error| error.to_string())?;
+    rows.next().transpose().map_err(|error| error.to_string())
+}
+
+pub fn get_session_run(conn: &Connection, id: &str) -> Result<SessionRunRecord, String> {
+    conn.query_row(
+        "SELECT id, session_id, status, started_at, ended_at FROM session_run WHERE id = ?1",
+        params![id],
+        session_run_from_row,
+    )
+    .map_err(|error| not_found_error(error, "session_run", id))
+}
+
+pub fn end_session_run(conn: &Connection, run_id: &str, status: &str) -> Result<(), String> {
+    let now = util::now_string();
+    conn.execute(
+        "UPDATE session_run SET status = ?1, ended_at = ?2 WHERE id = ?3",
+        params![status, &now, run_id],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub fn list_session_runs(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<SessionRunRecord>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, status, started_at, ended_at
+             FROM session_run WHERE session_id = ?1 ORDER BY started_at DESC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map(params![session_id], session_run_from_row)
+        .map_err(|error| error.to_string())?;
+    collect_rows(rows)
+}
+
+pub fn create_permission_request(
+    conn: &Connection,
+    session_id: &str,
+    action: &str,
+    resources: Vec<String>,
+    save: Vec<String>,
+    source_json: Value,
+) -> Result<PermissionRequestRecord, String> {
+    let id = Uuid::new_v4().to_string();
+    let now = util::now_string();
+    let resources_json = serde_json::to_string(&resources).map_err(|error| error.to_string())?;
+    let save_json = serde_json::to_string(&save).map_err(|error| error.to_string())?;
+    let source_json_text =
+        serde_json::to_string(&source_json).map_err(|error| error.to_string())?;
+    conn.execute(
+        r#"
+        INSERT INTO permission_request
+          (id, session_id, action, resources_json, save_json, source_json, status, reply, created_at, updated_at)
+        VALUES
+          (?1, ?2, ?3, ?4, ?5, ?6, 'pending', NULL, ?7, ?8)
+        "#,
+        params![&id, session_id, action, &resources_json, &save_json, &source_json_text, &now, &now],
+    )
+    .map_err(|error| error.to_string())?;
+    get_permission_request(conn, &id)
+}
+
+pub fn get_permission_request(
+    conn: &Connection,
+    id: &str,
+) -> Result<PermissionRequestRecord, String> {
+    conn.query_row(
+        "SELECT id, session_id, action, resources_json, save_json, source_json, status, reply, created_at, updated_at
+         FROM permission_request WHERE id = ?1",
+        params![id],
+        permission_request_from_row,
+    )
+    .map_err(|error| not_found_error(error, "permission_request", id))
+}
+
+pub fn reply_permission_request(
+    conn: &Connection,
+    request_id: &str,
+    reply: PermissionReply,
+    project_root: &str,
+) -> Result<PermissionRequestRecord, String> {
+    let request = get_permission_request(conn, request_id)?;
+    let now = util::now_string();
+    conn.execute(
+        "UPDATE permission_request SET status = 'answered', reply = ?1, updated_at = ?2 WHERE id = ?3",
+        params![reply.as_str(), &now, request_id],
+    )
+    .map_err(|error| error.to_string())?;
+    if matches!(reply, PermissionReply::Always) {
+        for resource in &request.save {
+            save_permission(conn, project_root, &request.action, resource)?;
+        }
+    }
+    get_permission_request(conn, request_id)
+}
+
+pub fn list_permission_requests(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<PermissionRequestRecord>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, action, resources_json, save_json, source_json, status, reply, created_at, updated_at
+             FROM permission_request WHERE session_id = ?1 ORDER BY created_at ASC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map(params![session_id], permission_request_from_row)
+        .map_err(|error| error.to_string())?;
+    collect_rows(rows)
+}
+
+pub fn save_permission(
+    conn: &Connection,
+    project_root: &str,
+    action: &str,
+    resource: &str,
+) -> Result<(), String> {
+    let now = util::now_string();
+    conn.execute(
+        "INSERT OR IGNORE INTO permission_saved (id, project_root, action, resource, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            Uuid::new_v4().to_string(),
+            project_root,
+            action,
+            resource,
+            &now
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub fn permission_is_saved(
+    conn: &Connection,
+    project_root: &str,
+    action: &str,
+    resource: &str,
+) -> Result<bool, String> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM permission_saved WHERE project_root = ?1 AND action = ?2 AND resource = ?3",
+            params![project_root, action, resource],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(count > 0)
+}
+
+pub fn insert_background_job(
+    conn: &Connection,
+    session_id: &str,
+    command: &str,
+    cwd: &str,
+    pid: u32,
+    log_path: Option<String>,
+) -> Result<BackgroundJobRecord, String> {
+    let id = Uuid::new_v4().to_string();
+    let now = util::now_string();
+    conn.execute(
+        "INSERT INTO background_job (id, session_id, command, cwd, pid, status, log_path, started_at, ended_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, ?7, NULL)",
+        params![&id, session_id, command, cwd, pid as i64, &log_path, &now],
+    )
+    .map_err(|error| error.to_string())?;
+    get_background_job(conn, &id)
+}
+
+pub fn get_background_job(conn: &Connection, id: &str) -> Result<BackgroundJobRecord, String> {
+    conn.query_row(
+        "SELECT id, session_id, command, cwd, pid, status, log_path, started_at, ended_at
+         FROM background_job WHERE id = ?1",
+        params![id],
+        background_job_from_row,
+    )
+    .map_err(|error| not_found_error(error, "background_job", id))
+}
+
+pub fn list_background_jobs(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<BackgroundJobRecord>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, command, cwd, pid, status, log_path, started_at, ended_at
+             FROM background_job WHERE session_id = ?1 ORDER BY started_at DESC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map(params![session_id], background_job_from_row)
+        .map_err(|error| error.to_string())?;
+    collect_rows(rows)
+}
+
+pub fn update_background_job_status(
+    conn: &Connection,
+    id: &str,
+    status: &str,
+) -> Result<BackgroundJobRecord, String> {
+    let now = util::now_string();
+    conn.execute(
+        "UPDATE background_job SET status = ?1, ended_at = ?2 WHERE id = ?3",
+        params![status, &now, id],
+    )
+    .map_err(|error| error.to_string())?;
+    get_background_job(conn, id)
+}
+
 pub fn session_events_response(
     conn: &Connection,
     session_id: &str,
@@ -522,6 +944,10 @@ pub fn session_events_response(
         events: list_events(conn, session_id)?,
         snapshots: list_snapshots(conn, session_id)?,
         summaries: list_context_summaries(conn, session_id)?,
+        inputs: list_session_inputs(conn, session_id)?,
+        runs: list_session_runs(conn, session_id)?,
+        permissions: list_permission_requests(conn, session_id)?,
+        jobs: list_background_jobs(conn, session_id)?,
     })
 }
 
@@ -660,6 +1086,70 @@ fn context_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Context
     })
 }
 
+fn session_input_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionInputRecord> {
+    let delivery: String = row.get(3)?;
+    let resume: i64 = row.get(4)?;
+    Ok(SessionInputRecord {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        prompt: row.get(2)?,
+        delivery: SessionInputDelivery::from_str(&delivery).unwrap_or(SessionInputDelivery::Queue),
+        resume: resume != 0,
+        status: row.get(5)?,
+        promoted_event_id: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+fn session_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRunRecord> {
+    Ok(SessionRunRecord {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        status: row.get(2)?,
+        started_at: row.get(3)?,
+        ended_at: row.get(4)?,
+    })
+}
+
+fn permission_request_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PermissionRequestRecord> {
+    let resources_json: String = row.get(3)?;
+    let save_json: String = row.get(4)?;
+    let source_json: String = row.get(5)?;
+    let reply: Option<String> = row.get(7)?;
+    Ok(PermissionRequestRecord {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        action: row.get(2)?,
+        resources: serde_json::from_str(&resources_json).unwrap_or_default(),
+        save: serde_json::from_str(&save_json).unwrap_or_default(),
+        source_json: serde_json::from_str(&source_json).unwrap_or(Value::Null),
+        status: row.get(6)?,
+        reply: reply
+            .as_deref()
+            .and_then(|value| PermissionReply::from_str(value).ok()),
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+    })
+}
+
+fn background_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BackgroundJobRecord> {
+    let pid: i64 = row.get(4)?;
+    Ok(BackgroundJobRecord {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        command: row.get(2)?,
+        cwd: row.get(3)?,
+        pid: pid.max(0) as u32,
+        status: row.get(5)?,
+        log_path: row.get(6)?,
+        started_at: row.get(7)?,
+        ended_at: row.get(8)?,
+    })
+}
+
 fn collect_rows<T>(
     rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
 ) -> Result<Vec<T>, String> {
@@ -774,5 +1264,76 @@ mod tests {
             load_shell_policy(&conn).unwrap().auto_allowlist,
             saved.auto_allowlist
         );
+    }
+
+    #[test]
+    fn session_input_admission_is_idempotent() {
+        let conn = memory_db();
+        conn.execute(
+            "INSERT INTO session (id, project_root, mode, provider_id, title, status, shell_mode, created_at, updated_at)
+             VALUES ('s1', 'E:/oDot', 'agent', 'p1', 'Test', 'active', 'auto', '1', '1')",
+            [],
+        )
+        .unwrap();
+
+        let first = admit_session_input(
+            &conn,
+            Some("input-1".to_string()),
+            "s1",
+            "hi",
+            SessionInputDelivery::Queue,
+            true,
+        )
+        .unwrap();
+        let second = admit_session_input(
+            &conn,
+            Some("input-1".to_string()),
+            "s1",
+            "hi",
+            SessionInputDelivery::Queue,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(list_session_inputs(&conn, "s1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn permission_reply_always_saves_rule() {
+        let conn = memory_db();
+        let request = create_permission_request(
+            &conn,
+            "s1",
+            "bash",
+            vec!["npm run build".to_string()],
+            vec!["npm run build".to_string()],
+            json!({ "type": "tool" }),
+        )
+        .unwrap();
+
+        let replied =
+            reply_permission_request(&conn, &request.id, PermissionReply::Always, "E:/oDot")
+                .unwrap();
+
+        assert_eq!(replied.status, "answered");
+        assert!(permission_is_saved(&conn, "E:/oDot", "bash", "npm run build").unwrap());
+    }
+
+    #[test]
+    fn background_job_can_be_recorded() {
+        let conn = memory_db();
+        let job = insert_background_job(
+            &conn,
+            "s1",
+            "npm run dev",
+            "E:/oDot",
+            123,
+            Some("E:/oDot/.odot/jobs/test.log".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(job.status, "running");
+        assert_eq!(list_background_jobs(&conn, "s1").unwrap().len(), 1);
     }
 }

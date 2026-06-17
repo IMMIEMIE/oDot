@@ -7,7 +7,7 @@ use encoding_rs::GBK;
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::{
-    fs,
+    fs::{self, OpenOptions},
     io::Read,
     path::PathBuf,
     process::{Child, Command, Stdio},
@@ -133,8 +133,8 @@ pub fn approve_tool_call(conn: &Connection, event_id: &str) -> Result<EventRecor
         .get("name")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if name != "shell" {
-        return Err("当前版本只支持确认等待中的 shell 命令。".to_string());
+    if name != "shell" && name != "bash" {
+        return Err("当前版本只支持确认等待中的 shell/bash 命令。".to_string());
     }
 
     let command = event
@@ -143,6 +143,7 @@ pub fn approve_tool_call(conn: &Connection, event_id: &str) -> Result<EventRecor
         .and_then(Value::as_str)
         .ok_or_else(|| "等待确认的 shell 事件中没有命令内容。".to_string())?;
     let options = shell_run_options(event.data.pointer("/pending").unwrap_or(&Value::Null));
+    let cwd = shell_workdir(&session, &options)?;
     storage::append_event(
         conn,
         &session.id,
@@ -154,9 +155,9 @@ pub fn approve_tool_call(conn: &Connection, event_id: &str) -> Result<EventRecor
     )?;
 
     let result = if options.background {
-        run_shell_command_background(&session.project_root, command)?
+        run_shell_command_background(conn, &session, &cwd, command)?
     } else {
-        run_shell_command(&session.project_root, command, options.timeout_seconds)?
+        run_shell_command(&cwd, command, options.timeout_seconds)?
     };
     let event_type = if result.get("exitCode").and_then(Value::as_i64).unwrap_or(1) == 0 {
         "tool.success"
@@ -170,7 +171,7 @@ pub fn approve_tool_call(conn: &Connection, event_id: &str) -> Result<EventRecor
         event_type,
         json!({
             "pendingEventId": event.id,
-            "name": "shell",
+            "name": name,
             "result": result
         }),
     )
@@ -218,7 +219,7 @@ fn execute_tool_inner(
                 "content": truncate(&content, 40_000)
             })))
         }
-        "search" => {
+        "search" | "grep" => {
             let query = required_string(&call.input, "query")?;
             let matches = search_project(&session.project_root, &query)?;
             Ok(ToolRun::Success(json!({
@@ -281,29 +282,68 @@ fn execute_tool_inner(
                 "patch": snapshot.patch
             })))
         }
-        "shell" => {
+        "question" => {
+            let question = required_string_any(&call.input, &["question", "text"])?;
+            Ok(ToolRun::Pending(json!({
+                "kind": "question",
+                "question": question,
+                "reason": "Agent 请求用户回答。"
+            })))
+        }
+        "todo_write" | "todowrite" => {
+            let todos = call
+                .input
+                .get("todos")
+                .cloned()
+                .unwrap_or(Value::Array(Vec::new()));
+            Ok(ToolRun::Success(json!({
+                "todos": todos
+            })))
+        }
+        "shell" | "bash" => {
             let command = required_string(&call.input, "command")?;
             let options = shell_run_options(&call.input);
+            let cwd = shell_workdir(session, &options)?;
             if execution_mode == ToolExecutionMode::Plan {
+                let permission = storage::create_permission_request(
+                    conn,
+                    &session.id,
+                    "bash",
+                    vec![command.clone()],
+                    vec![command.clone()],
+                    json!({ "type": "tool", "eventId": called_event.id }),
+                )?;
                 return Ok(ToolRun::Pending(json!({
                     "command": command,
                     "background": options.background,
                     "timeoutSeconds": options.timeout_seconds,
+                    "permissionRequestId": permission.id,
                     "reason": "计划模式下 shell 命令必须由用户确认。"
                 })));
             }
-            if shell_needs_approval(&command, shell_mode, shell_policy) {
+            if shell_needs_approval(&command, shell_mode, shell_policy)
+                && !storage::permission_is_saved(conn, &session.project_root, "bash", &command)?
+            {
+                let permission = storage::create_permission_request(
+                    conn,
+                    &session.id,
+                    "bash",
+                    vec![command.clone()],
+                    vec![command.clone()],
+                    json!({ "type": "tool", "eventId": called_event.id }),
+                )?;
                 return Ok(ToolRun::Pending(json!({
                     "command": command,
                     "background": options.background,
                     "timeoutSeconds": options.timeout_seconds,
+                    "permissionRequestId": permission.id,
                     "reason": shell_approval_reason(&command, shell_mode, shell_policy)
                 })));
             }
             let result = if options.background {
-                run_shell_command_background(&session.project_root, &command)?
+                run_shell_command_background(conn, session, &cwd, &command)?
             } else {
-                run_shell_command(&session.project_root, &command, options.timeout_seconds)?
+                run_shell_command(&cwd, &command, options.timeout_seconds)?
             };
             if shell_exit_code(&result) == 0 {
                 Ok(ToolRun::Success(result))
@@ -393,10 +433,11 @@ fn search_project(root: &str, query: &str) -> Result<Vec<Value>, String> {
     Ok(matches)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ShellRunOptions {
     background: bool,
     timeout_seconds: u64,
+    workdir: Option<String>,
 }
 
 fn shell_run_options(input: &Value) -> ShellRunOptions {
@@ -406,7 +447,32 @@ fn shell_run_options(input: &Value) -> ShellRunOptions {
     ShellRunOptions {
         background: optional_bool(input, "background").unwrap_or(false),
         timeout_seconds,
+        workdir: optional_string_any(input, &["workdir", "cwd"]),
     }
+}
+
+fn shell_workdir(session: &SessionRecord, options: &ShellRunOptions) -> Result<String, String> {
+    let root = PathBuf::from(&session.project_root);
+    let dir = match options
+        .workdir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => {
+            let path = PathBuf::from(value);
+            if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            }
+        }
+        None => root,
+    };
+    if !dir.is_dir() {
+        return Err(format!("Shell 工作目录不存在或不是目录: {}", dir.display()));
+    }
+    Ok(dir.to_string_lossy().to_string())
 }
 
 fn run_shell_command(root: &str, command: &str, timeout_seconds: u64) -> Result<Value, String> {
@@ -457,20 +523,47 @@ fn run_shell_command(root: &str, command: &str, timeout_seconds: u64) -> Result<
     }))
 }
 
-fn run_shell_command_background(root: &str, command: &str) -> Result<Value, String> {
-    let root = PathBuf::from(root);
-    let child = shell_command(&root, command)
+fn run_shell_command_background(
+    conn: &Connection,
+    session: &SessionRecord,
+    cwd: &str,
+    command: &str,
+) -> Result<Value, String> {
+    let cwd_path = PathBuf::from(cwd);
+    let job_dir = PathBuf::from(&session.project_root)
+        .join(".odot")
+        .join("jobs");
+    fs::create_dir_all(&job_dir).map_err(|error| error.to_string())?;
+    let log_path = job_dir.join(format!("{}.log", uuid::Uuid::new_v4()));
+    let stdout = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|error| error.to_string())?;
+    let stderr = stdout.try_clone().map_err(|error| error.to_string())?;
+    let child = shell_command(&cwd_path, command)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
         .spawn()
         .map_err(|error| format!("启动后台 shell 命令失败: {error}"))?;
     let pid = child.id();
+    let job = storage::insert_background_job(
+        conn,
+        &session.id,
+        command,
+        cwd,
+        pid,
+        Some(log_path.to_string_lossy().to_string()),
+    )?;
     Ok(json!({
         "command": command,
         "exitCode": 0,
         "background": true,
         "pid": pid,
+        "jobId": job.id,
+        "cwd": cwd,
+        "logPath": job.log_path,
         "stdout": "",
         "stderr": ""
     }))
@@ -520,6 +613,74 @@ fn terminate_process_tree(child: &mut Child) {
             .status();
     }
     let _ = child.kill();
+}
+
+pub fn wait_job(conn: &Connection, job_id: &str) -> Result<Value, String> {
+    let job = storage::get_background_job(conn, job_id)?;
+    if job.status != "running" {
+        return Ok(json!({ "job": job, "running": false }));
+    }
+    let running = pid_is_running(job.pid);
+    let job = if running {
+        job
+    } else {
+        storage::update_background_job_status(conn, job_id, "completed")?
+    };
+    Ok(json!({ "job": job, "running": running }))
+}
+
+pub fn cancel_job(conn: &Connection, job_id: &str) -> Result<Value, String> {
+    let job = storage::get_background_job(conn, job_id)?;
+    terminate_pid_tree(job.pid);
+    let job = storage::update_background_job_status(conn, job_id, "cancelled")?;
+    Ok(json!({ "job": job }))
+}
+
+pub fn read_job_logs(conn: &Connection, job_id: &str) -> Result<Value, String> {
+    let job = storage::get_background_job(conn, job_id)?;
+    let logs = job
+        .log_path
+        .as_ref()
+        .and_then(|path| fs::read(path).ok())
+        .map(|bytes| truncate(&decode_process_output(&bytes), 30_000))
+        .unwrap_or_default();
+    Ok(json!({ "job": job, "logs": logs }))
+}
+
+fn pid_is_running(pid: u32) -> bool {
+    if cfg!(target_os = "windows") {
+        Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}")])
+            .output()
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .to_ascii_lowercase()
+                    .contains(&pid.to_string())
+            })
+            .unwrap_or(false)
+    } else {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+}
+
+fn terminate_pid_tree(pid: u32) {
+    if cfg!(target_os = "windows") {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    } else {
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 fn decode_process_output(bytes: &[u8]) -> String {

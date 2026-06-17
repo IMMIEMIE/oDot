@@ -9,6 +9,8 @@ export type ProviderKind =
 
 export type AgentMode = "ask" | "plan" | "agent";
 export type ShellMode = "manual" | "auto";
+export type SessionInputDelivery = "steer" | "queue";
+export type PermissionReply = "once" | "always" | "reject";
 
 export type ShellPolicy = {
   autoAllowlist: string[];
@@ -91,10 +93,59 @@ export type ContextSummaryRecord = {
   createdAt: string;
 };
 
+export type SessionInputRecord = {
+  id: string;
+  sessionId: string;
+  prompt: string;
+  delivery: SessionInputDelivery;
+  resume: boolean;
+  status: string;
+  promotedEventId?: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type SessionRunRecord = {
+  id: string;
+  sessionId: string;
+  status: string;
+  startedAt: string;
+  endedAt?: string | null;
+};
+
+export type PermissionRequestRecord = {
+  id: string;
+  sessionId: string;
+  action: string;
+  resources: string[];
+  save: string[];
+  sourceJson: unknown;
+  status: string;
+  reply?: PermissionReply | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type BackgroundJobRecord = {
+  id: string;
+  sessionId: string;
+  command: string;
+  cwd: string;
+  pid: number;
+  status: string;
+  logPath?: string | null;
+  startedAt: string;
+  endedAt?: string | null;
+};
+
 export type SessionEventsResponse = {
   events: EventRecord[];
   snapshots: SnapshotRecord[];
   summaries: ContextSummaryRecord[];
+  inputs: SessionInputRecord[];
+  runs: SessionRunRecord[];
+  permissions: PermissionRequestRecord[];
+  jobs: BackgroundJobRecord[];
 };
 
 export type ProjectFile = {
@@ -186,12 +237,43 @@ export async function getSessionEvents(
   return invoke<SessionEventsResponse>("get_session_events", { sessionId });
 }
 
+export async function tailSessionEvents(input: {
+  sessionId: string;
+  afterSeq?: number;
+}): Promise<SessionEventsResponse> {
+  assertTauri();
+  return invoke<SessionEventsResponse>("tail_session_events", { input });
+}
+
 export async function submitPrompt(input: {
   sessionId: string;
   prompt: string;
 }): Promise<SessionEventsResponse> {
   assertTauri();
   return invoke<SessionEventsResponse>("submit_prompt", { input });
+}
+
+export async function promptSession(input: {
+  id?: string;
+  sessionId: string;
+  prompt: string;
+  delivery?: SessionInputDelivery;
+  resume?: boolean;
+}): Promise<SessionEventsResponse> {
+  assertTauri();
+  return invoke<SessionEventsResponse>("prompt_session", { input });
+}
+
+export async function waitSession(
+  sessionId: string
+): Promise<SessionEventsResponse> {
+  assertTauri();
+  return invoke<SessionEventsResponse>("wait_session", { sessionId });
+}
+
+export async function interruptSession(sessionId: string): Promise<EventRecord> {
+  assertTauri();
+  return invoke<EventRecord>("interrupt_session", { sessionId });
 }
 
 export async function continueSession(
@@ -209,6 +291,29 @@ export async function approveToolCall(eventId: string): Promise<EventRecord> {
 export async function rejectToolCall(eventId: string): Promise<EventRecord> {
   assertTauri();
   return invoke<EventRecord>("reject_tool_call", { eventId });
+}
+
+export async function replyPermission(input: {
+  requestId: string;
+  reply: PermissionReply;
+}): Promise<PermissionRequestRecord> {
+  assertTauri();
+  return invoke<PermissionRequestRecord>("reply_permission", { input });
+}
+
+export async function waitJob(jobId: string): Promise<Record<string, unknown>> {
+  assertTauri();
+  return invoke<Record<string, unknown>>("wait_job", { jobId });
+}
+
+export async function cancelJob(jobId: string): Promise<Record<string, unknown>> {
+  assertTauri();
+  return invoke<Record<string, unknown>>("cancel_job", { jobId });
+}
+
+export async function readJobLogs(jobId: string): Promise<Record<string, unknown>> {
+  assertTauri();
+  return invoke<Record<string, unknown>>("read_job_logs", { jobId });
 }
 
 export async function rollbackSnapshot(

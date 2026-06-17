@@ -1,10 +1,14 @@
 use crate::{
     config_file, provider, storage, tools,
-    types::{AgentMode, ContextSummaryRecord, ModelTurn, SessionEventsResponse, SubmitPromptInput},
+    types::{
+        AgentMode, ContextSummaryRecord, ModelTurn, PromptSessionInput, SessionEventsResponse,
+        SessionInputDelivery, SubmitPromptInput,
+    },
     util,
 };
 use rusqlite::Connection;
 use serde_json::{json, Value};
+use std::{fs, path::PathBuf};
 use tauri::AppHandle;
 
 const MAX_STEPS: usize = 25;
@@ -16,20 +20,49 @@ pub async fn submit_prompt(
     conn: &Connection,
     input: SubmitPromptInput,
 ) -> Result<SessionEventsResponse, String> {
-    let session = storage::get_session(conn, &input.session_id)?;
-    storage::set_session_status(conn, &session.id, "active")?;
+    prompt_session(
+        app,
+        conn,
+        PromptSessionInput {
+            id: None,
+            session_id: input.session_id,
+            prompt: input.prompt,
+            delivery: Some(SessionInputDelivery::Queue),
+            resume: true,
+        },
+    )
+    .await
+}
 
+pub async fn prompt_session(
+    app: &AppHandle,
+    conn: &Connection,
+    input: PromptSessionInput,
+) -> Result<SessionEventsResponse, String> {
+    let admitted = storage::admit_session_input(
+        conn,
+        input.id,
+        &input.session_id,
+        &input.prompt,
+        input.delivery.unwrap_or(SessionInputDelivery::Queue),
+        input.resume,
+    )?;
     storage::append_event(
         conn,
-        &session.id,
-        "prompt.submitted",
+        &admitted.session_id,
+        "session.input.admitted",
         json!({
-            "prompt": input.prompt
+            "inputId": admitted.id,
+            "delivery": admitted.delivery,
+            "resume": admitted.resume
         }),
     )?;
-    maybe_auto_compact(conn, &session.id)?;
 
-    run_session_steps(app, conn, &session, &input.prompt).await
+    if admitted.resume {
+        resume_session(app, conn, admitted.session_id).await
+    } else {
+        storage::session_events_response(conn, &admitted.session_id)
+    }
 }
 
 pub async fn continue_session(
@@ -46,6 +79,49 @@ pub async fn continue_session(
         "Continue from the latest tool result. Inspect recent tool success/failure output, then either call the next needed tool or provide the final user-facing answer.",
     )
     .await
+}
+
+pub async fn resume_session(
+    app: &AppHandle,
+    conn: &Connection,
+    session_id: String,
+) -> Result<SessionEventsResponse, String> {
+    let run = storage::begin_session_run(conn, &session_id)?;
+    let result = resume_session_inner(app, conn, &session_id).await;
+    let status = if result.is_ok() {
+        "completed"
+    } else {
+        "failed"
+    };
+    let _ = storage::end_session_run(conn, &run.id, status);
+    result
+}
+
+async fn resume_session_inner(
+    app: &AppHandle,
+    conn: &Connection,
+    session_id: &str,
+) -> Result<SessionEventsResponse, String> {
+    let session = storage::get_session(conn, session_id)?;
+    storage::set_session_status(conn, &session.id, "active")?;
+    let prompt = if let Some(input) = storage::next_pending_session_input(conn, &session.id)? {
+        let event = storage::append_event(
+            conn,
+            &session.id,
+            "prompt.submitted",
+            json!({
+                "inputId": input.id,
+                "prompt": input.prompt,
+                "delivery": input.delivery
+            }),
+        )?;
+        storage::mark_session_input_promoted(conn, &input.id, &event.id)?;
+        input.prompt
+    } else {
+        "Continue from the latest tool result. Inspect recent tool success/failure output, then either call the next needed tool or provide the final user-facing answer.".to_string()
+    };
+    maybe_auto_compact(conn, &session.id)?;
+    run_session_steps(app, conn, &session, &prompt).await
 }
 
 async fn run_session_steps(
@@ -386,7 +462,10 @@ Tool guidance:
 - edit: replace exact text in an existing file. Prefer edit for code changes.
 - write: create a new file or intentionally replace a whole small file. Avoid full-file rewrites for existing large files unless necessary.
 - delete: delete a file.
-- shell: run verification commands. Foreground commands time out by default; use background=true for long-running dev servers such as npm run dev.
+- bash/shell: run verification commands. Foreground commands time out by default; use background=true for long-running dev servers such as npm run dev.
+- grep/search: search project text.
+- question: ask the user when blocked on an important choice.
+- todo_write: publish a short task checklist.
 
 Shell environment:
 {shell_environment}
@@ -410,7 +489,7 @@ JSON schema:
   "message": "user-facing response or progress note",
   "toolCalls": [
     {{
-      "name": "read|search|edit|write|delete|shell",
+      "name": "read|search|grep|edit|write|delete|shell|bash|question|todo_write",
       "input": {{}}
     }}
   ],
@@ -423,7 +502,9 @@ Tool inputs:
 - edit: {{"path":"relative/path","oldString":"exact text","newString":"replacement text"}}
 - write: {{"path":"relative/path","content":"complete file content","expectedHash":"optional sha256"}}. Prefer edit for existing large files; use write for new files or intentional full replacement.
 - delete: {{"path":"relative/path"}}
-- shell: {{"command":"test/lint/build command","timeoutSeconds":60,"background":false}}. Use background=true for long-running dev servers such as npm run dev.
+- shell/bash: {{"command":"test/lint/build command","workdir":"optional/path","timeoutSeconds":60,"background":false}}. Use background=true for long-running dev servers such as npm run dev.
+- question: {{"question":"short question"}}
+- todo_write: {{"todos":[{{"text":"task","status":"pending|in_progress|done"}}]}}
 
 Shell environment:
 {shell_environment}
@@ -458,6 +539,8 @@ fn build_user_prompt(
         .first()
         .map(|summary| summary.text.as_str())
         .unwrap_or("当前还没有压缩上下文。");
+    let session = storage::get_session(conn, session_id)?;
+    let project_context = project_context_text(&session.project_root);
 
     let event_lines = events
         .iter()
@@ -473,8 +556,25 @@ fn build_user_prompt(
         .join("\n");
 
     Ok(format!(
-        "Current user prompt:\n{current_prompt}\n\nCompressed context:\n{summary}\n\nRecent event timeline:\n{event_lines}"
+        "Current user prompt:\n{current_prompt}\n\nProject context:\n{project_context}\n\nCompressed context:\n{summary}\n\nRecent event timeline:\n{event_lines}"
     ))
+}
+
+fn project_context_text(project_root: &str) -> String {
+    let mut lines = vec![
+        format!("Host OS: {}", std::env::consts::OS),
+        format!("Host arch: {}", std::env::consts::ARCH),
+        format!("Project root: {project_root}"),
+        format!("Local date: {}", util::now_string()),
+    ];
+    let root = PathBuf::from(project_root);
+    for name in ["AGENTS.md", "CONTEXT.md"] {
+        let path = root.join(name);
+        if let Ok(content) = fs::read_to_string(&path) {
+            lines.push(format!("{name}:\n{}", truncate(&content, 8_000)));
+        }
+    }
+    truncate(&lines.join("\n\n"), 12_000)
 }
 
 fn parse_model_turn(raw_response: &str) -> Result<ModelTurn, String> {

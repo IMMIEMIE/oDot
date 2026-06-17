@@ -87,6 +87,57 @@ impl ShellMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionInputDelivery {
+    Steer,
+    Queue,
+}
+
+impl SessionInputDelivery {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Steer => "steer",
+            Self::Queue => "queue",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Result<Self, String> {
+        match value {
+            "steer" => Ok(Self::Steer),
+            "queue" => Ok(Self::Queue),
+            _ => Err(format!("Unsupported session input delivery: {value}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionReply {
+    Once,
+    Always,
+    Reject,
+}
+
+impl PermissionReply {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Once => "once",
+            Self::Always => "always",
+            Self::Reject => "reject",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Result<Self, String> {
+        match value {
+            "once" => Ok(Self::Once),
+            "always" => Ok(Self::Always),
+            "reject" => Ok(Self::Reject),
+            _ => Err(format!("Unsupported permission reply: {value}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderInput {
     pub id: Option<String>,
@@ -207,10 +258,71 @@ pub struct ContextSummaryRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SessionInputRecord {
+    pub id: String,
+    pub session_id: String,
+    pub prompt: String,
+    pub delivery: SessionInputDelivery,
+    pub resume: bool,
+    pub status: String,
+    pub promoted_event_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRunRecord {
+    pub id: String,
+    pub session_id: String,
+    pub status: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionRequestRecord {
+    pub id: String,
+    pub session_id: String,
+    pub action: String,
+    pub resources: Vec<String>,
+    pub save: Vec<String>,
+    pub source_json: Value,
+    pub status: String,
+    pub reply: Option<PermissionReply>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundJobRecord {
+    pub id: String,
+    pub session_id: String,
+    pub command: String,
+    pub cwd: String,
+    pub pid: u32,
+    pub status: String,
+    pub log_path: Option<String>,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionEventsResponse {
     pub events: Vec<EventRecord>,
     pub snapshots: Vec<SnapshotRecord>,
     pub summaries: Vec<ContextSummaryRecord>,
+    #[serde(default)]
+    pub inputs: Vec<SessionInputRecord>,
+    #[serde(default)]
+    pub runs: Vec<SessionRunRecord>,
+    #[serde(default)]
+    pub permissions: Vec<PermissionRequestRecord>,
+    #[serde(default)]
+    pub jobs: Vec<BackgroundJobRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +345,35 @@ pub struct ProjectFile {
 pub struct SubmitPromptInput {
     pub session_id: String,
     pub prompt: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptSessionInput {
+    pub id: Option<String>,
+    pub session_id: String,
+    pub prompt: String,
+    pub delivery: Option<SessionInputDelivery>,
+    #[serde(default = "default_resume")]
+    pub resume: bool,
+}
+
+fn default_resume() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TailSessionEventsInput {
+    pub session_id: String,
+    pub after_seq: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplyPermissionInput {
+    pub request_id: String,
+    pub reply: PermissionReply,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
