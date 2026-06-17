@@ -1,12 +1,96 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 
-export type ProviderConfig = {
+export type ProviderKind =
+  | "openai"
+  | "anthropic"
+  | "openai-compatible"
+  | "anthropic-compatible";
+
+export type AgentMode = "ask" | "plan" | "agent";
+export type ShellMode = "manual" | "auto";
+
+export type ProviderInput = {
+  id?: string;
+  kind: ProviderKind;
   name: string;
-  baseUrl: string;
-  apiKey?: string;
+  baseUrl?: string;
   model: string;
-  temperature?: number;
+  apiKey?: string;
+};
+
+export type ProviderRecord = {
+  id: string;
+  kind: ProviderKind;
+  name: string;
+  baseUrl?: string | null;
+  model: string;
+  credentialRef: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ProviderConfigFileResponse = {
+  path: string;
+  content: string;
+  providers: ProviderRecord[];
+  selectedProviderId?: string | null;
+};
+
+export type CreateSessionInput = {
+  projectRoot: string;
+  mode: AgentMode;
+  providerId: string;
+  shellMode: ShellMode;
+  title?: string;
+};
+
+export type SessionRecord = {
+  id: string;
+  projectRoot: string;
+  mode: AgentMode;
+  providerId: string;
+  title: string;
+  status: string;
+  shellMode: ShellMode;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type EventRecord = {
+  id: string;
+  sessionId: string;
+  seq: number;
+  type: string;
+  data: Record<string, unknown>;
+  createdAt: string;
+};
+
+export type SnapshotRecord = {
+  id: string;
+  sessionId: string;
+  eventId?: string | null;
+  path: string;
+  beforeHash: string;
+  afterHash: string;
+  beforeContent?: string | null;
+  afterContent?: string | null;
+  patch: string;
+  createdAt: string;
+};
+
+export type ContextSummaryRecord = {
+  id: string;
+  sessionId: string;
+  text: string;
+  recentEventSeq: number;
+  createdAt: string;
+};
+
+export type SessionEventsResponse = {
+  events: EventRecord[];
+  snapshots: SnapshotRecord[];
+  summaries: ContextSummaryRecord[];
 };
 
 export type ProjectFile = {
@@ -16,67 +100,101 @@ export type ProjectFile = {
   language: string;
 };
 
-export type ProposedFileChange = {
-  path: string;
-  originalContent: string;
-  updatedContent: string;
-  patch: string;
-};
+export async function saveProvider(
+  input: ProviderInput
+): Promise<ProviderRecord> {
+  assertTauri();
+  return invoke<ProviderRecord>("save_provider", { input });
+}
 
-export type ChangePlan = {
-  id: string;
-  summary: string;
-  createdAt: string;
-  provider: string;
-  model: string;
-  changes: ProposedFileChange[];
-  rawResponse: string;
-};
+export async function listProviders(): Promise<ProviderRecord[]> {
+  assertTauri();
+  return invoke<ProviderRecord[]>("list_providers");
+}
+
+export async function deleteProvider(id: string): Promise<void> {
+  assertTauri();
+  return invoke<void>("delete_provider", { id });
+}
+
+export async function loadProviderConfig(
+  projectRoot?: string
+): Promise<ProviderConfigFileResponse> {
+  assertTauri();
+  return invoke<ProviderConfigFileResponse>("load_provider_config", {
+    projectRoot: projectRoot?.trim() || null
+  });
+}
+
+export async function saveProviderConfig(
+  content: string,
+  projectRoot?: string
+): Promise<ProviderConfigFileResponse> {
+  assertTauri();
+  return invoke<ProviderConfigFileResponse>("save_provider_config", {
+    content,
+    projectRoot: projectRoot?.trim() || null
+  });
+}
+
+export async function createSession(
+  input: CreateSessionInput
+): Promise<SessionRecord> {
+  assertTauri();
+  return invoke<SessionRecord>("create_session", { input });
+}
+
+export async function listSessions(): Promise<SessionRecord[]> {
+  assertTauri();
+  return invoke<SessionRecord[]>("list_sessions");
+}
+
+export async function getSessionEvents(
+  sessionId: string
+): Promise<SessionEventsResponse> {
+  assertTauri();
+  return invoke<SessionEventsResponse>("get_session_events", { sessionId });
+}
+
+export async function submitPrompt(input: {
+  sessionId: string;
+  prompt: string;
+}): Promise<SessionEventsResponse> {
+  assertTauri();
+  return invoke<SessionEventsResponse>("submit_prompt", { input });
+}
+
+export async function approveToolCall(eventId: string): Promise<EventRecord> {
+  assertTauri();
+  return invoke<EventRecord>("approve_tool_call", { eventId });
+}
+
+export async function rejectToolCall(eventId: string): Promise<EventRecord> {
+  assertTauri();
+  return invoke<EventRecord>("reject_tool_call", { eventId });
+}
+
+export async function rollbackSnapshot(
+  snapshotId: string
+): Promise<SnapshotRecord> {
+  assertTauri();
+  return invoke<SnapshotRecord>("rollback_snapshot", { snapshotId });
+}
+
+export async function compactSession(
+  sessionId: string
+): Promise<ContextSummaryRecord> {
+  assertTauri();
+  return invoke<ContextSummaryRecord>("compact_session", { sessionId });
+}
 
 export async function fetchProjectFiles(root: string): Promise<ProjectFile[]> {
-  if (isTauri()) {
-    return invoke<ProjectFile[]>("list_project_files", { root });
-  }
-
-  const payload = await postJson<{ files: ProjectFile[] }>("/api/project/files", {
-    root
-  });
-  return payload.files;
-}
-
-export async function proposeChange(input: {
-  root: string;
-  paths: string[];
-  instruction: string;
-  provider: ProviderConfig;
-}): Promise<ChangePlan> {
-  if (isTauri()) {
-    return invoke<ChangePlan>("propose_code_change", input);
-  }
-
-  const payload = await postJson<{ plan: ChangePlan }>("/api/ai/propose", input);
-  return payload.plan;
-}
-
-export async function applyChanges(input: {
-  root: string;
-  changes: ProposedFileChange[];
-}): Promise<{ applied: string[]; backupDir: string }> {
-  if (isTauri()) {
-    return invoke<{ applied: string[]; backupDir: string }>("apply_file_changes", input);
-  }
-
-  const payload = await postJson<{
-    result: { applied: string[]; backupDir: string };
-  }>("/api/changes/apply", input);
-  return payload.result;
+  assertTauri();
+  return invoke<ProjectFile[]>("list_project_files", { root });
 }
 
 export async function pickProjectDirectory(): Promise<string | null> {
-  if (!isTauri()) {
-    return null;
-  }
-
+  assertTauri();
   const selected = await open({
     directory: true,
     multiple: false,
@@ -86,23 +204,8 @@ export async function pickProjectDirectory(): Promise<string | null> {
   return typeof selected === "string" ? selected : null;
 }
 
-async function postJson<TResponse>(
-  url: string,
-  body: unknown
-): Promise<TResponse> {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(body)
-  });
-
-  const payload = await response.json();
-
-  if (!response.ok) {
-    throw new Error(payload.error ?? "oDot request failed.");
+function assertTauri() {
+  if (!isTauri()) {
+    throw new Error("oDot 桌面 API 只能在 Tauri 应用内使用。");
   }
-
-  return payload as TResponse;
 }

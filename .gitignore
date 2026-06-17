@@ -1,5 +1,6 @@
 node_modules/
 dist/
+opencode/
 .vite/
 .env
 .env.local
