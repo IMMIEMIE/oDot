@@ -10,6 +10,10 @@ export type ProviderKind =
 export type AgentMode = "ask" | "plan" | "agent";
 export type ShellMode = "manual" | "auto";
 
+export type ShellPolicy = {
+  autoAllowlist: string[];
+};
+
 export type ProviderInput = {
   id?: string;
   kind: ProviderKind;
@@ -149,6 +153,11 @@ export async function listSessions(): Promise<SessionRecord[]> {
   return invoke<SessionRecord[]>("list_sessions");
 }
 
+export async function deleteSession(sessionId: string): Promise<void> {
+  assertTauri();
+  return invoke<void>("delete_session", { sessionId });
+}
+
 export async function getSessionEvents(
   sessionId: string
 ): Promise<SessionEventsResponse> {
@@ -162,6 +171,13 @@ export async function submitPrompt(input: {
 }): Promise<SessionEventsResponse> {
   assertTauri();
   return invoke<SessionEventsResponse>("submit_prompt", { input });
+}
+
+export async function continueSession(
+  sessionId: string
+): Promise<SessionEventsResponse> {
+  assertTauri();
+  return invoke<SessionEventsResponse>("continue_session", { sessionId });
 }
 
 export async function approveToolCall(eventId: string): Promise<EventRecord> {
@@ -186,6 +202,18 @@ export async function compactSession(
 ): Promise<ContextSummaryRecord> {
   assertTauri();
   return invoke<ContextSummaryRecord>("compact_session", { sessionId });
+}
+
+export async function loadShellPolicy(): Promise<ShellPolicy> {
+  assertTauri();
+  return invoke<ShellPolicy>("load_shell_policy");
+}
+
+export async function saveShellPolicy(
+  policy: ShellPolicy
+): Promise<ShellPolicy> {
+  assertTauri();
+  return invoke<ShellPolicy>("save_shell_policy", { policy });
 }
 
 export async function fetchProjectFiles(root: string): Promise<ProjectFile[]> {

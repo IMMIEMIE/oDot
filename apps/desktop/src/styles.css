@@ -30,8 +30,9 @@
 body {
   margin: 0;
   min-width: 1120px;
-  min-height: 100vh;
+  height: 100vh;
   background: var(--bg);
+  overflow: hidden;
 }
 
 button,
@@ -82,19 +83,21 @@ textarea:focus {
 }
 
 .appShell {
-  min-height: 100vh;
+  height: 100vh;
   display: grid;
   color: var(--ink);
+  overflow: hidden;
 }
 
 .leftPane,
 .rightPane {
-  min-height: 100vh;
+  height: 100vh;
   background: var(--surface);
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
   min-width: 0;
+  overflow: hidden;
 }
 
 .rightPane {
@@ -103,7 +106,7 @@ textarea:focus {
 }
 
 .resizeHandle {
-  min-height: 100vh;
+  height: 100vh;
   background: #dfe4ea;
   cursor: col-resize;
   transition:
@@ -118,7 +121,7 @@ textarea:focus {
 }
 
 .brandRow {
-  height: 68px;
+  height: 56px;
   display: flex;
   align-items: center;
   gap: 11px;
@@ -129,8 +132,8 @@ textarea:focus {
 }
 
 .brandIcon {
-  width: 36px;
-  height: 36px;
+  width: 32px;
+  height: 32px;
   display: grid;
   place-items: center;
   border-radius: 8px;
@@ -146,7 +149,7 @@ textarea:focus {
 }
 
 .brandRow strong {
-  font-size: 18px;
+  font-size: 16px;
 }
 
 .brandRow small,
@@ -160,7 +163,7 @@ textarea:focus {
 
 .leftSection,
 .rightSection {
-  padding: 14px;
+  padding: 12px;
   border-bottom: 1px solid var(--border);
   display: grid;
   gap: 10px;
@@ -173,9 +176,20 @@ textarea:focus {
   flex: 1;
 }
 
+.sessionsSection {
+  grid-template-rows: auto 36px minmax(0, 1fr);
+}
+
+.sessionsSection > .commandButton {
+  height: 36px;
+  min-height: 36px;
+  align-self: stretch;
+}
+
 .projectSection {
-  min-height: 220px;
+  min-height: 180px;
   flex: 1.2;
+  grid-template-rows: auto auto auto minmax(0, 1fr);
 }
 
 .providerConfigSection {
@@ -188,6 +202,14 @@ textarea:focus {
   align-items: center;
   gap: 8px;
   color: #3a4652;
+}
+
+.sectionTitleRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
 }
 
 .configPath {
@@ -204,20 +226,39 @@ textarea:focus {
   overflow-wrap: anywhere;
 }
 
-.configEditor {
-  min-height: 180px;
-  max-height: 300px;
-  font-family:
-    "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  font-size: 12px;
-  white-space: pre;
-  overflow: auto;
+.providerMiniActions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px;
 }
 
-.providerActions {
+.providerSummary {
+  width: 100%;
+  min-height: 54px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #ffffff;
+  color: #26313a;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) 18px;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 10px;
+  text-align: left;
+}
+
+.providerSummary span {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.providerSummary strong,
+.providerSummary small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .pathRow {
@@ -380,11 +421,13 @@ textarea:focus {
   color: #ffffff;
   background: var(--blue);
   white-space: nowrap;
+  min-width: 0;
 }
 
 .commandButton {
   width: 100%;
   font-weight: 700;
+  padding: 0 10px;
 }
 
 .iconButton {
@@ -407,18 +450,27 @@ textarea:focus {
 }
 
 .iconTextButton {
-  min-width: 94px;
+  min-width: 0;
   padding: 0 12px;
   color: #41505d;
   background: var(--surface-soft);
   border: 1px solid var(--border);
 }
 
+.iconTextButton,
+.commandButton,
+.runButton,
+.rollbackButton {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .mainPane {
   min-width: 0;
-  min-height: 100vh;
+  height: 100vh;
   display: grid;
-  grid-template-rows: 68px minmax(0, 1fr);
+  grid-template-rows: 56px minmax(0, 1fr);
+  overflow: hidden;
 }
 
 .topBar {
@@ -426,7 +478,7 @@ textarea:focus {
   align-items: center;
   justify-content: space-between;
   gap: 14px;
-  padding: 0 18px;
+  padding: 0 14px;
   border-bottom: 1px solid var(--border);
   background: #fbfbfc;
 }
@@ -448,8 +500,8 @@ textarea:focus {
 }
 
 .segmented button {
-  min-width: 64px;
-  height: 28px;
+  min-width: 56px;
+  height: 26px;
   border: 0;
   border-radius: 5px;
   background: transparent;
@@ -494,15 +546,17 @@ textarea:focus {
 .timelinePane {
   min-height: 0;
   display: grid;
-  grid-template-rows: 60px minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  overflow: hidden;
 }
 
 .paneHeader {
+  min-height: 64px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 0 18px;
+  padding: 8px 18px;
   border-bottom: 1px solid var(--border);
   background: #ffffff;
 }
@@ -513,10 +567,38 @@ textarea:focus {
   gap: 2px;
 }
 
+.contextUsage {
+  width: min(260px, 100%);
+  display: grid;
+  grid-template-columns: auto minmax(64px, 1fr);
+  align-items: center;
+  gap: 8px;
+  color: #42505d;
+  font-size: 12px;
+}
+
+.contextUsage span {
+  white-space: nowrap;
+}
+
+.contextTrack {
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e2e8ee;
+}
+
+.contextTrack i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--teal);
+}
+
 .timeline {
   min-height: 0;
   overflow: auto;
-  padding: 18px;
+  padding: 14px;
   display: grid;
   align-content: start;
   gap: 12px;
@@ -570,6 +652,20 @@ textarea:focus {
   border-bottom: 1px solid var(--border);
 }
 
+.eventHeaderButton {
+  min-width: 0;
+  flex: 1;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  text-align: left;
+}
+
 .eventBody header strong {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -583,11 +679,75 @@ textarea:focus {
 }
 
 .eventBody p,
-.eventDetailStack {
+.eventDetailStack,
+.markdownFrame,
+.markdownBody {
   margin: 0;
   padding: 10px 11px;
   color: #34414d;
   overflow-wrap: anywhere;
+}
+
+.markdownFrame {
+  position: relative;
+  display: grid;
+  gap: 8px;
+}
+
+.markdownBody {
+  display: grid;
+  gap: 8px;
+  line-height: 1.55;
+  padding: 0;
+}
+
+.markdownFrame.collapsed .markdownBody {
+  max-height: 260px;
+  overflow: hidden;
+}
+
+.markdownFrame.collapsed::after {
+  content: "";
+  position: absolute;
+  left: 11px;
+  right: 11px;
+  bottom: 45px;
+  height: 42px;
+  pointer-events: none;
+  background: linear-gradient(rgba(255, 255, 255, 0), #ffffff);
+}
+
+.collapseToggle {
+  justify-self: start;
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: #41505d;
+  background: var(--surface-soft);
+}
+
+.markdownBody > * {
+  margin: 0;
+}
+
+.markdownBody ul,
+.markdownBody ol {
+  padding-left: 20px;
+}
+
+.markdownBody code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: #eef2f5;
+  font-family:
+    "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+}
+
+.markdownBody pre {
+  border-radius: 6px;
+  white-space: pre-wrap;
 }
 
 pre {
@@ -609,7 +769,7 @@ pre {
 }
 
 .promptBar {
-  padding: 14px 18px;
+  padding: 12px 14px;
   border-top: 1px solid var(--border);
   background: #ffffff;
   display: grid;
@@ -618,19 +778,31 @@ pre {
 }
 
 .promptBar textarea {
-  min-height: 76px;
-  max-height: 180px;
+  min-height: 64px;
+  max-height: 140px;
 }
 
 .runButton {
   align-self: stretch;
-  min-height: 76px;
+  min-height: 64px;
   background: var(--green);
   font-weight: 800;
 }
 
 .rightSection {
   background: #ffffff;
+  min-height: 0;
+}
+
+.snapshotsSection {
+  overflow: hidden;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.snapshotsSection .snapshotList {
+  min-height: 0;
+  overflow: auto;
+  padding-right: 2px;
 }
 
 .errorSection {
@@ -712,6 +884,149 @@ pre {
 .emptyTimeline {
   min-height: 220px;
   gap: 8px;
+}
+
+.rowIconAction {
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
+  color: var(--muted);
+}
+
+.rowIconAction:hover {
+  color: #ffffff;
+  background: var(--red);
+}
+
+.modalBackdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 22px;
+  background: rgba(18, 24, 31, 0.42);
+}
+
+.settingsModal {
+  width: min(760px, calc(100vw - 44px));
+  max-height: calc(100vh - 44px);
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  overflow: hidden;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 24px 60px rgba(17, 24, 39, 0.28);
+}
+
+.modalHeader,
+.modalFooter {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.modalFooter {
+  justify-content: flex-end;
+  border-top: 1px solid var(--border);
+  border-bottom: 0;
+}
+
+.modalHeader > div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.modalHeader strong {
+  font-size: 15px;
+}
+
+.modalHeader small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.settingsBody {
+  min-height: 0;
+  overflow: auto;
+  padding: 14px;
+  display: grid;
+  gap: 12px;
+}
+
+.settingsGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.settingsGrid label {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+  color: #3c4853;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.settingsWide {
+  grid-column: 1 / -1;
+}
+
+.allowlistEditor {
+  min-height: 112px;
+  max-height: 180px;
+  font-family:
+    "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  resize: vertical;
+}
+
+.advancedToggle {
+  min-height: 32px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-soft);
+  color: #34414d;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 7px;
+  padding: 0 10px;
+}
+
+.settingsJsonEditor {
+  min-height: 220px;
+  max-height: 340px;
+  font-family:
+    "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  white-space: pre;
+  overflow: auto;
+}
+
+.modalError {
+  max-height: 160px;
+  white-space: pre-wrap;
+  border: 1px solid #f0c4bf;
+  border-radius: 6px;
+  color: #6d231c;
+  background: #fff7f6;
+}
+
+.modalSaveButton {
+  width: auto;
+  min-width: 116px;
 }
 
 .spin {

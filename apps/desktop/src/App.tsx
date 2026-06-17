@@ -17,24 +17,31 @@ import {
   RotateCcw,
   Save,
   Search,
+  Settings,
   Terminal,
+  Trash2,
   Wrench,
   X
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import type { PointerEvent, ReactNode } from "react";
+import ReactMarkdown from "react-markdown";
 import {
   approveToolCall,
   compactSession,
+  continueSession,
   createSession,
+  deleteSession,
   fetchProjectFiles,
   getSessionEvents,
   listSessions,
+  loadShellPolicy,
   loadProviderConfig,
   pickProjectDirectory,
   rejectToolCall,
   rollbackSnapshot,
   saveProviderConfig,
+  saveShellPolicy,
   submitPrompt,
   type AgentMode,
   type EventRecord,
@@ -43,6 +50,7 @@ import {
   type ProviderRecord,
   type SessionEventsResponse,
   type SessionRecord,
+  type ShellPolicy,
   type ShellMode,
   type SnapshotRecord
 } from "./api";
@@ -80,8 +88,12 @@ export function App() {
   const [selectedSessionId, setSelectedSessionId] = useState("");
   const [mode, setMode] = useState<AgentMode>("agent");
   const [shellMode, setShellMode] = useState<ShellMode>("manual");
+  const [shellPolicy, setShellPolicy] = useState<ShellPolicy>({
+    autoAllowlist: []
+  });
   const [eventsResponse, setEventsResponse] =
     useState<SessionEventsResponse>(EMPTY_EVENTS);
+  const [streamingEventId, setStreamingEventId] = useState<string | null>(null);
   const [prompt, setPrompt] = useState("");
   const [lastError, setLastError] = useState<string | null>(null);
   const [notice, setNotice] = useState<Notice>({
@@ -94,6 +106,7 @@ export function App() {
   const [isCreatingSession, setIsCreatingSession] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isMutating, setIsMutating] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [leftWidth, setLeftWidth] = useState(() => {
     const stored = Number(localStorage.getItem("odot.leftWidth"));
     return Number.isFinite(stored) && stored >= 300 ? stored : 420;
@@ -146,17 +159,30 @@ export function App() {
     );
   }, [eventsResponse.events]);
 
+  const contextUsage = useMemo(
+    () =>
+      estimateContextUsage({
+        eventsResponse,
+        configContent,
+        selectedProviderId,
+        draftPrompt: prompt
+      }),
+    [configContent, eventsResponse, prompt, selectedProviderId]
+  );
+
   async function bootstrap() {
     setIsBooting(true);
     try {
-      const [config, nextSessions] = await Promise.all([
+      const [config, nextSessions, policy] = await Promise.all([
         loadProviderConfig(projectRoot),
-        listSessions()
+        listSessions(),
+        loadShellPolicy()
       ]);
       setConfigPath(config.path);
       setConfigContent(config.content);
       setProviders(config.providers);
       setSessions(nextSessions);
+      setShellPolicy(policy);
       const preferredProviderId = preferredConfigProviderId(config);
       if (preferredProviderId) {
         setSelectedProviderId(preferredProviderId);
@@ -197,10 +223,43 @@ export function App() {
   async function saveConfig() {
     setIsSavingConfig(true);
     try {
-      const config = await saveProviderConfig(configContent, projectRoot);
+      await applyProviderConfig(configContent);
+      setNotice({ tone: "success", text: "AI 服务配置已保存并同步" });
+    } catch (error) {
+      reportError(error);
+    } finally {
+      setIsSavingConfig(false);
+    }
+  }
+
+  async function applyProviderConfig(content: string) {
+    const config = await saveProviderConfig(content, projectRoot);
+    setConfigPath(config.path);
+    setConfigContent(config.content);
+    setProviders(config.providers);
+    const preferredProviderId = preferredConfigProviderId(config);
+    if (
+      preferredProviderId !== selectedProviderId ||
+      !config.providers.some((provider) => provider.id === selectedProviderId)
+    ) {
+      setSelectedProviderId(preferredProviderId);
+      setSelectedSessionId("");
+      setEventsResponse(EMPTY_EVENTS);
+    }
+    return config;
+  }
+
+  async function saveSettings(content: string, policy: ShellPolicy) {
+    setIsSavingConfig(true);
+    try {
+      const [config, savedPolicy] = await Promise.all([
+        saveProviderConfig(content, projectRoot),
+        saveShellPolicy(policy)
+      ]);
       setConfigPath(config.path);
       setConfigContent(config.content);
       setProviders(config.providers);
+      setShellPolicy(savedPolicy);
       const preferredProviderId = preferredConfigProviderId(config);
       if (
         preferredProviderId !== selectedProviderId ||
@@ -210,9 +269,11 @@ export function App() {
         setSelectedSessionId("");
         setEventsResponse(EMPTY_EVENTS);
       }
-      setNotice({ tone: "success", text: "AI 服务配置已保存并同步" });
+      setIsSettingsOpen(false);
+      setNotice({ tone: "success", text: "设置已保存" });
     } catch (error) {
       reportError(error);
+      throw error;
     } finally {
       setIsSavingConfig(false);
     }
@@ -249,10 +310,12 @@ export function App() {
   async function loadEvents(sessionId = selectedSessionId) {
     if (!sessionId) {
       setEventsResponse(EMPTY_EVENTS);
+      setStreamingEventId(null);
       return EMPTY_EVENTS;
     }
     const response = await getSessionEvents(sessionId);
     setEventsResponse(response);
+    setStreamingEventId(null);
     return response;
   }
 
@@ -351,9 +414,16 @@ export function App() {
     if (!prompt.trim() || isSubmitting) {
       return;
     }
+    let liveRefreshTimer: number | undefined;
     setIsSubmitting(true);
     try {
       const session = await ensureSession();
+      const previousMaxSeq = eventsResponse.events.at(-1)?.seq ?? 0;
+      liveRefreshTimer = window.setInterval(() => {
+        void getSessionEvents(session.id)
+          .then((partialResponse) => setEventsResponse(partialResponse))
+          .catch(() => undefined);
+      }, 700);
       const selectedFileText = Array.from(selectedPaths).sort().join("\n");
       const finalPrompt = selectedFileText
         ? `${prompt}\n\n已选择文件:\n${selectedFileText}`
@@ -362,7 +432,14 @@ export function App() {
         sessionId: session.id,
         prompt: finalPrompt
       });
+      const latestAssistantEvent = [...response.events]
+        .reverse()
+        .find(
+          (event) =>
+            event.type === "assistant.message" && event.seq > previousMaxSeq
+        );
       setEventsResponse(response);
+      setStreamingEventId(latestAssistantEvent?.id ?? null);
       await refreshSessions();
       setPrompt("");
       setNotice({ tone: "success", text: "Agent 步骤已完成" });
@@ -372,19 +449,37 @@ export function App() {
         await loadEvents(selectedSessionId).catch(() => undefined);
       }
     } finally {
+      if (liveRefreshTimer) {
+        window.clearInterval(liveRefreshTimer);
+      }
       setIsSubmitting(false);
     }
   }
 
   async function handleApprove(eventId: string) {
+    let liveRefreshTimer: number | undefined;
     setIsMutating(true);
     try {
+      const sessionId = selectedSessionId;
       await approveToolCall(eventId);
-      await loadEvents();
+      if (sessionId) {
+        liveRefreshTimer = window.setInterval(() => {
+          void getSessionEvents(sessionId)
+            .then((partialResponse) => setEventsResponse(partialResponse))
+            .catch(() => undefined);
+        }, 700);
+        const response = await continueSession(sessionId);
+        setEventsResponse(response);
+      } else {
+        await loadEvents();
+      }
       setNotice({ tone: "success", text: "命令已批准" });
     } catch (error) {
       reportError(error);
     } finally {
+      if (liveRefreshTimer) {
+        window.clearInterval(liveRefreshTimer);
+      }
       setIsMutating(false);
     }
   }
@@ -425,6 +520,37 @@ export function App() {
       await compactSession(selectedSessionId);
       await loadEvents();
       setNotice({ tone: "success", text: "上下文已压缩" });
+    } catch (error) {
+      reportError(error);
+    } finally {
+      setIsMutating(false);
+    }
+  }
+
+  async function handleDeleteSession(sessionId: string) {
+    const session = sessions.find((item) => item.id === sessionId);
+    const confirmed = window.confirm(`删除会话「${session?.title ?? sessionId}」？`);
+    if (!confirmed) {
+      return;
+    }
+
+    setIsMutating(true);
+    try {
+      await deleteSession(sessionId);
+      const nextSessions = await listSessions();
+      setSessions(nextSessions);
+      if (selectedSessionId === sessionId) {
+        const nextSession = nextSessions.find((item) =>
+          providers.some((provider) => provider.id === item.providerId)
+        );
+        if (nextSession) {
+          await selectSession(nextSession);
+        } else {
+          setSelectedSessionId("");
+          setEventsResponse(EMPTY_EVENTS);
+        }
+      }
+      setNotice({ tone: "success", text: "会话已删除" });
     } catch (error) {
       reportError(error);
     } finally {
@@ -496,54 +622,36 @@ export function App() {
         </header>
 
         <section className="leftSection providerConfigSection">
-          <SectionTitle icon={<KeyRound size={16} />} title="AI 服务配置" />
-          <div className="configPath">{configPath || "配置文件尚未加载"}</div>
-          <textarea
-            className="configEditor"
-            value={configContent}
-            onChange={(event) => setConfigContent(event.target.value)}
-            spellCheck={false}
-          />
-          <div className="providerActions">
+          <div className="sectionTitleRow">
+            <SectionTitle icon={<KeyRound size={16} />} title="AI 服务" />
             <button
-              className="commandButton"
+              className="iconButton ghost"
+              aria-label="打开 AI 服务设置"
+              onClick={() => setIsSettingsOpen(true)}
+            >
+              <Settings size={16} />
+            </button>
+          </div>
+          <button className="providerSummary" onClick={() => setIsSettingsOpen(true)}>
+            <span>
+              <strong>{selectedProvider?.name ?? "未选择服务"}</strong>
+              <small>{selectedProvider?.id ?? (configPath || "配置文件尚未加载")}</small>
+            </span>
+            <Settings size={16} />
+          </button>
+          <div className="providerMiniActions">
+            <button className="iconTextButton" onClick={() => void reloadProviderConfig()}>
+              <RefreshCw size={16} />
+              重新加载
+            </button>
+            <button
+              className="iconTextButton"
               disabled={isSavingConfig || !configContent.trim()}
               onClick={() => void saveConfig()}
             >
               {isSavingConfig ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
-              保存并加载
+              保存
             </button>
-            <button
-              className="iconTextButton"
-              onClick={() => void reloadProviderConfig()}
-            >
-              <RefreshCw size={16} />
-              重新加载
-            </button>
-          </div>
-          <div className="stackList providerList">
-            {providers.map((provider) => (
-              <button
-                key={provider.id}
-                className={`listRow ${
-                  provider.id === selectedProviderId ? "active" : ""
-                }`}
-                onClick={() => {
-                  setSelectedProviderId(provider.id);
-                  if (selectedSession?.providerId !== provider.id) {
-                    setSelectedSessionId("");
-                    setEventsResponse(EMPTY_EVENTS);
-                  }
-                }}
-              >
-                <KeyRound size={15} />
-                <span>
-                  <strong>{provider.name}</strong>
-                  <small>{provider.id}</small>
-                </span>
-              </button>
-            ))}
-            {!providers.length && <EmptyLine text="JSON 中还没有可用服务" />}
           </div>
         </section>
 
@@ -619,6 +727,17 @@ export function App() {
                     {modeLabel(session.mode)} / {shellModeLabel(session.shellMode)}
                   </small>
                 </span>
+                <span
+                  className="rowIconAction"
+                  role="button"
+                  aria-label={`删除会话 ${session.title}`}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void handleDeleteSession(session.id);
+                  }}
+                >
+                  <Trash2 size={14} />
+                </span>
               </button>
             ))}
             {!availableSessions.length && <EmptyLine text="暂无可用会话" />}
@@ -663,6 +782,12 @@ export function App() {
         <section className="timelinePane">
           <div className="paneHeader">
             <div>
+              <div className="contextUsage" title={contextUsage.title}>
+                <span>上下文 {contextUsage.percent}%</span>
+                <div className="contextTrack" aria-hidden="true">
+                  <i style={{ width: `${contextUsage.percent}%` }} />
+                </div>
+              </div>
               <strong>{selectedSession?.title ?? "暂无活动会话"}</strong>
               <small>
                 {selectedProvider?.name ?? "未选择服务"} / 已选 {selectedPaths.size} 个文件
@@ -680,7 +805,11 @@ export function App() {
 
           <div className="timeline">
             {eventsResponse.events.map((event) => (
-              <TimelineEvent key={event.id} event={event} />
+              <TimelineEvent
+                key={event.id}
+                event={event}
+                stream={event.id === streamingEventId}
+              />
             ))}
             {!eventsResponse.events.length && (
               <div className="emptyTimeline">
@@ -696,7 +825,11 @@ export function App() {
               onChange={(event) => setPrompt(event.target.value)}
               placeholder="让 oDot 检查、规划、修改、验证或回滚代码。"
               onKeyDown={(event) => {
-                if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+                if (
+                  event.key === "Enter" &&
+                  !event.shiftKey &&
+                  (!event.nativeEvent.isComposing || event.ctrlKey || event.metaKey)
+                ) {
                   event.preventDefault();
                   void handleSubmitPrompt();
                 }
@@ -769,6 +902,216 @@ export function App() {
           </div>
         </section>
       </aside>
+
+      {isSettingsOpen && (
+        <SettingsModal
+          configPath={configPath}
+          configContent={configContent}
+          providers={providers}
+          selectedProviderId={selectedProviderId}
+          shellPolicy={shellPolicy}
+          isSaving={isSavingConfig}
+          onClose={() => setIsSettingsOpen(false)}
+          onSave={saveSettings}
+        />
+      )}
+    </div>
+  );
+}
+
+function SettingsModal({
+  configPath,
+  configContent,
+  providers,
+  selectedProviderId,
+  shellPolicy,
+  isSaving,
+  onClose,
+  onSave
+}: {
+  configPath: string;
+  configContent: string;
+  providers: ProviderRecord[];
+  selectedProviderId: string;
+  shellPolicy: ShellPolicy;
+  isSaving: boolean;
+  onClose: () => void;
+  onSave: (content: string, policy: ShellPolicy) => Promise<void>;
+}) {
+  const initial = parseProviderSettings(configContent, selectedProviderId);
+  const [providerId, setProviderId] = useState(initial.providerId);
+  const [modelId, setModelId] = useState(initial.modelId);
+  const [name, setName] = useState(initial.name);
+  const [baseUrl, setBaseUrl] = useState(initial.baseUrl);
+  const [apiKey, setApiKey] = useState(initial.apiKey);
+  const [jsonText, setJsonText] = useState(configContent);
+  const [allowlistText, setAllowlistText] = useState(
+    shellPolicy.autoAllowlist.join("\n")
+  );
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [error, setError] = useState("");
+
+  const providerOptions = useMemo(
+    () => providerChoices(jsonText, providers, providerId),
+    [jsonText, providerId, providers]
+  );
+  const modelOptions = useMemo(
+    () => modelChoices(jsonText, providerId, modelId),
+    [jsonText, providerId, modelId]
+  );
+
+  function syncFromSelection(nextProviderId: string, nextModelId?: string) {
+    const parsed = parseProviderSettings(
+      jsonText,
+      nextModelId ? `${nextProviderId}/${nextModelId}` : `${nextProviderId}/${modelId}`
+    );
+    setProviderId(parsed.providerId || nextProviderId);
+    setModelId(parsed.modelId || nextModelId || "");
+    setName(parsed.name);
+    setBaseUrl(parsed.baseUrl);
+    setApiKey(parsed.apiKey);
+  }
+
+  async function handleSave() {
+    setError("");
+    try {
+      const nextContent = buildProviderConfigContent(jsonText, {
+        providerId,
+        modelId,
+        name,
+        baseUrl,
+        apiKey
+      });
+      const nextPolicy = {
+        autoAllowlist: allowlistText
+          .split("\n")
+          .map((item) => item.trim())
+          .filter(Boolean)
+      };
+      await onSave(nextContent, nextPolicy);
+    } catch (saveError) {
+      setError(errorMessage(saveError));
+    }
+  }
+
+  return (
+    <div className="modalBackdrop" role="presentation">
+      <section className="settingsModal" role="dialog" aria-modal="true">
+        <header className="modalHeader">
+          <div>
+            <strong>AI 服务设置</strong>
+            <small>{configPath || "配置文件尚未加载"}</small>
+          </div>
+          <button className="iconButton ghost" onClick={onClose} aria-label="关闭设置">
+            <X size={16} />
+          </button>
+        </header>
+
+        <div className="settingsBody">
+          {error && <pre className="modalError">{error}</pre>}
+
+          <div className="settingsGrid">
+            <label>
+              <span>Provider</span>
+              <select
+                value={providerId}
+                onChange={(event) => syncFromSelection(event.target.value)}
+              >
+                {providerOptions.map((item) => (
+                  <option key={item} value={item}>
+                    {item}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>Model</span>
+              <select
+                value={modelId}
+                onChange={(event) => {
+                  setModelId(event.target.value);
+                  syncFromSelection(providerId, event.target.value);
+                }}
+              >
+                {modelOptions.map((item) => (
+                  <option key={item} value={item}>
+                    {item}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>Name</span>
+              <input value={name} onChange={(event) => setName(event.target.value)} />
+            </label>
+            <label>
+              <span>Base URL</span>
+              <input
+                value={baseUrl}
+                onChange={(event) => setBaseUrl(event.target.value)}
+                placeholder="https://api.example.com/v1"
+              />
+            </label>
+            <label className="settingsWide">
+              <span>API Key</span>
+              <input
+                value={apiKey}
+                onChange={(event) => setApiKey(event.target.value)}
+                placeholder="sk-..."
+                type="password"
+              />
+            </label>
+            <label className="settingsWide">
+              <span>自动命令白名单</span>
+              <textarea
+                className="allowlistEditor"
+                value={allowlistText}
+                onChange={(event) => setAllowlistText(event.target.value)}
+                spellCheck={false}
+              />
+            </label>
+          </div>
+
+          <button
+            className="advancedToggle"
+            type="button"
+            onClick={() => setShowAdvanced(!showAdvanced)}
+          >
+            {showAdvanced ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+            高级 JSON
+          </button>
+          {showAdvanced && (
+            <textarea
+              className="settingsJsonEditor"
+              value={jsonText}
+              onChange={(event) => {
+                setJsonText(event.target.value);
+                const parsed = parseProviderSettings(event.target.value, `${providerId}/${modelId}`);
+                setProviderId(parsed.providerId);
+                setModelId(parsed.modelId);
+                setName(parsed.name);
+                setBaseUrl(parsed.baseUrl);
+                setApiKey(parsed.apiKey);
+              }}
+              spellCheck={false}
+            />
+          )}
+        </div>
+
+        <footer className="modalFooter">
+          <button className="iconTextButton" onClick={onClose}>
+            取消
+          </button>
+          <button
+            className="commandButton modalSaveButton"
+            disabled={isSaving}
+            onClick={() => void handleSave()}
+          >
+            {isSaving ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
+            保存设置
+          </button>
+        </footer>
+      </section>
     </div>
   );
 }
@@ -834,27 +1177,58 @@ function FileTreeNode({
   );
 }
 
-function TimelineEvent({ event }: { event: EventRecord }) {
+function TimelineEvent({
+  event,
+  stream = false
+}: {
+  event: EventRecord;
+  stream?: boolean;
+}) {
+  const isLong = isLongEvent(event);
+  const [expanded, setExpanded] = useState(!isLong);
+
+  useEffect(() => {
+    setExpanded(!isLongEvent(event));
+  }, [event.id, isLong]);
+
   return (
     <article className={`timelineEvent ${eventTone(event.type)}`}>
       <div className="eventIcon">{eventIcon(event.type)}</div>
       <div className="eventBody">
         <header>
-          <strong>{eventLabel(event)}</strong>
+          <button
+            type="button"
+            className="eventHeaderButton"
+            onClick={() => setExpanded(!expanded)}
+          >
+            {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+            <strong>{eventLabel(event)}</strong>
+          </button>
           <span>#{event.seq}</span>
         </header>
-        <EventDetail event={event} />
+        {expanded && <EventDetail event={event} stream={stream} />}
       </div>
     </article>
   );
 }
 
-function EventDetail({ event }: { event: EventRecord }) {
+function EventDetail({
+  event,
+  stream = false
+}: {
+  event: EventRecord;
+  stream?: boolean;
+}) {
   if (event.type === "prompt.submitted") {
     return <p>{valueAsString(event.data.prompt)}</p>;
   }
   if (event.type === "assistant.message" || event.type === "reasoning.summary") {
-    return <p>{valueAsString(event.data.text)}</p>;
+    return (
+      <MarkdownText
+        text={valueAsString(event.data.text)}
+        stream={stream && event.type === "assistant.message"}
+      />
+    );
   }
   if (event.type === "tool.called") {
     return <pre>{JSON.stringify(event.data.input ?? {}, null, 2)}</pre>;
@@ -884,6 +1258,107 @@ function EventDetail({ event }: { event: EventRecord }) {
     return <pre>{JSON.stringify(event.data, null, 2)}</pre>;
   }
   return <pre>{JSON.stringify(event.data, null, 2)}</pre>;
+}
+
+const LONG_EVENT_CHARS = 1600;
+const LONG_EVENT_LINES = 24;
+const LONG_MARKDOWN_CHARS = 1200;
+const LONG_MARKDOWN_LINES = 18;
+
+function isLongEvent(event: EventRecord) {
+  const text = eventTextForLength(event);
+  return (
+    text.length > LONG_EVENT_CHARS ||
+    text.split(/\r?\n/).length > LONG_EVENT_LINES
+  );
+}
+
+function eventTextForLength(event: EventRecord) {
+  if (event.type === "assistant.message" || event.type === "reasoning.summary") {
+    return valueAsString(event.data.text);
+  }
+  if (event.type === "tool.success" || event.type === "tool.failed") {
+    const result = event.data.result as Record<string, unknown> | undefined;
+    return [
+      valueAsString(event.data.error),
+      valueAsString(result?.patch),
+      valueAsString(result?.stdout),
+      valueAsString(result?.stderr)
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (event.type === "prompt.submitted") {
+    return valueAsString(event.data.prompt);
+  }
+  try {
+    return JSON.stringify(event.data, null, 2);
+  } catch {
+    return "";
+  }
+}
+
+function MarkdownText({
+  text,
+  stream = false
+}: {
+  text: string;
+  stream?: boolean;
+}) {
+  const isLong = isLongMarkdown(text);
+  const [expanded, setExpanded] = useState(!isLong);
+  const [visibleLength, setVisibleLength] = useState(stream ? 0 : text.length);
+
+  useEffect(() => {
+    setExpanded(!isLongMarkdown(text));
+    if (!stream) {
+      setVisibleLength(text.length);
+      return undefined;
+    }
+
+    setVisibleLength(0);
+    const characters = Array.from(text);
+    const step = Math.max(4, Math.ceil(characters.length / 140));
+    const timer = window.setInterval(() => {
+      setVisibleLength((current) => {
+        const next = Math.min(characters.length, current + step);
+        if (next >= characters.length) {
+          window.clearInterval(timer);
+        }
+        return next;
+      });
+    }, 18);
+
+    return () => window.clearInterval(timer);
+  }, [stream, text]);
+
+  const displayText = stream
+    ? Array.from(text).slice(0, visibleLength).join("")
+    : text;
+
+  return (
+    <div className={`markdownFrame ${isLong && !expanded ? "collapsed" : ""}`}>
+      <div className="markdownBody">
+        <ReactMarkdown>{displayText}</ReactMarkdown>
+      </div>
+      {isLong && (
+        <button
+          type="button"
+          className="collapseToggle"
+          onClick={() => setExpanded(!expanded)}
+        >
+          {expanded ? "Collapse" : "Show more"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function isLongMarkdown(text: string) {
+  return (
+    text.length > LONG_MARKDOWN_CHARS ||
+    text.split(/\r?\n/).length > LONG_MARKDOWN_LINES
+  );
 }
 
 function SnapshotItem({
@@ -1123,6 +1598,246 @@ function toolLabel(value: string) {
     shell: "命令"
   };
   return labels[value] ?? value;
+}
+
+type ContextUsageEstimate = {
+  percent: number;
+  usedTokens: number;
+  maxTokens: number;
+  title: string;
+};
+
+function estimateContextUsage({
+  eventsResponse,
+  configContent,
+  selectedProviderId,
+  draftPrompt
+}: {
+  eventsResponse: SessionEventsResponse;
+  configContent: string;
+  selectedProviderId: string;
+  draftPrompt: string;
+}): ContextUsageEstimate {
+  const limit = contextLimitFromConfig(configContent, selectedProviderId);
+  const maxTokens = limit ?? 128_000;
+  const recentEventText = eventsResponse.events
+    .slice(-36)
+    .map(
+      (event) =>
+        `#${event.seq} ${event.type} ${truncateText(safeJson(event.data), 2_000)}`
+    )
+    .join("\n");
+  const summaryText = eventsResponse.summaries[0]?.text ?? "";
+  const promptShape = [
+    "System prompt: local coding agent JSON tool protocol.",
+    `Current user prompt:\n${draftPrompt}`,
+    `Compressed context:\n${summaryText}`,
+    `Recent event timeline:\n${recentEventText}`
+  ].join("\n\n");
+  const usedTokens = estimateTokens(promptShape);
+  const percent = Math.min(100, Math.ceil((usedTokens / maxTokens) * 100));
+  const title = [
+    `估算使用量: ${formatInteger(usedTokens)} tokens`,
+    `上下文上限: ${formatInteger(maxTokens)} tokens${limit ? "" : " (默认估算)"}`,
+    `最近事件: ${Math.min(eventsResponse.events.length, 36)} / ${eventsResponse.events.length}`,
+    "说明: 按当前发送给模型的压缩上下文估算，非供应商实际 billing usage。"
+  ].join("\n");
+
+  return {
+    percent,
+    usedTokens,
+    maxTokens,
+    title
+  };
+}
+
+function contextLimitFromConfig(content: string, selectedProviderId: string) {
+  try {
+    const config = JSON.parse(content) as Record<string, unknown>;
+    const selected = splitProviderRecordId(
+      selectedProviderId || valueAsString(config.model)
+    );
+    const provider = providerRecord(config, selected.providerId);
+    const model = asRecord(asRecord(provider.models)[selected.modelId]);
+    const limit = asRecord(model.limit);
+    return (
+      valueAsNumber(limit.context) ||
+      valueAsNumber(model.context) ||
+      valueAsNumber(asRecord(model.options).context) ||
+      valueAsNumber(asRecord(provider.options).context) ||
+      null
+    );
+  } catch {
+    return null;
+  }
+}
+
+function estimateTokens(text: string) {
+  let tokens = 0;
+  for (const char of text) {
+    tokens += char.charCodeAt(0) > 127 ? 1 : 0.25;
+  }
+  return Math.max(1, Math.ceil(tokens));
+}
+
+function safeJson(value: unknown) {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function truncateText(value: string, maxChars: number) {
+  return value.length <= maxChars ? value : `${value.slice(0, maxChars)}...`;
+}
+
+function valueAsNumber(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function formatInteger(value: number) {
+  return new Intl.NumberFormat("zh-CN").format(value);
+}
+
+type ProviderSettingsFields = {
+  providerId: string;
+  modelId: string;
+  name: string;
+  baseUrl: string;
+  apiKey: string;
+};
+
+function parseProviderSettings(
+  content: string,
+  selectedProviderId: string
+): ProviderSettingsFields {
+  try {
+    const config = JSON.parse(content) as Record<string, unknown>;
+    const providers = config.provider as Record<string, unknown> | undefined;
+    const selected = splitProviderRecordId(
+      selectedProviderId || valueAsString(config.model)
+    );
+    const providerId =
+      selected.providerId || (Object.keys(providers ?? {})[0] ?? "");
+    const provider = providerRecord(config, providerId);
+    const models = provider.models as Record<string, unknown> | undefined;
+    const modelId = selected.modelId || (Object.keys(models ?? {})[0] ?? "");
+    const options = asRecord(provider.options);
+    const model = asRecord(models?.[modelId]);
+    const modelProvider = asRecord(model.provider);
+    return {
+      providerId,
+      modelId,
+      name: valueAsString(provider.name),
+      baseUrl:
+        valueAsString(modelProvider.api) ||
+        valueAsString(provider.api) ||
+        valueAsString(options.baseURL) ||
+        valueAsString(options.base_url) ||
+        valueAsString(options.api),
+      apiKey:
+        valueAsString(options.apiKey) ||
+        valueAsString(options.api_key) ||
+        valueAsString(options.key)
+    };
+  } catch {
+    return {
+      providerId: "",
+      modelId: "",
+      name: "",
+      baseUrl: "",
+      apiKey: ""
+    };
+  }
+}
+
+function buildProviderConfigContent(
+  content: string,
+  fields: ProviderSettingsFields
+) {
+  const config = JSON.parse(content) as Record<string, unknown>;
+  const providerId = fields.providerId.trim();
+  const modelId = fields.modelId.trim();
+  if (!providerId) {
+    throw new Error("Provider 不能为空。");
+  }
+  if (!modelId) {
+    throw new Error("Model 不能为空。");
+  }
+
+  const providers = ensureRecord(config, "provider");
+  const provider = ensureRecord(providers, providerId);
+  const options = ensureRecord(provider, "options");
+  const models = ensureRecord(provider, "models");
+  const model = ensureRecord(models, modelId);
+
+  provider.name = fields.name.trim() || providerId;
+  options.baseURL = fields.baseUrl.trim();
+  options.apiKey = fields.apiKey.trim();
+  model.name = model.name || modelId;
+  config.model = `${providerId}/${modelId}`;
+
+  return `${JSON.stringify(config, null, 2)}\n`;
+}
+
+function providerChoices(
+  content: string,
+  providers: ProviderRecord[],
+  fallback: string
+) {
+  try {
+    const config = JSON.parse(content) as Record<string, unknown>;
+    const provider = asRecord(config.provider);
+    const choices = Object.keys(provider);
+    const fallbackProvider = splitProviderRecordId(fallback).providerId || fallback;
+    if (fallbackProvider && !choices.includes(fallbackProvider)) {
+      choices.push(fallbackProvider);
+    }
+    return choices.length ? choices : providers.map((item) => item.id.split("/")[0]);
+  } catch {
+    return providers.map((item) => item.id.split("/")[0]);
+  }
+}
+
+function modelChoices(content: string, providerId: string, fallback: string) {
+  try {
+    const config = JSON.parse(content) as Record<string, unknown>;
+    const provider = providerRecord(config, providerId);
+    const models = asRecord(provider.models);
+    const choices = Object.keys(models);
+    if (fallback && !choices.includes(fallback)) {
+      choices.push(fallback);
+    }
+    return choices.length ? choices : ["default"];
+  } catch {
+    return fallback ? [fallback] : ["default"];
+  }
+}
+
+function providerRecord(config: Record<string, unknown>, providerId: string) {
+  return asRecord(asRecord(config.provider)[providerId]);
+}
+
+function splitProviderRecordId(value: string) {
+  const [providerId = "", modelId = ""] = value.split("/");
+  return { providerId, modelId };
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function ensureRecord(target: Record<string, unknown>, key: string) {
+  const current = target[key];
+  if (typeof current === "object" && current !== null && !Array.isArray(current)) {
+    return current as Record<string, unknown>;
+  }
+  const next: Record<string, unknown> = {};
+  target[key] = next;
+  return next;
 }
 
 function formatBytes(value: number): string {

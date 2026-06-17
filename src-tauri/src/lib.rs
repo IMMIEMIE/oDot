@@ -11,8 +11,8 @@ mod workspace;
 use tauri::AppHandle;
 use types::{
     ContextSummaryRecord, CreateSessionInput, EventRecord, ProjectFile, ProviderConfigFileResponse,
-    ProviderInput, ProviderRecord, SessionEventsResponse, SessionRecord, SnapshotRecord,
-    SubmitPromptInput,
+    ProviderInput, ProviderRecord, SessionEventsResponse, SessionRecord, ShellPolicy,
+    SnapshotRecord, SubmitPromptInput,
 };
 
 #[tauri::command]
@@ -63,24 +63,51 @@ fn list_sessions(app: AppHandle) -> Result<Vec<SessionRecord>, String> {
 }
 
 #[tauri::command]
+fn delete_session(app: AppHandle, session_id: String) -> Result<(), String> {
+    let conn = storage::open_db(&app)?;
+    storage::delete_session(&conn, &session_id)
+}
+
+#[tauri::command]
 fn get_session_events(app: AppHandle, session_id: String) -> Result<SessionEventsResponse, String> {
     let conn = storage::open_db(&app)?;
     storage::session_events_response(&conn, &session_id)
 }
 
 #[tauri::command]
-fn submit_prompt(
+async fn submit_prompt(
     app: AppHandle,
     input: SubmitPromptInput,
 ) -> Result<SessionEventsResponse, String> {
-    let conn = storage::open_db(&app)?;
-    tauri::async_runtime::block_on(runner::submit_prompt(&app, &conn, input))
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = storage::open_db(&app)?;
+        tauri::async_runtime::block_on(runner::submit_prompt(&app, &conn, input))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-fn approve_tool_call(app: AppHandle, event_id: String) -> Result<EventRecord, String> {
-    let conn = storage::open_db(&app)?;
-    tools::approve_tool_call(&conn, &event_id)
+async fn continue_session(
+    app: AppHandle,
+    session_id: String,
+) -> Result<SessionEventsResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = storage::open_db(&app)?;
+        tauri::async_runtime::block_on(runner::continue_session(&app, &conn, session_id))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn approve_tool_call(app: AppHandle, event_id: String) -> Result<EventRecord, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = storage::open_db(&app)?;
+        tools::approve_tool_call(&conn, &event_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -99,6 +126,18 @@ fn rollback_snapshot(app: AppHandle, snapshot_id: String) -> Result<SnapshotReco
 fn compact_session(app: AppHandle, session_id: String) -> Result<ContextSummaryRecord, String> {
     let conn = storage::open_db(&app)?;
     runner::compact_session(&conn, &session_id)
+}
+
+#[tauri::command]
+fn load_shell_policy(app: AppHandle) -> Result<ShellPolicy, String> {
+    let conn = storage::open_db(&app)?;
+    storage::load_shell_policy(&conn)
+}
+
+#[tauri::command]
+fn save_shell_policy(app: AppHandle, policy: ShellPolicy) -> Result<ShellPolicy, String> {
+    let conn = storage::open_db(&app)?;
+    storage::save_shell_policy(&conn, policy)
 }
 
 #[tauri::command]
@@ -128,12 +167,16 @@ pub fn run() {
             save_provider_config,
             create_session,
             list_sessions,
+            delete_session,
             get_session_events,
             submit_prompt,
+            continue_session,
             approve_tool_call,
             reject_tool_call,
             rollback_snapshot,
             compact_session,
+            load_shell_policy,
+            save_shell_policy,
             list_project_files
         ])
         .run(tauri::generate_context!())
