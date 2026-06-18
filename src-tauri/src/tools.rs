@@ -194,6 +194,7 @@ pub fn reject_tool_call(conn: &Connection, event_id: &str) -> Result<EventRecord
     )
 }
 
+#[derive(Debug)]
 enum ToolRun {
     Success(Value),
     Pending(Value),
@@ -209,7 +210,9 @@ fn execute_tool_inner(
     called_event: &EventRecord,
     execution_mode: ToolExecutionMode,
 ) -> Result<ToolRun, String> {
-    match call.name.as_str() {
+    let tool_name = normalize_tool_name(&call.name);
+    match tool_name.as_str() {
+        "invalid" => Ok(ToolRun::Failure(invalid_tool_result(&call.input))),
         "read" => {
             let path = required_string(&call.input, "path")?;
             let root = PathBuf::from(&session.project_root);
@@ -290,7 +293,7 @@ fn execute_tool_inner(
                 "reason": "Agent 请求用户回答。"
             })))
         }
-        "todo_write" | "todowrite" => {
+        "todo_write" => {
             let todos = call
                 .input
                 .get("todos")
@@ -336,6 +339,31 @@ fn execute_tool_inner(
         }
         other => Err(format!("未知工具: {other}")),
     }
+}
+
+fn normalize_tool_name(name: &str) -> String {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "bash" => "shell".to_string(),
+        "grep" => "search".to_string(),
+        "todowrite" => "todo_write".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn invalid_tool_result(input: &Value) -> Value {
+    let tool = input.get("tool").cloned().unwrap_or(Value::Null);
+    let error = input
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown tool argument error");
+    let arguments = input.get("arguments").cloned().unwrap_or(Value::Null);
+    json!({
+        "invalid": true,
+        "tool": tool,
+        "error": error,
+        "arguments": arguments,
+        "message": format!("The arguments provided to the tool are invalid: {error}")
+    })
 }
 
 fn plan_mode_mutation_blocked(tool_name: &str) -> ToolRun {
@@ -935,6 +963,45 @@ mod tests {
                 panic!("allowlisted auto shell command should not require approval")
             }
             ToolRun::Failure(data) => panic!("allowlisted auto shell command failed: {data:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_tool_returns_failure_without_pending_permission() {
+        let conn = Connection::open_in_memory().unwrap();
+        let session = test_session(".".to_string(), ShellMode::Auto);
+        let call = ToolCallRequest {
+            name: "invalid".to_string(),
+            input: json!({
+                "tool": "shell",
+                "error": "expected `,` or `}`",
+                "arguments": "{\"command\":\"npm test\"<parameter>"
+            }),
+        };
+        let policy = policy(&[]);
+        let event = test_event();
+
+        let result = execute_tool_inner(
+            &conn,
+            &session,
+            &ShellMode::Auto,
+            &policy,
+            &call,
+            &event,
+            ToolExecutionMode::Agent,
+        )
+        .unwrap();
+
+        match result {
+            ToolRun::Failure(data) => {
+                assert_eq!(data["invalid"], true);
+                assert_eq!(data["tool"], "shell");
+                assert!(data["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("The arguments provided to the tool are invalid"));
+            }
+            other => panic!("invalid tool should return failure, got {other:?}"),
         }
     }
 

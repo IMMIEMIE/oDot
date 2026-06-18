@@ -1,4 +1,4 @@
-use crate::types::{ModelTurn, ProviderKind, ProviderRequestConfig, ToolCallRequest};
+use crate::types::{ModelTurn, ProviderKind, ProviderRequestConfig, ToolCallRequest, ToolMode};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 
@@ -42,10 +42,11 @@ pub async fn complete(
 }
 
 pub fn supports_native_tools(provider: &ProviderRequestConfig) -> bool {
-    matches!(
-        provider.kind,
-        ProviderKind::OpenAi | ProviderKind::OpenAiCompatible
-    )
+    provider.tool_mode == ToolMode::Native
+        && matches!(
+            provider.kind,
+            ProviderKind::OpenAi | ProviderKind::OpenAiCompatible
+        )
 }
 
 async fn complete_openai_compatible(
@@ -60,21 +61,8 @@ async fn complete_openai_compatible(
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("https://api.openai.com/v1"),
     );
-    let mut body = provider.body.clone();
-    body.remove("response_format");
-    body.insert("model".to_string(), json!(provider.model));
-    body.entry("temperature".to_string()).or_insert(json!(0.2));
-    body.insert(
-        "messages".to_string(),
-        json!([
-            { "role": "system", "content": system_prompt },
-            { "role": "user", "content": user_prompt }
-        ]),
-    );
-    body.entry("tools".to_string())
-        .or_insert_with(native_tool_definitions);
-    body.entry("tool_choice".to_string())
-        .or_insert(json!("auto"));
+    let native_tools = supports_native_tools(provider);
+    let body = openai_request_body(provider, system_prompt, user_prompt);
 
     let client = reqwest::Client::new();
     let mut request = client.post(&endpoint);
@@ -90,9 +78,62 @@ async fn complete_openai_compatible(
         &provider.config_path,
     )
     .await?;
-    let raw_response = raw_response_from_payload(&payload);
-    let turn = parse_openai_compatible_turn(&payload)?;
-    Ok(ProviderCompletion { raw_response, turn })
+    if native_tools {
+        let turn = parse_openai_compatible_turn(&payload)?;
+        let raw_response = if turn.is_some() {
+            raw_response_from_payload(&payload)
+        } else {
+            openai_response_content(&payload)?
+        };
+        Ok(ProviderCompletion { raw_response, turn })
+    } else {
+        Ok(ProviderCompletion {
+            raw_response: openai_response_content(&payload)?,
+            turn: None,
+        })
+    }
+}
+
+fn openai_chat_body(
+    provider: &ProviderRequestConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> serde_json::Map<String, Value> {
+    let mut body = provider.body.clone();
+    body.remove("response_format");
+    body.insert("model".to_string(), json!(provider.model));
+    body.entry("temperature".to_string()).or_insert(json!(0.2));
+    if let Some(limit) = provider.output_token_limit {
+        if !body.contains_key("max_tokens") && !body.contains_key("max_completion_tokens") {
+            body.insert("max_tokens".to_string(), json!(limit));
+        }
+    }
+    body.insert(
+        "messages".to_string(),
+        json!([
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": user_prompt }
+        ]),
+    );
+    body
+}
+
+fn openai_request_body(
+    provider: &ProviderRequestConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> serde_json::Map<String, Value> {
+    let mut body = openai_chat_body(provider, system_prompt, user_prompt);
+    if supports_native_tools(provider) {
+        body.entry("tools".to_string())
+            .or_insert_with(native_tool_definitions);
+        body.entry("tool_choice".to_string())
+            .or_insert(json!("auto"));
+    } else {
+        body.remove("tools");
+        body.remove("tool_choice");
+    }
+    body
 }
 
 async fn complete_anthropic_compatible(
@@ -203,6 +244,14 @@ fn openai_message_content(value: Option<&Value>) -> Option<String> {
     }
 }
 
+fn openai_response_content(payload: &Value) -> Result<String, String> {
+    let message = payload
+        .pointer("/choices/0/message")
+        .ok_or_else(|| "AI 服务返回缺少 choices[0].message。".to_string())?;
+    openai_message_content(message.get("content"))
+        .ok_or_else(|| "AI 服务返回了空消息。".to_string())
+}
+
 fn parse_openai_tool_calls(value: Option<&Value>) -> Result<Vec<ToolCallRequest>, String> {
     let Some(calls) = value.and_then(Value::as_array) else {
         return Ok(Vec::new());
@@ -211,23 +260,42 @@ fn parse_openai_tool_calls(value: Option<&Value>) -> Result<Vec<ToolCallRequest>
     calls
         .iter()
         .map(|call| {
-            let name = call
+            let original_name = call
                 .pointer("/function/name")
                 .and_then(Value::as_str)
-                .ok_or_else(|| "AI 服务返回的工具调用缺少 function.name。".to_string())?
-                .to_string();
+                .ok_or_else(|| "AI 服务返回的工具调用缺少 function.name。".to_string())?;
+            let name = normalize_tool_name(original_name);
             let arguments = call
                 .pointer("/function/arguments")
                 .and_then(Value::as_str)
                 .unwrap_or("{}");
-            let input = serde_json::from_str(arguments).map_err(|error| {
-                format!(
-                    "AI 服务返回的工具参数不是合法 JSON: {error}\n工具: {name}\n参数: {arguments}"
-                )
-            })?;
+            let input = match serde_json::from_str(arguments) {
+                Ok(input) => input,
+                Err(error) => {
+                    let call_id = call.get("id").and_then(Value::as_str).unwrap_or_default();
+                    return Ok(ToolCallRequest {
+                        name: "invalid".to_string(),
+                        input: json!({
+                            "tool": original_name,
+                            "error": error.to_string(),
+                            "arguments": arguments,
+                            "callId": call_id
+                        }),
+                    });
+                }
+            };
             Ok(ToolCallRequest { name, input })
         })
         .collect()
+}
+
+fn normalize_tool_name(name: &str) -> String {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "bash" => "shell".to_string(),
+        "grep" => "search".to_string(),
+        "todowrite" => "todo_write".to_string(),
+        other => other.to_string(),
+    }
 }
 
 fn native_tool_definitions() -> Value {
@@ -311,21 +379,6 @@ fn native_tool_definitions() -> Value {
             "function": {
                 "name": "shell",
                 "description": "Run a project command. On Windows this runs in PowerShell. Use background=true for long-running dev servers.",
-                "parameters": object_schema(
-                    json!({
-                        "command": { "type": "string", "description": "Command to run." },
-                        "timeoutSeconds": { "type": "integer", "description": "Optional foreground timeout in seconds, 1-600. Default 60." },
-                        "background": { "type": "boolean", "description": "Start the command and return immediately. Use for npm run dev and other servers." }
-                    }),
-                    &["command"]
-                )
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "description": "Execute one shell command. Use background=true for long-running dev servers.",
                 "parameters": object_schema(
                     json!({
                         "command": { "type": "string", "description": "Command to run." },
@@ -436,6 +489,20 @@ fn to_anthropic_messages_endpoint(base_url: &str) -> String {
 mod tests {
     use super::*;
 
+    fn test_provider(kind: ProviderKind, tool_mode: ToolMode) -> ProviderRequestConfig {
+        ProviderRequestConfig {
+            kind,
+            tool_mode,
+            base_url: Some("https://example.com/v1".to_string()),
+            model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
+            headers: std::collections::HashMap::new(),
+            body: serde_json::Map::new(),
+            output_token_limit: None,
+            config_path: "odot.json".to_string(),
+        }
+    }
+
     #[test]
     fn chat_completions_endpoint_is_not_duplicated() {
         assert_eq!(
@@ -446,6 +513,123 @@ mod tests {
             to_chat_completions_endpoint("https://example.com/v1/"),
             "https://example.com/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn json_tool_mode_removes_native_tool_fields() {
+        let mut provider = test_provider(ProviderKind::OpenAiCompatible, ToolMode::Json);
+        provider.body.insert("tools".to_string(), json!(["stale"]));
+        provider
+            .body
+            .insert("tool_choice".to_string(), json!("auto"));
+        provider.output_token_limit = Some(4096);
+
+        let body = openai_request_body(&provider, "system", "user");
+
+        assert!(!body.contains_key("tools"));
+        assert!(!body.contains_key("tool_choice"));
+        assert_eq!(body.get("max_tokens"), Some(&json!(4096)));
+    }
+
+    #[test]
+    fn explicit_max_token_body_is_not_overwritten() {
+        let mut provider = test_provider(ProviderKind::OpenAiCompatible, ToolMode::Json);
+        provider.output_token_limit = Some(4096);
+        provider.body.insert("max_tokens".to_string(), json!(2048));
+
+        let body = openai_request_body(&provider, "system", "user");
+
+        assert_eq!(body.get("max_tokens"), Some(&json!(2048)));
+    }
+
+    #[test]
+    fn native_tool_schema_omits_bash_and_keeps_shell_description() {
+        let tools = native_tool_definitions();
+        let tools = tools.as_array().expect("tool array");
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"shell"));
+        assert!(!names.contains(&"bash"));
+
+        let shell = tools
+            .iter()
+            .find(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some("shell"))
+            .expect("shell tool");
+        assert!(shell
+            .pointer("/function/parameters/properties/description")
+            .is_some());
+    }
+
+    #[test]
+    fn malformed_native_tool_arguments_become_invalid_tool_call() {
+        let payload = json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_bad",
+                        "type": "function",
+                        "function": {
+                            "name": "shell",
+                            "arguments": "{\"command\":\"Get-Content src\\\\main.rs\"<parameter name=\"description\">"
+                        }
+                    }]
+                }
+            }]
+        });
+
+        let turn = parse_openai_compatible_turn(&payload)
+            .expect("provider payload should parse")
+            .expect("native turn");
+
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "invalid");
+        assert_eq!(turn.tool_calls[0].input["tool"], "shell");
+        assert_eq!(turn.tool_calls[0].input["callId"], "call_bad");
+        assert!(turn.tool_calls[0].input["arguments"]
+            .as_str()
+            .unwrap()
+            .contains("<parameter"));
+    }
+
+    #[test]
+    fn native_tool_names_are_normalized() {
+        let calls = json!([
+            {
+                "function": {
+                    "name": "Shell",
+                    "arguments": "{\"command\":\"npm run typecheck\"}"
+                }
+            },
+            {
+                "function": {
+                    "name": "bash",
+                    "arguments": "{\"command\":\"cargo test\"}"
+                }
+            },
+            {
+                "function": {
+                    "name": "grep",
+                    "arguments": "{\"query\":\"TODO\"}"
+                }
+            },
+            {
+                "function": {
+                    "name": "todowrite",
+                    "arguments": "{\"todos\":[]}"
+                }
+            }
+        ]);
+
+        let calls = parse_openai_tool_calls(Some(&calls)).expect("tool calls");
+
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[1].name, "shell");
+        assert_eq!(calls[2].name, "search");
+        assert_eq!(calls[3].name, "todo_write");
     }
 
     #[test]

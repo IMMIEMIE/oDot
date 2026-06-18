@@ -14,6 +14,14 @@ pub enum ProviderKind {
     AnthropicCompatible,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolMode {
+    Native,
+    Json,
+    Auto,
+}
+
 impl ProviderKind {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -173,11 +181,13 @@ pub struct ProviderRecord {
 #[derive(Debug, Clone)]
 pub struct ProviderRequestConfig {
     pub kind: ProviderKind,
+    pub tool_mode: ToolMode,
     pub base_url: Option<String>,
     pub model: String,
     pub api_key: String,
     pub headers: HashMap<String, String>,
     pub body: serde_json::Map<String, Value>,
+    pub output_token_limit: Option<u64>,
     pub config_path: String,
 }
 

@@ -2,7 +2,7 @@ use crate::{
     storage,
     types::{
         ProviderConfigFileResponse, ProviderInput, ProviderKind, ProviderRecord,
-        ProviderRequestConfig,
+        ProviderRequestConfig, ToolMode,
     },
 };
 use serde::Deserialize;
@@ -30,6 +30,8 @@ struct ConfigProvider {
     name: Option<String>,
     api: Option<String>,
     npm: Option<String>,
+    #[serde(default, rename = "toolMode", alias = "tool_mode")]
+    tool_mode: Option<ToolMode>,
     request: Option<ConfigRequest>,
     #[serde(default)]
     env: Vec<String>,
@@ -44,9 +46,17 @@ struct ConfigModel {
     id: Option<String>,
     name: Option<String>,
     provider: Option<ModelProvider>,
+    #[serde(default, rename = "toolMode", alias = "tool_mode")]
+    tool_mode: Option<ToolMode>,
+    limit: Option<ModelLimit>,
     request: Option<ConfigRequest>,
     #[serde(default)]
     options: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ModelLimit {
+    output: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -248,6 +258,8 @@ where
             id: None,
             name: None,
             provider: None,
+            tool_mode: None,
+            limit: None,
             request: None,
             options: HashMap::new(),
         };
@@ -268,6 +280,13 @@ where
         .or(provider.npm.as_deref())
         .unwrap_or_default();
     let kind = infer_provider_kind(provider_id, npm);
+    let tool_mode = resolve_tool_mode(
+        &kind,
+        model
+            .tool_mode
+            .or(provider.tool_mode)
+            .unwrap_or(ToolMode::Auto),
+    );
     let base_url = model
         .provider
         .as_ref()
@@ -287,14 +306,17 @@ where
     })?;
     let headers = merge_headers(provider, model);
     let body = merge_body(provider, model);
+    let output_token_limit = model.limit.as_ref().and_then(|limit| limit.output);
 
     Ok(ProviderRequestConfig {
         kind,
+        tool_mode,
         base_url,
         model: model.id.clone().unwrap_or_else(|| model_key.to_string()),
         api_key,
         headers,
         body,
+        output_token_limit,
         config_path: config_path.to_string_lossy().to_string(),
     })
 }
@@ -344,6 +366,8 @@ fn model_entries(provider: &ConfigProvider) -> Vec<(String, ConfigModel)> {
                 id: None,
                 name: None,
                 provider: None,
+                tool_mode: None,
+                limit: None,
                 request: None,
                 options: HashMap::new(),
             },
@@ -462,6 +486,18 @@ fn infer_provider_kind(provider_id: &str, npm: &str) -> ProviderKind {
         ProviderKind::OpenAi
     } else {
         ProviderKind::OpenAiCompatible
+    }
+}
+
+fn resolve_tool_mode(kind: &ProviderKind, requested: ToolMode) -> ToolMode {
+    match requested {
+        ToolMode::Auto => match kind {
+            ProviderKind::OpenAi => ToolMode::Native,
+            ProviderKind::OpenAiCompatible
+            | ProviderKind::Anthropic
+            | ProviderKind::AnthropicCompatible => ToolMode::Json,
+        },
+        other => other,
     }
 }
 
@@ -652,6 +688,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(request.api_key, "ark-json-key");
+        assert_eq!(request.tool_mode, ToolMode::Json);
+        assert_eq!(request.output_token_limit, Some(4096));
         assert_eq!(
             request.base_url.as_deref(),
             Some("https://ark.cn-beijing.volces.com/api/coding/v3")
@@ -670,6 +708,70 @@ mod tests {
         .unwrap();
 
         assert_eq!(request.api_key, "ark-env-key");
+    }
+
+    #[test]
+    fn openai_defaults_to_native_tool_mode() {
+        let config = r#"{
+  "model": "openai/gpt-4.1-mini",
+  "provider": {
+    "openai": {
+      "api": "https://api.openai.com/v1",
+      "options": {
+        "apiKey": "openai-key"
+      },
+      "models": {
+        "gpt-4.1-mini": {
+          "name": "GPT-4.1 Mini"
+        }
+      }
+    }
+  }
+}"#;
+
+        let request = resolve_provider_request_config_with_env(
+            config,
+            "openai/gpt-4.1-mini",
+            Path::new("C:/Users/test/AppData/Roaming/dev.odot.desktop/odot.json"),
+            |_| None,
+        )
+        .unwrap();
+
+        assert!(matches!(request.kind, ProviderKind::OpenAi));
+        assert_eq!(request.tool_mode, ToolMode::Native);
+    }
+
+    #[test]
+    fn model_tool_mode_overrides_compatible_default() {
+        let config = r#"{
+  "model": "volcengine-plan/ark-code-latest",
+  "provider": {
+    "volcengine-plan": {
+      "npm": "@ai-sdk/openai-compatible",
+      "tool_mode": "json",
+      "options": {
+        "baseURL": "https://ark.cn-beijing.volces.com/api/coding/v3",
+        "apiKey": "ark-json-key"
+      },
+      "models": {
+        "ark-code-latest": {
+          "toolMode": "native"
+        }
+      }
+    }
+  }
+}"#;
+
+        let request = resolve_provider_request_config_with_env(
+            config,
+            "volcengine-plan/ark-code-latest",
+            Path::new("C:/Users/test/AppData/Roaming/dev.odot.desktop/odot.json"),
+            |_| None,
+        )
+        .unwrap();
+
+        assert!(matches!(request.kind, ProviderKind::OpenAiCompatible));
+        assert_eq!(request.tool_mode, ToolMode::Native);
     }
 
     #[test]

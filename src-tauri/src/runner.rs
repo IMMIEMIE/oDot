@@ -12,7 +12,9 @@ use std::{fs, path::PathBuf};
 use tauri::AppHandle;
 
 const MAX_STEPS: usize = 25;
-const RECENT_EVENT_LIMIT: usize = 36;
+const RECENT_EVENT_LIMIT: usize = 80;
+const RECENT_EVENT_CHAR_BUDGET: usize = 48_000;
+const RECENT_EVENT_MIN_KEEP: usize = 12;
 const AUTO_COMPACT_EVENT_THRESHOLD: usize = 80;
 
 pub async fn submit_prompt(
@@ -462,10 +464,10 @@ Tool guidance:
 - edit: replace exact text in an existing file. Prefer edit for code changes.
 - write: create a new file or intentionally replace a whole small file. Avoid full-file rewrites for existing large files unless necessary.
 - delete: delete a file.
-- bash/shell: run verification commands. Foreground commands time out by default; use background=true for long-running dev servers such as npm run dev.
-- grep/search: search project text.
+- shell: run verification commands. Foreground commands time out by default; use background=true for long-running dev servers such as npm run dev.
 - question: ask the user when blocked on an important choice.
 - todo_write: publish a short task checklist.
+Use read for file contents and search for project text. Do not read project files with shell commands such as Get-Content, more, cat, grep, or sed when read/search can do it.
 
 Shell environment:
 {shell_environment}
@@ -489,7 +491,7 @@ JSON schema:
   "message": "user-facing response or progress note",
   "toolCalls": [
     {{
-      "name": "read|search|grep|edit|write|delete|shell|bash|question|todo_write",
+      "name": "read|search|grep|edit|write|delete|shell|question|todo_write",
       "input": {{}}
     }}
   ],
@@ -502,9 +504,10 @@ Tool inputs:
 - edit: {{"path":"relative/path","oldString":"exact text","newString":"replacement text"}}
 - write: {{"path":"relative/path","content":"complete file content","expectedHash":"optional sha256"}}. Prefer edit for existing large files; use write for new files or intentional full replacement.
 - delete: {{"path":"relative/path"}}
-- shell/bash: {{"command":"test/lint/build command","workdir":"optional/path","timeoutSeconds":60,"background":false}}. Use background=true for long-running dev servers such as npm run dev.
+- shell: {{"command":"test/lint/build command","workdir":"optional/path","timeoutSeconds":60,"background":false,"description":"short purpose"}}. Use background=true for long-running dev servers such as npm run dev.
 - question: {{"question":"short question"}}
 - todo_write: {{"todos":[{{"text":"task","status":"pending|in_progress|done"}}]}}
+Use read for file contents and search for project text. Do not read project files with shell commands such as Get-Content, more, cat, grep, or sed when read/search can do it.
 
 Shell environment:
 {shell_environment}
@@ -542,22 +545,33 @@ fn build_user_prompt(
     let session = storage::get_session(conn, session_id)?;
     let project_context = project_context_text(&session.project_root);
 
-    let event_lines = events
-        .iter()
-        .map(|event| {
-            format!(
-                "#{} {} {}",
-                event.seq,
-                event.event_type,
-                compact_json(&event.data)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let event_lines = recent_event_timeline(&events);
 
     Ok(format!(
         "Current user prompt:\n{current_prompt}\n\nProject context:\n{project_context}\n\nCompressed context:\n{summary}\n\nRecent event timeline:\n{event_lines}"
     ))
+}
+
+fn recent_event_timeline(events: &[crate::types::EventRecord]) -> String {
+    let mut selected = Vec::new();
+    let mut used = 0usize;
+    for (index, event) in events.iter().enumerate().rev() {
+        let line = format!(
+            "#{} {} {}",
+            event.seq,
+            event.event_type,
+            compact_json(&event.data)
+        );
+        let line_len = line.chars().count() + 1;
+        let kept_from_tail = events.len().saturating_sub(index);
+        if used + line_len > RECENT_EVENT_CHAR_BUDGET && kept_from_tail > RECENT_EVENT_MIN_KEEP {
+            break;
+        }
+        used += line_len;
+        selected.push(line);
+    }
+    selected.reverse();
+    selected.join("\n")
 }
 
 fn project_context_text(project_root: &str) -> String {
@@ -830,6 +844,42 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_prompts_prefer_shell_and_read_search() {
+        let native = build_system_prompt("agent", true);
+        let json = build_system_prompt("agent", false);
+
+        assert!(native.contains("- shell: run verification commands."));
+        assert!(!native.contains("bash/shell"));
+        assert!(native.contains("Use read for file contents and search for project text."));
+        assert!(json.contains(
+            "\"name\": \"read|search|grep|edit|write|delete|shell|question|todo_write\""
+        ));
+        assert!(!json.contains("shell|bash"));
+        assert!(json.contains("Do not read project files with shell commands"));
+    }
+
+    #[test]
+    fn recent_event_timeline_respects_budget_and_keeps_recent_tail() {
+        let events = (1..=80)
+            .map(|seq| crate::types::EventRecord {
+                id: format!("e{seq}"),
+                session_id: "s1".to_string(),
+                seq,
+                event_type: "tool.success".to_string(),
+                data: json!({ "payload": "x".repeat(4_000) }),
+                created_at: "now".to_string(),
+            })
+            .collect::<Vec<_>>();
+
+        let timeline = recent_event_timeline(&events);
+
+        assert!(timeline.lines().any(|line| line.starts_with("#80 ")));
+        assert!(timeline.lines().any(|line| line.starts_with("#69 ")));
+        assert!(!timeline.lines().any(|line| line.starts_with("#1 ")));
+        assert!(timeline.chars().count() <= RECENT_EVENT_CHAR_BUDGET);
+    }
 
     #[test]
     fn repairs_done_field_inserted_after_tool_call() {
