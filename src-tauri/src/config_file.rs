@@ -492,10 +492,8 @@ fn infer_provider_kind(provider_id: &str, npm: &str) -> ProviderKind {
 fn resolve_tool_mode(kind: &ProviderKind, requested: ToolMode) -> ToolMode {
     match requested {
         ToolMode::Auto => match kind {
-            ProviderKind::OpenAi => ToolMode::Native,
-            ProviderKind::OpenAiCompatible
-            | ProviderKind::Anthropic
-            | ProviderKind::AnthropicCompatible => ToolMode::Json,
+            ProviderKind::OpenAi | ProviderKind::OpenAiCompatible => ToolMode::Native,
+            ProviderKind::Anthropic | ProviderKind::AnthropicCompatible => ToolMode::Json,
         },
         other => other,
     }
@@ -688,7 +686,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(request.api_key, "ark-json-key");
-        assert_eq!(request.tool_mode, ToolMode::Json);
+        assert_eq!(request.tool_mode, ToolMode::Native);
         assert_eq!(request.output_token_limit, Some(4096));
         assert_eq!(
             request.base_url.as_deref(),
@@ -772,6 +770,37 @@ mod tests {
 
         assert!(matches!(request.kind, ProviderKind::OpenAiCompatible));
         assert_eq!(request.tool_mode, ToolMode::Native);
+    }
+
+    #[test]
+    fn explicit_json_tool_mode_keeps_json_protocol() {
+        let config = r#"{
+  "model": "volcengine-plan/ark-code-latest",
+  "provider": {
+    "volcengine-plan": {
+      "npm": "@ai-sdk/openai-compatible",
+      "toolMode": "json",
+      "options": {
+        "baseURL": "https://ark.cn-beijing.volces.com/api/coding/v3",
+        "apiKey": "ark-json-key"
+      },
+      "models": {
+        "ark-code-latest": {}
+      }
+    }
+  }
+}"#;
+
+        let request = resolve_provider_request_config_with_env(
+            config,
+            "volcengine-plan/ark-code-latest",
+            Path::new("C:/Users/test/AppData/Roaming/dev.odot.desktop/odot.json"),
+            |_| None,
+        )
+        .unwrap();
+
+        assert!(matches!(request.kind, ProviderKind::OpenAiCompatible));
+        assert_eq!(request.tool_mode, ToolMode::Json);
     }
 
     #[test]

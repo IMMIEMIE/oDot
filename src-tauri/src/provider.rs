@@ -1,4 +1,8 @@
-use crate::types::{ModelTurn, ProviderKind, ProviderRequestConfig, ToolCallRequest, ToolMode};
+use crate::{
+    llm_runtime::{LlmStreamEvent, OpenAiChatStreamParser},
+    types::{ModelTurn, ProviderKind, ProviderRequestConfig, ToolCallRequest, ToolMode},
+};
+use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 
@@ -47,6 +51,103 @@ pub fn supports_native_tools(provider: &ProviderRequestConfig) -> bool {
             provider.kind,
             ProviderKind::OpenAi | ProviderKind::OpenAiCompatible
         )
+}
+
+pub async fn stream_openai_compatible<F>(
+    provider: &ProviderRequestConfig,
+    messages: &[Value],
+    mut on_event: F,
+) -> Result<ModelTurn, String>
+where
+    F: FnMut(LlmStreamEvent) -> Result<(), String>,
+{
+    if !supports_native_tools(provider) {
+        return Err("当前 provider 未启用 native streaming runtime。".to_string());
+    }
+    let endpoint = to_chat_completions_endpoint(
+        provider
+            .base_url
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("https://api.openai.com/v1"),
+    );
+    let body = openai_stream_request_body(provider, messages);
+    let client = reqwest::Client::new();
+    let mut request = client.post(&endpoint);
+    for (key, value) in &provider.headers {
+        request = request.header(key, value);
+    }
+    let response = request
+        .bearer_auth(provider.api_key.trim())
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| format!("AI 服务 streaming 请求失败: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response
+            .text()
+            .await
+            .map_err(|error| format!("无法读取 AI 服务响应: {error}"))?;
+        return Err(provider_error_message(
+            status,
+            &text,
+            &endpoint,
+            "Authorization: Bearer <redacted>",
+            &provider.config_path,
+        ));
+    }
+
+    let mut parser = OpenAiChatStreamParser::new();
+    let mut turn = ModelTurn {
+        summary: None,
+        message: None,
+        tool_calls: Vec::new(),
+        done: true,
+    };
+    let mut stream = response.bytes_stream();
+    let mut pending_utf8 = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("读取 AI 服务 streaming 响应失败: {error}"))?;
+        pending_utf8.extend_from_slice(&chunk);
+        loop {
+            match std::str::from_utf8(&pending_utf8) {
+                Ok(text) => {
+                    for event in parser.push_str(text)? {
+                        accumulate_stream_event(&mut turn, &event);
+                        on_event(event)?;
+                    }
+                    pending_utf8.clear();
+                    break;
+                }
+                Err(error) => {
+                    let valid_up_to = error.valid_up_to();
+                    if valid_up_to > 0 {
+                        let text = std::str::from_utf8(&pending_utf8[..valid_up_to])
+                            .map_err(|error| error.to_string())?;
+                        for event in parser.push_str(text)? {
+                            accumulate_stream_event(&mut turn, &event);
+                            on_event(event)?;
+                        }
+                        pending_utf8.drain(..valid_up_to);
+                    }
+                    if error.error_len().is_some() {
+                        return Err(format!("AI 服务 streaming 响应包含无效 UTF-8: {error}"));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    if !pending_utf8.is_empty() {
+        return Err("AI 服务 streaming 响应以不完整 UTF-8 结尾。".to_string());
+    }
+    for event in parser.finish()? {
+        accumulate_stream_event(&mut turn, &event);
+        on_event(event)?;
+    }
+    turn.done = turn.tool_calls.is_empty();
+    Ok(turn)
 }
 
 async fn complete_openai_compatible(
@@ -99,6 +200,27 @@ fn openai_chat_body(
     system_prompt: &str,
     user_prompt: &str,
 ) -> serde_json::Map<String, Value> {
+    let mut body = openai_base_body(provider);
+    body.insert(
+        "messages".to_string(),
+        json!([
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": user_prompt }
+        ]),
+    );
+    body
+}
+
+fn openai_messages_body(
+    provider: &ProviderRequestConfig,
+    messages: &[Value],
+) -> serde_json::Map<String, Value> {
+    let mut body = openai_base_body(provider);
+    body.insert("messages".to_string(), Value::Array(messages.to_vec()));
+    body
+}
+
+fn openai_base_body(provider: &ProviderRequestConfig) -> serde_json::Map<String, Value> {
     let mut body = provider.body.clone();
     body.remove("response_format");
     body.insert("model".to_string(), json!(provider.model));
@@ -108,13 +230,6 @@ fn openai_chat_body(
             body.insert("max_tokens".to_string(), json!(limit));
         }
     }
-    body.insert(
-        "messages".to_string(),
-        json!([
-            { "role": "system", "content": system_prompt },
-            { "role": "user", "content": user_prompt }
-        ]),
-    );
     body
 }
 
@@ -134,6 +249,38 @@ fn openai_request_body(
         body.remove("tool_choice");
     }
     body
+}
+
+fn openai_stream_request_body(
+    provider: &ProviderRequestConfig,
+    messages: &[Value],
+) -> serde_json::Map<String, Value> {
+    let mut body = openai_messages_body(provider, messages);
+    body.insert("stream".to_string(), json!(true));
+    body.entry("stream_options".to_string())
+        .or_insert(json!({ "include_usage": true }));
+    body.entry("tools".to_string())
+        .or_insert_with(native_tool_definitions);
+    body.entry("tool_choice".to_string())
+        .or_insert(json!("auto"));
+    body
+}
+
+fn accumulate_stream_event(turn: &mut ModelTurn, event: &LlmStreamEvent) {
+    match event {
+        LlmStreamEvent::TextDelta { text, .. } => {
+            let message = turn.message.get_or_insert_with(String::new);
+            message.push_str(text);
+        }
+        LlmStreamEvent::ReasoningDelta { text, .. } => {
+            let summary = turn.summary.get_or_insert_with(String::new);
+            summary.push_str(text);
+        }
+        LlmStreamEvent::ToolCall(call) => {
+            turn.tool_calls.push(call.clone());
+        }
+        LlmStreamEvent::ToolInputDelta { .. } | LlmStreamEvent::Finish { .. } => {}
+    }
 }
 
 async fn complete_anthropic_compatible(
@@ -274,6 +421,11 @@ fn parse_openai_tool_calls(value: Option<&Value>) -> Result<Vec<ToolCallRequest>
                 Err(error) => {
                     let call_id = call.get("id").and_then(Value::as_str).unwrap_or_default();
                     return Ok(ToolCallRequest {
+                        tool_call_id: if call_id.is_empty() {
+                            None
+                        } else {
+                            Some(call_id.to_string())
+                        },
                         name: "invalid".to_string(),
                         input: json!({
                             "tool": original_name,
@@ -284,7 +436,16 @@ fn parse_openai_tool_calls(value: Option<&Value>) -> Result<Vec<ToolCallRequest>
                     });
                 }
             };
-            Ok(ToolCallRequest { name, input })
+            let tool_call_id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+            Ok(ToolCallRequest {
+                tool_call_id,
+                name,
+                input,
+            })
         })
         .collect()
 }
@@ -454,17 +615,44 @@ async fn send_json_request(
     })?;
 
     if !status.is_success() {
-        let message = payload
-            .pointer("/error/message")
-            .and_then(|value| value.as_str())
-            .or_else(|| payload.pointer("/error").and_then(|value| value.as_str()))
-            .unwrap_or(status.as_str());
-        return Err(format!(
-            "AI 服务请求失败: {message}\n请求端点: {endpoint}\n鉴权方式: {auth_summary}\n配置文件: {config_path}"
+        return Err(provider_error_message(
+            status,
+            &text,
+            endpoint,
+            auth_summary,
+            config_path,
         ));
     }
 
     Ok(payload)
+}
+
+fn provider_error_message(
+    status: StatusCode,
+    text: &str,
+    endpoint: &str,
+    auth_summary: &str,
+    config_path: &str,
+) -> String {
+    let payload: Option<Value> = serde_json::from_str(text).ok();
+    let message = payload
+        .as_ref()
+        .and_then(|payload| {
+            payload
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .or_else(|| payload.pointer("/error").and_then(Value::as_str))
+        })
+        .unwrap_or_else(|| {
+            if text.trim().is_empty() {
+                status.as_str()
+            } else {
+                text.trim()
+            }
+        });
+    format!(
+        "AI 服务请求失败: {message}\n请求端点: {endpoint}\n鉴权方式: {auth_summary}\n配置文件: {config_path}"
+    )
 }
 
 fn to_chat_completions_endpoint(base_url: &str) -> String {

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ProviderKind {
     #[serde(rename = "openai")]
     OpenAi,
@@ -387,9 +387,11 @@ pub struct ReplyPermissionInput {
     pub reply: PermissionReply,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCallRequest {
+    #[serde(default, rename = "toolCallId", alias = "tool_call_id")]
+    pub tool_call_id: Option<String>,
     pub name: String,
     #[serde(default)]
     pub input: Value,

@@ -74,6 +74,7 @@ const EMPTY_EVENTS: SessionEventsResponse = {
   permissions: [],
   jobs: []
 };
+const LIVE_REFRESH_INTERVAL_MS = 250;
 
 type Notice = {
   tone: "info" | "success" | "error";
@@ -546,7 +547,7 @@ export function App() {
       const previousMaxSeq = eventsResponse.events.at(-1)?.seq ?? 0;
       liveRefreshTimerRef.current = window.setInterval(() => {
         void loadEventTail(session.id).catch(() => undefined);
-      }, 700);
+      }, LIVE_REFRESH_INTERVAL_MS);
       const selectedFileText = Array.from(selectedPaths).sort().join("\n");
       const finalPrompt = selectedFileText
         ? `${prompt}\n\n已选择文件:\n${selectedFileText}`
@@ -624,7 +625,7 @@ export function App() {
 
       liveRefreshTimerRef.current = window.setInterval(() => {
         void loadEventTail(executionSession.id).catch(() => undefined);
-      }, 700);
+      }, LIVE_REFRESH_INTERVAL_MS);
 
       const response = await promptSession({
         sessionId: executionSession.id,
@@ -724,7 +725,7 @@ export function App() {
       if (sessionId) {
         liveRefreshTimerRef.current = window.setInterval(() => {
           void loadEventTail(sessionId).catch(() => undefined);
-        }, 700);
+        }, LIVE_REFRESH_INTERVAL_MS);
         const response = await continueSession(sessionId);
         if (activeRunIdRef.current !== runId) {
           return;
@@ -2310,6 +2311,44 @@ function PlanExecutionDock({
   );
 }
 
+type StreamDeltaGroup = {
+  step: string;
+  text: string;
+  events: EventRecord[];
+};
+
+function collectStreamDeltaGroups(events: EventRecord[], eventType: string) {
+  const groups = new Map<string, StreamDeltaGroup>();
+  for (const event of events) {
+    if (event.type !== eventType) {
+      continue;
+    }
+    const step = streamStepKey(event);
+    if (!step) {
+      continue;
+    }
+    const group = groups.get(step) ?? { step, text: "", events: [] };
+    group.text += valueAsString(event.data.text);
+    group.events.push(event);
+    groups.set(step, group);
+  }
+  return groups;
+}
+
+function finalizedStreamSteps(events: EventRecord[], eventType: string) {
+  return new Set(
+    events
+      .filter((event) => event.type === eventType)
+      .map(streamStepKey)
+      .filter(Boolean)
+  );
+}
+
+function streamStepKey(event: EventRecord) {
+  const step = Number(event.data.step ?? 0);
+  return Number.isFinite(step) && step > 0 ? String(step) : "";
+}
+
 function buildTimelineItems(
   events: EventRecord[],
   snapshots: SnapshotRecord[]
@@ -2328,6 +2367,10 @@ function buildTimelineItems(
   );
   const promptEvents = events.filter((event) => event.type === "prompt.submitted");
   const changeItemsByPromptId = new Map<string, TimelineItem>();
+  const assistantDeltaGroups = collectStreamDeltaGroups(events, "assistant.message.delta");
+  const reasoningDeltaGroups = collectStreamDeltaGroups(events, "reasoning.summary.delta");
+  const assistantFinalSteps = finalizedStreamSteps(events, "assistant.message");
+  const reasoningFinalSteps = finalizedStreamSteps(events, "reasoning.summary");
   let currentPromptEvent: EventRecord | null = null;
 
   for (const event of events) {
@@ -2457,7 +2500,42 @@ function buildTimelineItems(
       continue;
     }
 
+    if (event.type === "assistant.message.delta") {
+      const step = streamStepKey(event);
+      const group = assistantDeltaGroups.get(step);
+      if (group && !assistantFinalSteps.has(step) && group.events[0]?.id === event.id) {
+        pushItem({
+          id: `assistant-stream-${step}`,
+          kind: "assistantReply",
+          title: "助手回复",
+          text: group.text,
+          status: "running",
+          event,
+          details: group.events
+        });
+      }
+      continue;
+    }
+
+    if (event.type === "reasoning.summary.delta") {
+      const step = streamStepKey(event);
+      const group = reasoningDeltaGroups.get(step);
+      if (group && !reasoningFinalSteps.has(step) && group.events[0]?.id === event.id) {
+        pushItem({
+          id: `reasoning-stream-${step}`,
+          kind: "reasoning",
+          title: "思考过程",
+          text: group.text,
+          status: "running",
+          event,
+          details: group.events
+        });
+      }
+      continue;
+    }
+
     if (event.type === "assistant.message") {
+      const deltaGroup = assistantDeltaGroups.get(streamStepKey(event));
       pushItem({
         id: event.id,
         kind: "assistantReply",
@@ -2465,12 +2543,13 @@ function buildTimelineItems(
         text: valueAsString(event.data.text),
         status: "done",
         event,
-        details: [event]
+        details: deltaGroup ? [event, ...deltaGroup.events] : [event]
       });
       continue;
     }
 
     if (event.type === "reasoning.summary") {
+      const deltaGroup = reasoningDeltaGroups.get(streamStepKey(event));
       pushItem({
         id: event.id,
         kind: "reasoning",
@@ -2478,7 +2557,7 @@ function buildTimelineItems(
         text: valueAsString(event.data.text),
         status: "done",
         event,
-        details: [event]
+        details: deltaGroup ? [event, ...deltaGroup.events] : [event]
       });
       continue;
     }
@@ -3138,8 +3217,13 @@ function eventLabel(event: EventRecord) {
     "step.started": "步骤开始",
     "step.ended": "步骤结束",
     "step.failed": "步骤失败",
+    "llm.stream.started": "模型流开始",
+    "llm.stream.finished": "模型流结束",
     "reasoning.summary": "过程摘要",
+    "reasoning.summary.delta": "过程摘要片段",
     "assistant.message": "助手回复",
+    "assistant.message.delta": "助手回复片段",
+    "tool.input.delta": "工具参数片段",
     "tool.called": "工具调用",
     "tool.success": "工具成功",
     "tool.failed": "工具失败",

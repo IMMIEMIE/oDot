@@ -51,6 +51,7 @@ pub fn execute_tool_with_mode(
         &session.id,
         "tool.called",
         json!({
+            "toolCallId": call.tool_call_id,
             "name": call.name,
             "input": call.input
         }),
@@ -931,6 +932,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let session = test_session(".".to_string(), ShellMode::Auto);
         let call = ToolCallRequest {
+            tool_call_id: None,
             name: "shell".to_string(),
             input: json!({
                 "command": echo_command(),
@@ -971,6 +973,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let session = test_session(".".to_string(), ShellMode::Auto);
         let call = ToolCallRequest {
+            tool_call_id: None,
             name: "invalid".to_string(),
             input: json!({
                 "tool": "shell",

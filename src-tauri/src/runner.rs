@@ -1,14 +1,21 @@
 use crate::{
-    config_file, provider, storage, tools,
+    config_file,
+    llm_runtime::LlmStreamEvent,
+    provider, storage, tools,
     types::{
-        AgentMode, ContextSummaryRecord, ModelTurn, PromptSessionInput, SessionEventsResponse,
-        SessionInputDelivery, SubmitPromptInput,
+        AgentMode, ContextSummaryRecord, EventRecord, ModelTurn, PromptSessionInput,
+        SessionEventsResponse, SessionInputDelivery, SubmitPromptInput,
     },
     util,
 };
 use rusqlite::Connection;
 use serde_json::{json, Value};
-use std::{fs, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fs,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use tauri::AppHandle;
 
 const MAX_STEPS: usize = 25;
@@ -16,6 +23,8 @@ const RECENT_EVENT_LIMIT: usize = 80;
 const RECENT_EVENT_CHAR_BUDGET: usize = 48_000;
 const RECENT_EVENT_MIN_KEEP: usize = 12;
 const AUTO_COMPACT_EVENT_THRESHOLD: usize = 80;
+const STREAM_DELTA_FLUSH_CHARS: usize = 96;
+const STREAM_DELTA_FLUSH_MS: u64 = 120;
 
 pub async fn submit_prompt(
     app: &AppHandle,
@@ -167,55 +176,96 @@ async fn run_session_steps(
                 return Err(error);
             }
         };
-        let system_prompt = build_system_prompt(
-            session.mode.as_str(),
-            provider::supports_native_tools(&request_config),
-        );
-        let user_prompt = build_user_prompt(conn, &session.id, current_prompt)?;
-        let completion =
-            match provider::complete(&request_config, &system_prompt, &user_prompt).await {
-                Ok(value) => value,
-                Err(error) => {
-                    if stop_if_cancelled(conn, &session.id, step_index)? {
-                        break;
+        let native_runtime = provider::supports_native_tools(&request_config);
+        let system_prompt = build_system_prompt(session.mode.as_str(), native_runtime);
+        let turn = if native_runtime {
+            storage::append_event(
+                conn,
+                &session.id,
+                "llm.stream.started",
+                json!({
+                    "step": step_index,
+                    "runtime": "rust-openai-chat",
+                    "providerId": provider_id_from_record(&session.provider_id),
+                    "model": &request_config.model
+                }),
+            )?;
+            let stream_system_prompt =
+                build_stream_system_prompt(conn, session, session.mode.as_str(), native_runtime)?;
+            let messages =
+                build_stream_messages(conn, &session.id, &stream_system_prompt, current_prompt)?;
+            let mut sink = StreamEventSink::new(conn, &session.id, step_index);
+            let turn =
+                match provider::stream_openai_compatible(&request_config, &messages, |event| {
+                    sink.handle(event)
+                })
+                .await
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if stop_if_cancelled(conn, &session.id, step_index)? {
+                            break;
+                        }
+                        storage::append_event(
+                            conn,
+                            &session.id,
+                            "step.failed",
+                            json!({
+                                "step": step_index,
+                                "error": error
+                            }),
+                        )?;
+                        return Err(error);
                     }
-                    storage::append_event(
-                        conn,
-                        &session.id,
-                        "step.failed",
-                        json!({
-                            "step": step_index,
-                            "error": error
-                        }),
-                    )?;
-                    return Err(error);
+                };
+            sink.flush_all()?;
+            turn
+        } else {
+            let user_prompt = build_user_prompt(conn, &session.id, current_prompt)?;
+            let completion =
+                match provider::complete(&request_config, &system_prompt, &user_prompt).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if stop_if_cancelled(conn, &session.id, step_index)? {
+                            break;
+                        }
+                        storage::append_event(
+                            conn,
+                            &session.id,
+                            "step.failed",
+                            json!({
+                                "step": step_index,
+                                "error": error
+                            }),
+                        )?;
+                        return Err(error);
+                    }
+                };
+            if let Some(turn) = completion.turn {
+                turn
+            } else {
+                match parse_model_turn(&completion.raw_response) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        storage::append_event(
+                            conn,
+                            &session.id,
+                            "step.failed",
+                            json!({
+                                "step": step_index,
+                                "error": error,
+                                "rawResponse": completion.raw_response
+                            }),
+                        )?;
+                        return Err(error);
+                    }
                 }
-            };
+            }
+        };
 
         if stop_if_cancelled(conn, &session.id, step_index)? {
             break;
         }
-
-        let turn = if let Some(turn) = completion.turn {
-            turn
-        } else {
-            match parse_model_turn(&completion.raw_response) {
-                Ok(value) => value,
-                Err(error) => {
-                    storage::append_event(
-                        conn,
-                        &session.id,
-                        "step.failed",
-                        json!({
-                            "step": step_index,
-                            "error": error,
-                            "rawResponse": completion.raw_response
-                        }),
-                    )?;
-                    return Err(error);
-                }
-            }
-        };
 
         if let Some(summary) = turn
             .summary
@@ -227,6 +277,7 @@ async fn run_session_steps(
                 &session.id,
                 "reasoning.summary",
                 json!({
+                    "step": step_index,
                     "text": summary
                 }),
             )?;
@@ -242,6 +293,7 @@ async fn run_session_steps(
                 &session.id,
                 "assistant.message",
                 json!({
+                    "step": step_index,
                     "text": message
                 }),
             )?;
@@ -529,6 +581,380 @@ fn shell_environment_prompt() -> &'static str {
     } else {
         "Host OS is Unix-like. Shell commands run through sh -lc. Use POSIX-compatible commands unless the project clearly provides another shell."
     }
+}
+
+fn build_stream_system_prompt(
+    conn: &Connection,
+    session: &crate::types::SessionRecord,
+    mode: &str,
+    native_tools: bool,
+) -> Result<String, String> {
+    let summaries = storage::list_context_summaries(conn, &session.id)?;
+    let summary = summaries
+        .first()
+        .map(|summary| summary.text.as_str())
+        .unwrap_or("当前还没有压缩上下文。");
+    Ok(format!(
+        "{}\n\nProject context:\n{}\n\nCompressed context:\n{}",
+        build_system_prompt(mode, native_tools),
+        project_context_text(&session.project_root),
+        summary
+    ))
+}
+
+fn build_stream_messages(
+    conn: &Connection,
+    session_id: &str,
+    system_prompt: &str,
+    current_prompt: &str,
+) -> Result<Vec<Value>, String> {
+    let events = storage::list_recent_events(conn, session_id, RECENT_EVENT_LIMIT)?;
+    let tool_call_ids = provider_tool_call_ids(&events);
+    let mut messages = vec![json!({
+        "role": "system",
+        "content": system_prompt
+    })];
+    let mut included_current_prompt = false;
+
+    for event in &events {
+        match event.event_type.as_str() {
+            "prompt.submitted" => {
+                let prompt = event
+                    .data
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if prompt.trim().is_empty() {
+                    continue;
+                }
+                included_current_prompt |= prompt == current_prompt;
+                messages.push(json!({
+                    "role": "user",
+                    "content": prompt
+                }));
+            }
+            "assistant.message" => {
+                let text = event.data.get("text").and_then(Value::as_str).unwrap_or("");
+                if text.trim().is_empty() {
+                    continue;
+                }
+                messages.push(json!({
+                    "role": "assistant",
+                    "content": text
+                }));
+            }
+            "tool.called" => {
+                let name = event.data.get("name").and_then(Value::as_str).unwrap_or("");
+                if name.trim().is_empty() {
+                    continue;
+                }
+                let input = event.data.get("input").cloned().unwrap_or(Value::Null);
+                let tool_call_id = tool_call_ids
+                    .get(&event.id)
+                    .cloned()
+                    .unwrap_or_else(|| event.id.clone());
+                messages.push(json!({
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string())
+                        }
+                    }]
+                }));
+            }
+            "tool.success" | "tool.failed" | "tool.rejected" => {
+                let local_call_id = event
+                    .data
+                    .get("toolCallEventId")
+                    .or_else(|| event.data.get("pendingEventId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if local_call_id.is_empty() {
+                    continue;
+                }
+                let tool_call_id = tool_call_ids
+                    .get(local_call_id)
+                    .cloned()
+                    .unwrap_or_else(|| local_call_id.to_string());
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": tool_result_content(event)
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    if !included_current_prompt && !current_prompt.trim().is_empty() {
+        messages.push(json!({
+            "role": "user",
+            "content": current_prompt
+        }));
+    }
+
+    Ok(messages)
+}
+
+fn provider_tool_call_ids(events: &[EventRecord]) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+    for event in events {
+        if event.event_type != "tool.called" {
+            continue;
+        }
+        let tool_call_id = event
+            .data
+            .get("toolCallId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(event.id.as_str());
+        result.insert(event.id.clone(), tool_call_id.to_string());
+    }
+    result
+}
+
+fn tool_result_content(event: &EventRecord) -> String {
+    match event.event_type.as_str() {
+        "tool.rejected" => "Tool call rejected by user.".to_string(),
+        "tool.failed" => {
+            let error = event
+                .data
+                .get("error")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .unwrap_or_else(|| compact_json(event.data.get("result").unwrap_or(&Value::Null)));
+            truncate(&format!("Tool failed: {error}"), 12_000)
+        }
+        _ => truncate(
+            &compact_json(event.data.get("result").unwrap_or(&Value::Null)),
+            12_000,
+        ),
+    }
+}
+
+fn provider_id_from_record(record_id: &str) -> &str {
+    record_id.split('/').next().unwrap_or(record_id)
+}
+
+struct StreamEventSink<'a> {
+    conn: &'a Connection,
+    session_id: &'a str,
+    step: usize,
+    text: HashMap<String, DeltaBuffer>,
+    reasoning: HashMap<String, DeltaBuffer>,
+    tools: HashMap<String, ToolDeltaBuffer>,
+}
+
+struct DeltaBuffer {
+    text: String,
+    last_flush: Instant,
+}
+
+struct ToolDeltaBuffer {
+    text: String,
+    name: Option<String>,
+    last_flush: Instant,
+}
+
+impl<'a> StreamEventSink<'a> {
+    fn new(conn: &'a Connection, session_id: &'a str, step: usize) -> Self {
+        Self {
+            conn,
+            session_id,
+            step,
+            text: HashMap::new(),
+            reasoning: HashMap::new(),
+            tools: HashMap::new(),
+        }
+    }
+
+    fn handle(&mut self, event: LlmStreamEvent) -> Result<(), String> {
+        match event {
+            LlmStreamEvent::TextDelta { part_id, text } => {
+                Self::push_delta(&mut self.text, part_id, text);
+                self.flush_ready_text()
+            }
+            LlmStreamEvent::ReasoningDelta { part_id, text } => {
+                Self::push_delta(&mut self.reasoning, part_id, text);
+                self.flush_ready_reasoning()
+            }
+            LlmStreamEvent::ToolInputDelta {
+                tool_call_id,
+                name,
+                text,
+            } => {
+                let item = self
+                    .tools
+                    .entry(tool_call_id)
+                    .or_insert_with(|| ToolDeltaBuffer {
+                        text: String::new(),
+                        name: None,
+                        last_flush: Instant::now(),
+                    });
+                if name.is_some() {
+                    item.name = name;
+                }
+                item.text.push_str(&text);
+                self.flush_ready_tools()
+            }
+            LlmStreamEvent::Finish {
+                finish_reason,
+                usage,
+            } => {
+                self.flush_all()?;
+                storage::append_event(
+                    self.conn,
+                    self.session_id,
+                    "llm.stream.finished",
+                    json!({
+                        "step": self.step,
+                        "finishReason": finish_reason,
+                        "usage": usage
+                    }),
+                )?;
+                Ok(())
+            }
+            LlmStreamEvent::ToolCall(_) => Ok(()),
+        }
+    }
+
+    fn push_delta(buffers: &mut HashMap<String, DeltaBuffer>, part_id: String, text: String) {
+        let item = buffers.entry(part_id).or_insert_with(|| DeltaBuffer {
+            text: String::new(),
+            last_flush: Instant::now(),
+        });
+        item.text.push_str(&text);
+    }
+
+    fn flush_ready_text(&mut self) -> Result<(), String> {
+        let ready = ready_delta_keys(&self.text);
+        for key in ready {
+            self.flush_text(&key)?;
+        }
+        Ok(())
+    }
+
+    fn flush_ready_reasoning(&mut self) -> Result<(), String> {
+        let ready = ready_delta_keys(&self.reasoning);
+        for key in ready {
+            self.flush_reasoning(&key)?;
+        }
+        Ok(())
+    }
+
+    fn flush_ready_tools(&mut self) -> Result<(), String> {
+        let ready = self
+            .tools
+            .iter()
+            .filter_map(|(key, item)| {
+                should_flush(&item.text, item.last_flush).then(|| key.clone())
+            })
+            .collect::<Vec<_>>();
+        for key in ready {
+            self.flush_tool(&key)?;
+        }
+        Ok(())
+    }
+
+    fn flush_all(&mut self) -> Result<(), String> {
+        let text = self.text.keys().cloned().collect::<Vec<_>>();
+        for key in text {
+            self.flush_text(&key)?;
+        }
+        let reasoning = self.reasoning.keys().cloned().collect::<Vec<_>>();
+        for key in reasoning {
+            self.flush_reasoning(&key)?;
+        }
+        let tools = self.tools.keys().cloned().collect::<Vec<_>>();
+        for key in tools {
+            self.flush_tool(&key)?;
+        }
+        Ok(())
+    }
+
+    fn flush_text(&mut self, part_id: &str) -> Result<(), String> {
+        let Some(item) = self.text.get_mut(part_id) else {
+            return Ok(());
+        };
+        if item.text.is_empty() {
+            return Ok(());
+        }
+        let text = std::mem::take(&mut item.text);
+        item.last_flush = Instant::now();
+        storage::append_event(
+            self.conn,
+            self.session_id,
+            "assistant.message.delta",
+            json!({
+                "step": self.step,
+                "partId": part_id,
+                "text": text
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn flush_reasoning(&mut self, part_id: &str) -> Result<(), String> {
+        let Some(item) = self.reasoning.get_mut(part_id) else {
+            return Ok(());
+        };
+        if item.text.is_empty() {
+            return Ok(());
+        }
+        let text = std::mem::take(&mut item.text);
+        item.last_flush = Instant::now();
+        storage::append_event(
+            self.conn,
+            self.session_id,
+            "reasoning.summary.delta",
+            json!({
+                "step": self.step,
+                "partId": part_id,
+                "text": text
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn flush_tool(&mut self, tool_call_id: &str) -> Result<(), String> {
+        let Some(item) = self.tools.get_mut(tool_call_id) else {
+            return Ok(());
+        };
+        if item.text.is_empty() {
+            return Ok(());
+        }
+        let text = std::mem::take(&mut item.text);
+        item.last_flush = Instant::now();
+        storage::append_event(
+            self.conn,
+            self.session_id,
+            "tool.input.delta",
+            json!({
+                "step": self.step,
+                "toolCallId": tool_call_id,
+                "name": &item.name,
+                "text": text
+            }),
+        )?;
+        Ok(())
+    }
+}
+
+fn ready_delta_keys(buffers: &HashMap<String, DeltaBuffer>) -> Vec<String> {
+    buffers
+        .iter()
+        .filter_map(|(key, item)| should_flush(&item.text, item.last_flush).then(|| key.clone()))
+        .collect()
+}
+
+fn should_flush(text: &str, last_flush: Instant) -> bool {
+    !text.is_empty()
+        && (text.chars().count() >= STREAM_DELTA_FLUSH_CHARS
+            || last_flush.elapsed() >= Duration::from_millis(STREAM_DELTA_FLUSH_MS))
 }
 
 fn build_user_prompt(
@@ -879,6 +1305,44 @@ mod tests {
         assert!(timeline.lines().any(|line| line.starts_with("#69 ")));
         assert!(!timeline.lines().any(|line| line.starts_with("#1 ")));
         assert!(timeline.chars().count() <= RECENT_EVENT_CHAR_BUDGET);
+    }
+
+    #[test]
+    fn provider_tool_call_ids_replay_from_tool_called_events() {
+        let events = vec![
+            crate::types::EventRecord {
+                id: "local-call".to_string(),
+                session_id: "s1".to_string(),
+                seq: 1,
+                event_type: "tool.called".to_string(),
+                data: json!({
+                    "toolCallId": "provider-call",
+                    "name": "read",
+                    "input": { "path": "src/main.rs" }
+                }),
+                created_at: "now".to_string(),
+            },
+            crate::types::EventRecord {
+                id: "result".to_string(),
+                session_id: "s1".to_string(),
+                seq: 2,
+                event_type: "tool.success".to_string(),
+                data: json!({
+                    "toolCallEventId": "local-call",
+                    "name": "read",
+                    "result": { "content": "ok" }
+                }),
+                created_at: "now".to_string(),
+            },
+        ];
+
+        let ids = provider_tool_call_ids(&events);
+
+        assert_eq!(
+            ids.get("local-call").map(String::as_str),
+            Some("provider-call")
+        );
+        assert!(tool_result_content(&events[1]).contains("ok"));
     }
 
     #[test]
