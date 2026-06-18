@@ -53,6 +53,7 @@ import {
   updateSessionTitle,
   type AgentMode,
   type EventRecord,
+  type PermissionRequestRecord,
   type PermissionReply,
   type ProjectFile,
   type ProviderConfigFileResponse,
@@ -135,6 +136,7 @@ export function App() {
   const stopRefreshTimerRef = useRef<number | undefined>(undefined);
   const activeRunIdRef = useRef(0);
   const stopBaselineSeqRef = useRef(0);
+  const rollbackInFlightRef = useRef(false);
   const [leftWidth, setLeftWidth] = useState(() => {
     const stored = Number(localStorage.getItem("odot.leftWidth"));
     return Number.isFinite(stored) && stored >= 300 ? stored : 420;
@@ -206,6 +208,17 @@ export function App() {
     [providers, sessions]
   );
 
+  useEffect(() => {
+    if (
+      selectedSessionId &&
+      !availableSessions.some((session) => session.id === selectedSessionId)
+    ) {
+      setSelectedSessionId("");
+      setEventsResponse(EMPTY_EVENTS);
+      setStreamingEventId(null);
+    }
+  }, [availableSessions, selectedSessionId]);
+
   const filteredFiles = useMemo(() => {
     const query = fileFilter.trim().toLowerCase();
     if (!query) {
@@ -252,6 +265,10 @@ export function App() {
         ) ?? null
     );
   }, [eventsResponse.events, selectedSession?.mode]);
+  const planExecutionEvents = useMemo(
+    () => latestPlanExecutionEvents(eventsResponse.events),
+    [eventsResponse.events]
+  );
 
   const latestEventId = eventsResponse.events.at(-1)?.id ?? "";
   const isAgentWorking = isSubmitting || isContinuing;
@@ -278,9 +295,15 @@ export function App() {
       if (preferredProviderId) {
         setSelectedProviderId(preferredProviderId);
       }
-      const restorableSession = nextSessions[0];
+      const restorableSession = nextSessions.find((session) =>
+        config.providers.some((provider) => provider.id === session.providerId)
+      );
       if (restorableSession) {
         await selectSession(restorableSession);
+      } else {
+        setSelectedSessionId("");
+        setEventsResponse(EMPTY_EVENTS);
+        setStreamingEventId(null);
       }
       setNotice({ tone: "success", text: "工作区已加载" });
     } catch (error) {
@@ -468,6 +491,17 @@ export function App() {
       throw new Error("请先选择项目目录。");
     }
     if (selectedSession) {
+      if (selectedSession.mode !== mode || selectedSession.shellMode !== shellMode) {
+        const updated = await updateSessionMode({
+          sessionId: selectedSession.id,
+          mode,
+          shellMode
+        });
+        setSessions((current) =>
+          current.map((session) => (session.id === updated.id ? updated : session))
+        );
+        return updated;
+      }
       return selectedSession;
     }
 
@@ -728,12 +762,13 @@ export function App() {
     if (!command) {
       return;
     }
+    const allowlistPrefix = shellAllowlistPrefix(command);
 
     setIsMutating(true);
     try {
       const nextPolicy = {
         autoAllowlist: Array.from(
-          new Set([...shellPolicy.autoAllowlist, command.toLowerCase()])
+          new Set([...shellPolicy.autoAllowlist, allowlistPrefix])
         )
       };
       const savedPolicy = await saveShellPolicy(nextPolicy);
@@ -785,15 +820,30 @@ export function App() {
   }
 
   async function handleRollback(snapshotId: string) {
+    await handleRollbackMany([snapshotId], "快照已回滚");
+  }
+
+  async function handleRollbackMany(snapshotIds: string[], successText: string) {
+    if (rollbackInFlightRef.current) {
+      return;
+    }
+    if (!snapshotIds.length) {
+      setNotice({ tone: "info", text: "没有可回滚的代码变更" });
+      return;
+    }
+    rollbackInFlightRef.current = true;
     setIsMutating(true);
     try {
-      await rollbackSnapshot(snapshotId);
+      for (const snapshotId of snapshotIds) {
+        await rollbackSnapshot(snapshotId);
+      }
       await loadEvents();
       await loadFiles(projectRoot);
-      setNotice({ tone: "success", text: "快照已回滚" });
+      setNotice({ tone: "success", text: successText });
     } catch (error) {
       reportError(error);
     } finally {
+      rollbackInFlightRef.current = false;
       setIsMutating(false);
     }
   }
@@ -1113,7 +1163,19 @@ export function App() {
                 ["plan", "计划"],
                 ["agent", "执行"]
               ]}
-              onChange={(value) => setMode(value as AgentMode)}
+              onChange={(value) => {
+                const nextMode = value as AgentMode;
+                setMode(nextMode);
+                if (selectedSessionId) {
+                  void updateSessionMode({ sessionId: selectedSessionId, mode: nextMode })
+                    .then((updated) =>
+                      setSessions((current) =>
+                        current.map((s) => s.id === updated.id ? updated : s)
+                      )
+                    )
+                    .catch(reportError);
+                }
+              }}
             />
             <Segmented
               value={shellMode}
@@ -1121,7 +1183,22 @@ export function App() {
                 ["manual", "手动命令"],
                 ["auto", "自动命令"]
               ]}
-              onChange={(value) => setShellMode(value as ShellMode)}
+              onChange={(value) => {
+                const nextShellMode = value as ShellMode;
+                setShellMode(nextShellMode);
+                if (selectedSessionId) {
+                  void updateSessionMode({
+                    sessionId: selectedSessionId,
+                    shellMode: nextShellMode
+                  })
+                    .then((updated) =>
+                      setSessions((current) =>
+                        current.map((s) => s.id === updated.id ? updated : s)
+                      )
+                    )
+                    .catch(reportError);
+                }
+              }}
             />
           </div>
           <div className={`notice ${notice.tone}`}>
@@ -1157,22 +1234,19 @@ export function App() {
           </div>
 
           <div className="timeline">
-            {selectedSession?.mode === "agent" && eventsResponse.events.length > 0 && (
-              <ExecutionTimelineEvent events={eventsResponse.events} />
-            )}
-            {eventsResponse.events.map((event) => (
-              <TimelineEvent
-                key={event.id}
-                event={event}
-                stream={event.id === streamingEventId}
-                canExecutePlan={
-                  event.id === latestExecutablePlanEvent?.id &&
-                  !isPromptLocked &&
-                  !isMutating
-                }
-                onExecutePlan={handleExecutePlan}
-              />
-            ))}
+            <ConversationTimeline
+              events={eventsResponse.events}
+              snapshots={eventsResponse.snapshots}
+              streamingEventId={streamingEventId ?? ""}
+              executablePlanEventId={latestExecutablePlanEvent?.id ?? ""}
+              canExecutePlan={!isPromptLocked && !isMutating}
+              onExecutePlan={handleExecutePlan}
+              rollbackDisabled={isMutating}
+              onRollbackSnapshot={(snapshotId) => void handleRollback(snapshotId)}
+              onRollbackSnapshots={(snapshotIds, successText) =>
+                void handleRollbackMany(snapshotIds, successText ?? "已回滚到提示词发送前")
+              }
+            />
             {!eventsResponse.events.length && (
               <div className="emptyTimeline">
                 <BrainCircuit size={28} />
@@ -1181,6 +1255,13 @@ export function App() {
             )}
             <div ref={timelineEndRef} />
           </div>
+
+          {planExecutionEvents.length > 0 && (
+            <PlanExecutionDock
+              events={planExecutionEvents}
+              snapshots={eventsResponse.snapshots}
+            />
+          )}
 
           <div className="promptBar">
             <textarea
@@ -1228,16 +1309,14 @@ export function App() {
       </main>
 
       <aside className={`rightPane ${isRightPaneCollapsed ? "collapsed" : ""}`}>
-        <div className="rightPaneToggleRow">
-          <button
-            className="iconButton ghost rightPaneToggle"
-            type="button"
-            aria-label={isRightPaneCollapsed ? "展开右侧面板" : "折叠右侧面板"}
-            onClick={() => setIsRightPaneCollapsed((current) => !current)}
-          >
-            {isRightPaneCollapsed ? <ChevronLeft size={16} /> : <ChevronRight size={16} />}
-          </button>
-        </div>
+        <button
+          className="rightPaneToggle"
+          type="button"
+          aria-label={isRightPaneCollapsed ? "展开右侧面板" : "折叠右侧面板"}
+          onClick={() => setIsRightPaneCollapsed((current) => !current)}
+        >
+          {isRightPaneCollapsed ? <ChevronLeft size={16} /> : <ChevronRight size={16} />}
+        </button>
 
         {!isRightPaneCollapsed && (
           <>
@@ -1293,8 +1372,7 @@ export function App() {
             <section className="rightSection">
               <SectionTitle icon={<KeyRound size={16} />} title="权限请求" />
               <div className="stackList">
-                {eventsResponse.permissions
-                  .filter((request) => request.status === "pending")
+                {visiblePermissionRequests(eventsResponse.permissions)
                   .map((request) => (
                     <div className="approvalRow" key={request.id}>
                       <code>{request.action}: {request.resources.join(", ")}</code>
@@ -1326,7 +1404,7 @@ export function App() {
                       </div>
                     </div>
                   ))}
-                {!eventsResponse.permissions.some((request) => request.status === "pending") && (
+                {!visiblePermissionRequests(eventsResponse.permissions).length && (
                   <EmptyLine text="暂无权限请求" />
                 )}
               </div>
@@ -1352,20 +1430,6 @@ export function App() {
               </div>
             </section>
 
-            <section className="rightSection snapshotsSection">
-              <SectionTitle icon={<RotateCcw size={16} />} title="变更快照" />
-              <div className="snapshotList">
-                {eventsResponse.snapshots.map((snapshot) => (
-                  <SnapshotItem
-                    key={snapshot.id}
-                    snapshot={snapshot}
-                    disabled={isMutating}
-                    onRollback={handleRollback}
-                  />
-                ))}
-                {!eventsResponse.snapshots.length && <EmptyLine text="暂无快照" />}
-              </div>
-            </section>
           </>
         )}
       </aside>
@@ -1662,121 +1726,380 @@ function FileTreeNode({
   );
 }
 
-function TimelineEvent({
-  event,
-  stream = false,
-  canExecutePlan = false,
-  onExecutePlan
-}: {
-  event: EventRecord;
-  stream?: boolean;
-  canExecutePlan?: boolean;
-  onExecutePlan?: (event: EventRecord) => Promise<void>;
-}) {
-  const [expanded, setExpanded] = useState(defaultTimelineExpanded(event));
+type TimelineItemKind =
+  | "userPrompt"
+  | "assistantReply"
+  | "reasoning"
+  | "codeChange"
+  | "codeChangeSummary"
+  | "statusSummary"
+  | "hiddenDetail";
 
-  useEffect(() => {
-    setExpanded(defaultTimelineExpanded(event));
-  }, [event.id, event.type]);
+type TimelineStatus = "done" | "running" | "waiting" | "failed" | "neutral";
+
+type TimelineCodeChange = {
+  id: string;
+  snapshotId?: string;
+  snapshotIds?: string[];
+  path: string;
+  operation: string;
+  patch: string;
+  stats: { added: number; deleted: number };
+  beforeContent?: string | null;
+  afterContent?: string | null;
+  order?: number;
+  createdAt?: string;
+};
+
+type TimelineCodeChangeGroup = {
+  id: string;
+  promptEventId?: string;
+  changes: TimelineCodeChange[];
+  stats: { files: number; added: number; deleted: number };
+  rollbackSnapshotIds: string[];
+};
+
+type TimelineItem = {
+  id: string;
+  kind: TimelineItemKind;
+  title: string;
+  text?: string;
+  status: TimelineStatus;
+  event?: EventRecord;
+  details: EventRecord[];
+  hiddenSummary?: string;
+  codeChange?: TimelineCodeChange;
+  codeChangeGroup?: TimelineCodeChangeGroup;
+  rollbackSnapshotIds?: string[];
+};
+
+function ConversationTimeline({
+  events,
+  snapshots,
+  streamingEventId,
+  executablePlanEventId,
+  canExecutePlan,
+  onExecutePlan,
+  rollbackDisabled,
+  onRollbackSnapshot,
+  onRollbackSnapshots
+}: {
+  events: EventRecord[];
+  snapshots: SnapshotRecord[];
+  streamingEventId: string;
+  executablePlanEventId: string;
+  canExecutePlan: boolean;
+  onExecutePlan: (event: EventRecord) => Promise<void>;
+  rollbackDisabled: boolean;
+  onRollbackSnapshot: (snapshotId: string) => void;
+  onRollbackSnapshots: (snapshotIds: string[], successText?: string) => void;
+}) {
+  const items = useMemo(
+    () => buildTimelineItems(events, snapshots),
+    [events, snapshots]
+  );
 
   return (
-    <article className={`timelineEvent ${eventTone(event.type)}`}>
-      <div className="eventIcon">{eventIcon(event.type)}</div>
-      <div className="eventBody">
-        <header>
-          <button
-            type="button"
-            className="eventHeaderButton"
-            onClick={() => setExpanded(!expanded)}
-          >
-            {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
-            <strong>{eventLabel(event)}</strong>
-          </button>
-          <span>#{event.seq}</span>
+    <>
+      {items.map((item) => (
+        <TimelineItemView
+          key={item.id}
+          item={item}
+          stream={item.event?.id === streamingEventId}
+          canExecutePlan={
+            canExecutePlan &&
+            item.kind === "assistantReply" &&
+            item.event?.id === executablePlanEventId
+          }
+          onExecutePlan={onExecutePlan}
+          rollbackDisabled={rollbackDisabled}
+          onRollbackSnapshot={onRollbackSnapshot}
+          onRollbackSnapshots={onRollbackSnapshots}
+        />
+      ))}
+    </>
+  );
+}
+
+function TimelineItemView({
+  item,
+  stream,
+  canExecutePlan,
+  onExecutePlan,
+  rollbackDisabled,
+  onRollbackSnapshot,
+  onRollbackSnapshots
+}: {
+  item: TimelineItem;
+  stream: boolean;
+  canExecutePlan: boolean;
+  onExecutePlan: (event: EventRecord) => Promise<void>;
+  rollbackDisabled: boolean;
+  onRollbackSnapshot: (snapshotId: string) => void;
+  onRollbackSnapshots: (snapshotIds: string[], successText?: string) => void;
+}) {
+  const hiddenDetails = item.details.filter((event) => event.id !== item.event?.id);
+  const icon = timelineItemIcon(item);
+
+  return (
+    <article className={`timelineItem ${item.kind} ${item.status}`}>
+      <div className="timelineItemRail">
+        <div className="timelineItemIcon">{icon}</div>
+      </div>
+      <div className="timelineItemBody">
+        <header className="timelineItemHeader">
+          <strong>{item.title}</strong>
+          {item.event && <span>#{item.event.seq}</span>}
         </header>
-        {expanded && (
-          <EventDetail
-            event={event}
-            stream={stream}
-            canExecutePlan={canExecutePlan}
-            onExecutePlan={onExecutePlan}
+
+        {item.kind === "userPrompt" && (
+          <>
+            <p className="promptText">{item.text}</p>
+            <div className="timelineItemActions">
+              <button
+                type="button"
+                className="inlineRollbackButton"
+                disabled={rollbackDisabled || !item.rollbackSnapshotIds?.length}
+                onClick={() => onRollbackSnapshots(item.rollbackSnapshotIds ?? [])}
+                title="回滚到这条提示词发送之前"
+              >
+                <RotateCcw size={15} />
+                回滚到发送前
+              </button>
+            </div>
+          </>
+        )}
+
+        {item.kind === "assistantReply" && (
+          <div className="assistantDetail">
+            <MarkdownText text={item.text ?? ""} stream={stream} />
+            {canExecutePlan && item.event && (
+              <button
+                type="button"
+                className="executePlanButton"
+                onClick={() => void onExecutePlan(item.event!)}
+              >
+                <Play size={16} />
+                执行该计划
+              </button>
+            )}
+          </div>
+        )}
+
+        {item.kind === "reasoning" && (
+          <div className="reasoningBlock">
+            <MarkdownText text={item.text ?? ""} />
+          </div>
+        )}
+
+        {item.kind === "codeChange" && item.codeChange && (
+          <CodeChangeCard
+            change={item.codeChange}
+            rollbackDisabled={rollbackDisabled}
+            onRollbackSnapshot={onRollbackSnapshot}
           />
         )}
+
+        {item.kind === "codeChangeSummary" && item.codeChangeGroup && (
+          <CodeChangeSummaryCard
+            group={item.codeChangeGroup}
+            rollbackDisabled={rollbackDisabled}
+            onRollbackSnapshot={onRollbackSnapshot}
+            onRollbackSnapshots={onRollbackSnapshots}
+          />
+        )}
+
+        {(item.kind === "statusSummary" || item.kind === "hiddenDetail") && (
+          <p className="statusText">{item.text}</p>
+        )}
+
+        {item.hiddenSummary && (
+          <div className="hiddenSummary">
+            <Wrench size={13} />
+            <span>{item.hiddenSummary}</span>
+          </div>
+        )}
+        <HiddenDetails events={hiddenDetails} />
       </div>
     </article>
   );
 }
 
-function EventDetail({
-  event,
-  stream = false,
-  canExecutePlan = false,
-  onExecutePlan
+function CodeChangeCard({
+  change,
+  rollbackDisabled,
+  onRollbackSnapshot,
+  onRollbackSnapshots
 }: {
-  event: EventRecord;
-  stream?: boolean;
-  canExecutePlan?: boolean;
-  onExecutePlan?: (event: EventRecord) => Promise<void>;
+  change: TimelineCodeChange;
+  rollbackDisabled: boolean;
+  onRollbackSnapshot: (snapshotId: string) => void;
+  onRollbackSnapshots?: (snapshotIds: string[], successText?: string) => void;
 }) {
-  if (event.type === "prompt.submitted") {
-    return <p>{valueAsString(event.data.prompt)}</p>;
-  }
-  if (event.type === "assistant.message" || event.type === "reasoning.summary") {
-    return (
-      <div className="assistantDetail">
-        <MarkdownText
-          text={valueAsString(event.data.text)}
-          stream={stream && event.type === "assistant.message"}
+  const [expanded, setExpanded] = useState(false);
+  const rollbackSnapshotIds = change.snapshotIds ?? (change.snapshotId ? [change.snapshotId] : []);
+  const rollbackDisabledState = rollbackDisabled || rollbackSnapshotIds.length === 0;
+  return (
+    <div className="codeChangeCard">
+      <button
+        type="button"
+        className="codeChangeHeader"
+        onClick={() => setExpanded(!expanded)}
+      >
+        {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+        <FileCode2 size={16} />
+        <span>{change.path}</span>
+        <small>{change.operation}</small>
+        <b className="patchStat add">+{change.stats.added}</b>
+        <b className="patchStat del">-{change.stats.deleted}</b>
+      </button>
+      {expanded && <pre>{change.patch}</pre>}
+      <div className="timelineItemActions">
+        <button
+          type="button"
+          className="inlineRollbackButton"
+          disabled={rollbackDisabledState}
+          onClick={() => {
+            if (!rollbackSnapshotIds.length) {
+              return;
+            }
+            if (onRollbackSnapshots && rollbackSnapshotIds.length > 1) {
+              onRollbackSnapshots(rollbackSnapshotIds, "已回滚该文件修改");
+              return;
+            }
+            onRollbackSnapshot(rollbackSnapshotIds[0]);
+          }}
+          title={rollbackDisabledState ? "缺少快照，不能回滚" : "回滚这次代码修改"}
+        >
+          <RotateCcw size={15} />
+          回滚修改
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function CodeChangeSummaryCard({
+  group,
+  rollbackDisabled,
+  onRollbackSnapshot,
+  onRollbackSnapshots
+}: {
+  group: TimelineCodeChangeGroup;
+  rollbackDisabled: boolean;
+  onRollbackSnapshot: (snapshotId: string) => void;
+  onRollbackSnapshots: (snapshotIds: string[], successText?: string) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const previewChanges = group.changes.slice(0, 3);
+  const overflowCount = Math.max(0, group.changes.length - previewChanges.length);
+  const rollbackDisabledState = rollbackDisabled || group.rollbackSnapshotIds.length === 0;
+
+  return (
+    <div className="codeChangeSummaryCard">
+      <div className="codeChangeSummaryTop">
+        <button
+          type="button"
+          className="codeChangeSummaryToggle"
+          onClick={() => setExpanded(!expanded)}
+        >
+          {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+          <FileCode2 size={16} />
+          <span>修改 {group.stats.files} 个文件</span>
+          <b className="patchStat add">+{group.stats.added}</b>
+          <b className="patchStat del">-{group.stats.deleted}</b>
+        </button>
+        <button
+          type="button"
+          className="inlineRollbackButton"
+          disabled={rollbackDisabledState}
+          onClick={() => onRollbackSnapshots(group.rollbackSnapshotIds, "已回滚本轮修改")}
+          title={rollbackDisabledState ? "没有可回滚的快照" : "回滚本轮代码修改"}
+        >
+          <RotateCcw size={15} />
+          回滚本轮修改
+        </button>
+      </div>
+      <div className="codeChangeSummaryMeta">
+        <span>{operationSummary(group.changes)}</span>
+        {previewChanges.map((change) => (
+          <code key={change.id}>{change.path}</code>
+        ))}
+        {overflowCount > 0 && <span>另有 {overflowCount} 个文件</span>}
+      </div>
+      {expanded && (
+        <CodeChangeList
+          changes={group.changes}
+          rollbackDisabled={rollbackDisabled}
+          onRollbackSnapshot={onRollbackSnapshot}
+          onRollbackSnapshots={onRollbackSnapshots}
         />
-        {canExecutePlan && event.type === "assistant.message" && (
-          <button
-            type="button"
-            className="executePlanButton"
-            onClick={() => void onExecutePlan?.(event)}
-          >
-            <Play size={16} />
-            执行该计划
-          </button>
-        )}
-      </div>
-    );
+      )}
+    </div>
+  );
+}
+
+function CodeChangeList({
+  changes,
+  rollbackDisabled,
+  onRollbackSnapshot,
+  onRollbackSnapshots
+}: {
+  changes: TimelineCodeChange[];
+  rollbackDisabled: boolean;
+  onRollbackSnapshot: (snapshotId: string) => void;
+  onRollbackSnapshots: (snapshotIds: string[], successText?: string) => void;
+}) {
+  return (
+    <div className="codeChangeList">
+      {changes.map((change) => (
+        <CodeChangeCard
+          key={change.id}
+          change={change}
+          rollbackDisabled={rollbackDisabled}
+          onRollbackSnapshot={onRollbackSnapshot}
+          onRollbackSnapshots={onRollbackSnapshots}
+        />
+      ))}
+    </div>
+  );
+}
+
+function HiddenDetails({ events }: { events: EventRecord[] }) {
+  const [expanded, setExpanded] = useState(false);
+  if (!events.length) {
+    return null;
   }
-  if (event.type === "tool.called") {
-    return <pre>{JSON.stringify(event.data.input ?? {}, null, 2)}</pre>;
-  }
-  if (event.type === "tool.success" || event.type === "tool.failed") {
-    const result = event.data.result as Record<string, unknown> | undefined;
-    const stdout = valueAsString(result?.stdout);
-    const stderr = valueAsString(result?.stderr);
-    const patch = valueAsString(result?.patch);
-    const error = valueAsString(event.data.error);
-    return (
-      <div className="eventDetailStack">
-        {error && <p>{error}</p>}
-        {patch && <pre>{patch}</pre>}
-        {stdout && <pre>{stdout}</pre>}
-        {stderr && <pre>{stderr}</pre>}
-        {!error && !patch && !stdout && !stderr && (
-          <pre>{JSON.stringify(event.data.result ?? event.data, null, 2)}</pre>
-        )}
-      </div>
-    );
-  }
-  if (event.type === "tool.pending") {
-    return <p>{pendingCommand(event)}</p>;
-  }
-  if (event.type === "plan.candidateTool" || event.type === "policy.blocked") {
-    return <pre>{JSON.stringify(event.data, null, 2)}</pre>;
-  }
-  return <pre>{JSON.stringify(event.data, null, 2)}</pre>;
+  return (
+    <div className="hiddenDetails">
+      <button
+        type="button"
+        className="detailsToggle"
+        onClick={() => setExpanded(!expanded)}
+      >
+        {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+        查看细节
+        <span>{events.length}</span>
+      </button>
+      {expanded && (
+        <div className="detailsList">
+          {events.map((event) => (
+            <details className="rawEventDetail" key={event.id}>
+              <summary>
+                <span>{eventLabel(event)}</span>
+                <small>#{event.seq}</small>
+              </summary>
+              <pre>{JSON.stringify(event.data, null, 2)}</pre>
+            </details>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 const LONG_MARKDOWN_CHARS = 1200;
 const LONG_MARKDOWN_LINES = 18;
-
-function defaultTimelineExpanded(event: EventRecord) {
-  return event.type === "assistant.message" || event.type === "reasoning.summary";
-}
 
 function MarkdownText({
   text,
@@ -1827,7 +2150,7 @@ function MarkdownText({
           className="collapseToggle"
           onClick={() => setExpanded(!expanded)}
         >
-          {expanded ? "Collapse" : "Show more"}
+          {expanded ? "收起" : "展开内容"}
         </button>
       )}
     </div>
@@ -1841,53 +2164,683 @@ function isLongMarkdown(text: string) {
   );
 }
 
-type ExecutionNode = {
-  id: string;
-  label: string;
+type ExecutionSummary = {
+  status: Exclude<TimelineStatus, "neutral">;
+  statusText: string;
+  toolCount: number;
+  readCount: number;
+  searchCount: number;
+  commandCount: number;
+  changeCount: number;
   detail: string;
-  status: "done" | "running" | "waiting" | "failed";
 };
 
-function ExecutionTimelineEvent({ events }: { events: EventRecord[] }) {
-  return (
-    <article className="timelineEvent executionTimelineEvent">
-      <div className="eventIcon">
-        <History size={16} />
-      </div>
-      <div className="eventBody executionEventBody">
-        <header>
-          <div className="eventHeaderStatic">
-            <ChevronDown size={15} />
-            <strong>计划执行 Timeline</strong>
-          </div>
-          <span>{buildExecutionNodes(events).length} 节点</span>
-        </header>
-        <ExecutionTimeline events={events} />
-      </div>
-    </article>
-  );
+type DockDetail = {
+  id: string;
+  toolName: string;
+  label: string;
+  target: string;
+  status: "success" | "failed" | "pending" | "running";
+  errorText?: string;
+};
+
+function buildToolAction(
+  event: EventRecord,
+  resultByToolCall: Map<string, EventRecord>
+): DockDetail {
+  const name = valueAsString(event.data.name);
+  const input = asRecord(event.data.input);
+  const label = toolLabel(name);
+
+  let target = "";
+  if (name === "shell" || name === "bash") {
+    target = valueAsString(input.command);
+  } else if (name === "search" || name === "grep") {
+    target = valueAsString(input.query) || valueAsString(input.pattern) || valueAsString(input.regex);
+  } else {
+    target = valueAsString(input.path);
+  }
+  if (target.length > 80) {
+    target = target.slice(0, 77) + "...";
+  }
+
+  const result = resultByToolCall.get(event.id);
+  let status: DockDetail["status"] = "running";
+  let errorText: string | undefined;
+  if (result) {
+    if (result.type === "tool.success") {
+      status = "success";
+    } else if (result.type === "tool.failed") {
+      status = "failed";
+      errorText =
+        valueAsString(result.data.error) ||
+        valueAsString(asRecord(result.data.result).stderr) ||
+        "执行失败";
+    } else if (result.type === "tool.pending") {
+      status = "pending";
+    }
+  }
+
+  return { id: event.id, toolName: name, label, target, status, errorText };
 }
 
-function ExecutionTimeline({ events }: { events: EventRecord[] }) {
-  const nodes = buildExecutionNodes(events);
+function buildResultByToolCall(events: EventRecord[]) {
+  const resultByToolCall = new Map<string, EventRecord>();
+  for (const event of events) {
+    const toolCallEventId = valueAsString(event.data.toolCallEventId);
+    if (
+      toolCallEventId &&
+      (event.type === "tool.success" ||
+        event.type === "tool.failed" ||
+        event.type === "tool.pending")
+    ) {
+      resultByToolCall.set(toolCallEventId, event);
+    }
+  }
+  return resultByToolCall;
+}
+
+function buildDockDetails(events: EventRecord[]): DockDetail[] {
+  const resultByToolCall = buildResultByToolCall(events);
+  const details: DockDetail[] = [];
+  for (const event of events) {
+    if (event.type !== "tool.called") {
+      continue;
+    }
+    details.push(buildToolAction(event, resultByToolCall));
+  }
+  return details;
+}
+
+function PlanExecutionDock({
+  events,
+  snapshots
+}: {
+  events: EventRecord[];
+  snapshots: SnapshotRecord[];
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const summary = buildExecutionSummary(events, snapshots);
+  const details = useMemo(() => buildDockDetails(events), [events]);
+
   return (
-    <div className="executionTimeline">
-      {nodes.map((node) => (
-        <div className={`executionNode ${node.status}`} key={node.id}>
-          <div className="executionMarker">{executionStatusIcon(node.status)}</div>
-          <div className="executionContent">
-            <strong>{node.label}</strong>
-            <small>{node.detail}</small>
-          </div>
+    <section className={`planExecutionDock ${expanded ? "expanded" : ""}`}>
+      <button
+        type="button"
+        className="planExecutionHeader"
+        onClick={() => setExpanded((prev) => !prev)}
+      >
+        <div className="planExecutionTitle">
+          {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+          <History size={16} />
+          <strong>执行状态</strong>
+          <span className={summary.status}>{summary.statusText}</span>
         </div>
-      ))}
-      {!nodes.length && <EmptyLine text="暂无执行节点" />}
-    </div>
+        <small>{summary.detail}</small>
+      </button>
+      <div className="executionSummary">
+        <span>
+          <Wrench size={14} />
+          工具 {summary.toolCount}
+        </span>
+        <span>读取 {summary.readCount}</span>
+        <span>搜索 {summary.searchCount}</span>
+        <span>命令 {summary.commandCount}</span>
+        <span>修改 {summary.changeCount}</span>
+      </div>
+      {expanded && (
+        <div className="dockDetailList">
+          {details.map((detail) => (
+            <div key={detail.id} className={`dockDetailItem ${detail.status}`}>
+              <span className="dockStatus">
+                {detail.status === "success" && <Check size={14} />}
+                {detail.status === "failed" && <AlertTriangle size={14} />}
+                {detail.status === "pending" && <Clock3 size={14} />}
+                {detail.status === "running" && <Loader2 className="spin" size={14} />}
+              </span>
+              <span className="dockLabel">{detail.label}</span>
+              <span className="dockTarget">{detail.target || "—"}</span>
+              {detail.errorText && <span className="dockError">{detail.errorText}</span>}
+            </div>
+          ))}
+          {!details.length && <div className="dockDetailItem empty">暂无工具调用记录</div>}
+        </div>
+      )}
+    </section>
   );
 }
 
-function buildExecutionNodes(events: EventRecord[]): ExecutionNode[] {
-  const nodes: ExecutionNode[] = [];
+function buildTimelineItems(
+  events: EventRecord[],
+  snapshots: SnapshotRecord[]
+): TimelineItem[] {
+  const items: TimelineItem[] = [];
+  const hiddenBuffer: EventRecord[] = [];
+  const callById = new Map<string, EventRecord>();
+  const eventSeqById = new Map(events.map((event) => [event.id, event.seq]));
+  const snapshotsByEventId = new Map<string, SnapshotRecord[]>();
+  const consumedSnapshots = new Set<string>();
+  const rolledBackSnapshotIds = new Set(
+    events
+      .filter((event) => event.type === "rollback.applied")
+      .map((event) => valueAsString(event.data.snapshotId))
+      .filter(Boolean)
+  );
+  const promptEvents = events.filter((event) => event.type === "prompt.submitted");
+  const changeItemsByPromptId = new Map<string, TimelineItem>();
+  let currentPromptEvent: EventRecord | null = null;
+
+  for (const event of events) {
+    if (event.type === "tool.called") {
+      callById.set(event.id, event);
+    }
+  }
+  for (const snapshot of snapshots) {
+    if (!snapshot.eventId) {
+      continue;
+    }
+    const bucket = snapshotsByEventId.get(snapshot.eventId) ?? [];
+    bucket.push(snapshot);
+    snapshotsByEventId.set(snapshot.eventId, bucket);
+  }
+
+  function pushItem(item: TimelineItem) {
+    if (hiddenBuffer.length) {
+      item.details.unshift(...hiddenBuffer.splice(0));
+    }
+    item.hiddenSummary = summarizeHiddenEvents(item.details, item.event?.id);
+    items.push(item);
+  }
+
+  function attachHidden(event: EventRecord) {
+    const previous = items.at(-1);
+    if (!previous) {
+      hiddenBuffer.push(event);
+      return;
+    }
+    previous.details.push(event);
+    previous.hiddenSummary = summarizeHiddenEvents(previous.details, previous.event?.id);
+  }
+
+  function promptForSeq(seq?: number) {
+    if (seq === undefined) {
+      return currentPromptEvent;
+    }
+    let promptEvent: EventRecord | null = null;
+    for (const event of promptEvents) {
+      if (event.seq < seq) {
+        promptEvent = event;
+      } else {
+        break;
+      }
+    }
+    return promptEvent;
+  }
+
+  function ensureCodeChangeSummaryItem(event?: EventRecord, promptEvent = currentPromptEvent) {
+    const promptKey = promptEvent?.id ?? "unscoped";
+    const existing = changeItemsByPromptId.get(promptKey);
+    if (existing) {
+      return existing;
+    }
+    const group: TimelineCodeChangeGroup = {
+      id: `changes-${promptKey}`,
+      promptEventId: promptEvent?.id,
+      changes: [],
+      stats: { files: 0, added: 0, deleted: 0 },
+      rollbackSnapshotIds: []
+    };
+    const item: TimelineItem = {
+      id: group.id,
+      kind: "codeChangeSummary",
+      title: "代码修改",
+      status: "done",
+      event,
+      details: [],
+      codeChangeGroup: group
+    };
+    pushItem(item);
+    changeItemsByPromptId.set(promptKey, item);
+    return item;
+  }
+
+  function addChangesToSummary(
+    item: TimelineItem,
+    changes: TimelineCodeChange[],
+    detailEvents: EventRecord[]
+  ) {
+    const group = item.codeChangeGroup;
+    if (!group) {
+      return;
+    }
+    const existingChangeIds = new Set(group.changes.map((change) => change.id));
+    for (const change of changes) {
+      if (!existingChangeIds.has(change.id)) {
+        group.changes.push(change);
+        existingChangeIds.add(change.id);
+      }
+    }
+    group.changes = mergeCodeChangesByPath(group.changes);
+    group.stats = codeChangeGroupStats(group.changes);
+    group.rollbackSnapshotIds = group.changes
+      .flatMap((change) => change.snapshotIds ?? (change.snapshotId ? [change.snapshotId] : []));
+
+    const existingDetailIds = new Set(item.details.map((detail) => detail.id));
+    for (const detail of detailEvents) {
+      if (!existingDetailIds.has(detail.id)) {
+        item.details.push(detail);
+        existingDetailIds.add(detail.id);
+      }
+    }
+    item.hiddenSummary = summarizeHiddenEvents(item.details, item.event?.id);
+  }
+
+  for (const event of events) {
+    if (event.type === "prompt.submitted") {
+      currentPromptEvent = event;
+      pushItem({
+        id: event.id,
+        kind: "userPrompt",
+        title: "用户提示词",
+        text: valueAsString(event.data.prompt),
+        status: "done",
+        event,
+        details: [event],
+        rollbackSnapshotIds: promptRollbackSnapshotIds(
+          event,
+          events,
+          snapshots,
+          eventSeqById,
+          rolledBackSnapshotIds
+        )
+      });
+      continue;
+    }
+
+    if (event.type === "assistant.message") {
+      pushItem({
+        id: event.id,
+        kind: "assistantReply",
+        title: "助手回复",
+        text: valueAsString(event.data.text),
+        status: "done",
+        event,
+        details: [event]
+      });
+      continue;
+    }
+
+    if (event.type === "reasoning.summary") {
+      pushItem({
+        id: event.id,
+        kind: "reasoning",
+        title: "思考过程",
+        text: valueAsString(event.data.text),
+        status: "done",
+        event,
+        details: [event]
+      });
+      continue;
+    }
+
+    if (event.type === "tool.success") {
+      const changes = codeChangesForToolResult(
+        event,
+        snapshotsByEventId,
+        eventSeqById,
+        consumedSnapshots,
+        rolledBackSnapshotIds
+      );
+      if (changes.length) {
+        const call = callById.get(valueAsString(event.data.toolCallEventId));
+        const promptEvent = promptForSeq(event.seq);
+        const item = ensureCodeChangeSummaryItem(event, promptEvent);
+        addChangesToSummary(item, changes, call ? [call, event] : [event]);
+        continue;
+      }
+    }
+
+    const statusItem = statusItemForEvent(event);
+    if (statusItem) {
+      pushItem(statusItem);
+      continue;
+    }
+
+    attachHidden(event);
+  }
+
+  for (const snapshot of snapshots) {
+    if (consumedSnapshots.has(snapshot.id)) {
+      continue;
+    }
+    if (rolledBackSnapshotIds.has(snapshot.id)) {
+      continue;
+    }
+    const seq = snapshot.eventId ? eventSeqById.get(snapshot.eventId) : undefined;
+    const item = ensureCodeChangeSummaryItem(undefined, promptForSeq(seq));
+    addChangesToSummary(item, [codeChangeFromSnapshot(snapshot, seq)], []);
+  }
+
+  if (hiddenBuffer.length) {
+    pushItem({
+      id: `hidden-${hiddenBuffer[0].id}`,
+      kind: "hiddenDetail",
+      title: "运行细节",
+      text: summarizeHiddenEvents(hiddenBuffer) || "低优先级事件",
+      status: "neutral",
+      details: hiddenBuffer.splice(0)
+    });
+  }
+
+  return items;
+}
+
+function codeChangesForToolResult(
+  event: EventRecord,
+  snapshotsByEventId: Map<string, SnapshotRecord[]>,
+  eventSeqById: Map<string, number>,
+  consumedSnapshots: Set<string>,
+  rolledBackSnapshotIds: Set<string>
+) {
+  const toolCallEventId = valueAsString(event.data.toolCallEventId);
+  const snapshotChanges = [
+    ...(snapshotsByEventId.get(event.id) ?? []),
+    ...(toolCallEventId ? (snapshotsByEventId.get(toolCallEventId) ?? []) : [])
+  ];
+  if (snapshotChanges.length) {
+    return snapshotChanges
+      .filter((snapshot) => !rolledBackSnapshotIds.has(snapshot.id))
+      .map((snapshot) => {
+        consumedSnapshots.add(snapshot.id);
+        return codeChangeFromSnapshot(snapshot, snapshot.eventId ? eventSeqById.get(snapshot.eventId) : event.seq);
+      });
+  }
+
+  const result = asRecord(event.data.result);
+  const patch = valueAsString(result.patch);
+  if (!patch) {
+    return [];
+  }
+  const path = valueAsString(result.path) || "未知文件";
+  return [
+    {
+      id: `patch-${event.id}`,
+      path,
+      operation: operationLabel(valueAsString(event.data.name), null),
+      patch,
+      stats: patchLineStats(patch),
+      order: event.seq,
+      createdAt: event.createdAt
+    }
+  ];
+}
+
+function codeChangeFromSnapshot(snapshot: SnapshotRecord, order = 0): TimelineCodeChange {
+  return {
+    id: `snapshot-${snapshot.id}`,
+    snapshotId: snapshot.id,
+    snapshotIds: [snapshot.id],
+    path: snapshot.path,
+    operation: operationLabel("", snapshot),
+    patch: snapshot.patch,
+    stats: patchLineStats(snapshot.patch),
+    beforeContent: snapshot.beforeContent ?? null,
+    afterContent: snapshot.afterContent ?? null,
+    order,
+    createdAt: snapshot.createdAt
+  };
+}
+
+function codeChangeGroupStats(changes: TimelineCodeChange[]) {
+  return changes.reduce(
+    (stats, change) => ({
+      files: stats.files + 1,
+      added: stats.added + change.stats.added,
+      deleted: stats.deleted + change.stats.deleted
+    }),
+    { files: 0, added: 0, deleted: 0 }
+  );
+}
+
+function mergeCodeChangesByPath(changes: TimelineCodeChange[]) {
+  const byPath = new Map<string, TimelineCodeChange[]>();
+  for (const change of changes) {
+    const bucket = byPath.get(change.path) ?? [];
+    bucket.push(change);
+    byPath.set(change.path, bucket);
+  }
+
+  return Array.from(byPath.values()).map((bucket) => mergeFileCodeChanges(bucket));
+}
+
+function mergeFileCodeChanges(changes: TimelineCodeChange[]): TimelineCodeChange {
+  const snapshotBackedChanges = changes.filter(
+    (change) => change.snapshotId || change.snapshotIds?.length
+  );
+  const sourceChanges = snapshotBackedChanges.length ? snapshotBackedChanges : changes;
+  const sorted = [...sourceChanges].sort(compareCodeChangeOrder);
+  const first = sorted[0];
+  const last = sorted[sorted.length - 1];
+  if (sorted.length === 1) {
+    return {
+      ...first,
+      snapshotIds: first.snapshotIds ?? (first.snapshotId ? [first.snapshotId] : [])
+    };
+  }
+
+  const snapshotIds = sorted
+    .flatMap((change) => change.snapshotIds ?? (change.snapshotId ? [change.snapshotId] : []))
+    .filter(Boolean)
+    .reverse();
+  const canBuildNetPatch =
+    first.beforeContent !== undefined && last.afterContent !== undefined;
+  const patch = canBuildNetPatch
+    ? createUnifiedDiffPreview(
+        first.path,
+        first.beforeContent ?? "",
+        last.afterContent ?? ""
+      )
+    : sorted.map((change) => change.patch).join("\n");
+  const operation =
+    first.beforeContent === null
+      ? "新增"
+      : last.afterContent === null
+        ? "删除"
+        : `修改 ${sorted.length} 次`;
+
+  return {
+    ...last,
+    id: `path-${first.path}`,
+    snapshotId: snapshotIds[0],
+    snapshotIds,
+    operation,
+    patch,
+    stats: patchLineStats(patch),
+    beforeContent: first.beforeContent,
+    afterContent: last.afterContent,
+    order: first.order,
+    createdAt: last.createdAt
+  };
+}
+
+function compareCodeChangeOrder(left: TimelineCodeChange, right: TimelineCodeChange) {
+  const leftOrder = left.order ?? 0;
+  const rightOrder = right.order ?? 0;
+  if (leftOrder !== rightOrder) {
+    return leftOrder - rightOrder;
+  }
+  return (left.createdAt ?? "").localeCompare(right.createdAt ?? "");
+}
+
+function promptRollbackSnapshotIds(
+  promptEvent: EventRecord,
+  events: EventRecord[],
+  snapshots: SnapshotRecord[],
+  eventSeqById: Map<string, number>,
+  rolledBackSnapshotIds: Set<string>
+) {
+  const nextPromptSeq =
+    events.find(
+      (event) => event.type === "prompt.submitted" && event.seq > promptEvent.seq
+    )?.seq ?? Number.POSITIVE_INFINITY;
+  return snapshots
+    .filter((snapshot) => {
+      if (!snapshot.eventId) {
+        return false;
+      }
+      const seq = eventSeqById.get(snapshot.eventId);
+      return seq !== undefined && seq > promptEvent.seq && seq < nextPromptSeq;
+    })
+    .sort((left, right) => {
+      const leftSeq = left.eventId ? (eventSeqById.get(left.eventId) ?? 0) : 0;
+      const rightSeq = right.eventId ? (eventSeqById.get(right.eventId) ?? 0) : 0;
+      if (rightSeq !== leftSeq) {
+        return rightSeq - leftSeq;
+      }
+      return right.createdAt.localeCompare(left.createdAt);
+    })
+    .filter((snapshot) => !rolledBackSnapshotIds.has(snapshot.id))
+    .map((snapshot) => snapshot.id);
+}
+
+function operationLabel(toolName: string, snapshot: SnapshotRecord | null) {
+  if (snapshot?.afterContent === null) {
+    return "删除";
+  }
+  if (snapshot?.beforeContent === null) {
+    return "新增";
+  }
+  const labels: Record<string, string> = {
+    edit: "编辑",
+    write: "写入",
+    delete: "删除"
+  };
+  return labels[toolName] ?? "修改";
+}
+
+function operationSummary(changes: TimelineCodeChange[]) {
+  const counts = new Map<string, number>();
+  for (const change of changes) {
+    counts.set(change.operation, (counts.get(change.operation) ?? 0) + 1);
+  }
+  return Array.from(counts.entries())
+    .map(([operation, count]) => (count > 1 ? `${operation} ${count}` : operation))
+    .join(" · ");
+}
+
+function statusItemForEvent(event: EventRecord): TimelineItem | null {
+  if (event.type === "tool.pending") {
+    return {
+      id: event.id,
+      kind: "statusSummary",
+      title: "等待确认",
+      text: pendingCommand(event),
+      status: "waiting",
+      event,
+      details: [event]
+    };
+  }
+  if (event.type === "tool.failed") {
+    return {
+      id: event.id,
+      kind: "statusSummary",
+      title: "工具失败",
+      text: eventFailureText(event),
+      status: "failed",
+      event,
+      details: [event]
+    };
+  }
+  if (event.type === "tool.rejected") {
+    return {
+      id: event.id,
+      kind: "statusSummary",
+      title: "已拒绝工具",
+      text: toolLabel(valueAsString(event.data.name)),
+      status: "failed",
+      event,
+      details: [event]
+    };
+  }
+  if (event.type === "policy.blocked") {
+    return {
+      id: event.id,
+      kind: "statusSummary",
+      title: "策略拦截",
+      text: valueAsString(event.data.reason) || "请求被策略拦截",
+      status: "failed",
+      event,
+      details: [event]
+    };
+  }
+  if (event.type === "step.failed") {
+    return {
+      id: event.id,
+      kind: "statusSummary",
+      title: "执行失败",
+      text: valueAsString(event.data.error),
+      status: "failed",
+      event,
+      details: [event]
+    };
+  }
+  if (event.type === "agent.cancelRequested" || event.type === "agent.stopped") {
+    return {
+      id: event.id,
+      kind: "statusSummary",
+      title: event.type === "agent.stopped" ? "已停止" : "请求停止",
+      text: valueAsString(event.data.reason) || eventLabel(event),
+      status: event.type === "agent.stopped" ? "done" : "waiting",
+      event,
+      details: [event]
+    };
+  }
+  if (event.type === "rollback.applied") {
+    return null;
+  }
+  return null;
+}
+
+function eventFailureText(event: EventRecord) {
+  const result = asRecord(event.data.result);
+  return (
+    valueAsString(event.data.error) ||
+    valueAsString(result.stderr) ||
+    valueAsString(result.stdout) ||
+    "工具执行失败"
+  );
+}
+
+function summarizeHiddenEvents(events: EventRecord[], primaryEventId = "") {
+  const hidden = events.filter((event) => event.id !== primaryEventId);
+  if (!hidden.length) {
+    return "";
+  }
+  const toolCalls = hidden.filter((event) => event.type === "tool.called");
+  const reads = toolCalls.filter((event) => valueAsString(event.data.name) === "read").length;
+  const searches = toolCalls.filter((event) => {
+    const name = valueAsString(event.data.name);
+    return name === "search" || name === "grep";
+  }).length;
+  const commands = toolCalls.filter((event) => {
+    const name = valueAsString(event.data.name);
+    return name === "shell" || name === "bash";
+  }).length;
+  const steps = hidden.filter((event) => event.type.startsWith("step.")).length;
+  const parts = [
+    toolCalls.length ? `${toolCalls.length} 个工具调用` : "",
+    reads ? `${reads} 次读取` : "",
+    searches ? `${searches} 次搜索` : "",
+    commands ? `${commands} 条命令` : "",
+    steps ? `${steps} 个步骤事件` : ""
+  ].filter(Boolean);
+  return parts.length ? parts.join(" · ") : `${hidden.length} 条细节`;
+}
+
+function buildExecutionSummary(
+  events: EventRecord[],
+  snapshots: SnapshotRecord[]
+): ExecutionSummary {
   const resultByToolCall = new Map<string, EventRecord>();
   const resolvedPending = new Set(
     events
@@ -1907,141 +2860,168 @@ function buildExecutionNodes(events: EventRecord[]): ExecutionNode[] {
     }
   }
 
+  const toolCalls = events.filter((event) => event.type === "tool.called");
+  const readCount = toolCalls.filter((event) => valueAsString(event.data.name) === "read").length;
+  const searchCount = toolCalls.filter((event) => {
+    const name = valueAsString(event.data.name);
+    return name === "search" || name === "grep";
+  }).length;
+  const commandCount = toolCalls.filter((event) => {
+    const name = valueAsString(event.data.name);
+    return name === "shell" || name === "bash";
+  }).length;
+  const failed = events.some(
+    (event) => event.type.includes("failed") || event.type === "policy.blocked"
+  );
+  const waiting = events.some(
+    (event) => event.type === "tool.pending" && !resolvedPending.has(event.id)
+  );
+  const runningTool = toolCalls.some((event) => !resultByToolCall.has(event.id));
+  const runningStep = events.some((event) => {
+    if (event.type !== "step.started") {
+      return false;
+    }
+    const step = Number(event.data.step ?? 0);
+    return !events.some(
+      (item) =>
+        (item.type === "step.ended" || item.type === "step.failed") &&
+        Number(item.data.step ?? 0) === step
+    );
+  });
+  const eventIds = new Set(events.map((event) => event.id));
+  const snapshotChangePaths = new Set(
+    snapshots
+      .filter((snapshot) => snapshot.eventId && eventIds.has(snapshot.eventId))
+      .map((snapshot) => snapshot.path)
+  );
+  const fallbackPatchPaths = new Set<string>();
   for (const event of events) {
-    if (event.type === "prompt.submitted") {
-      nodes.push({
-        id: event.id,
-        label: "执行请求",
-        detail: truncateInline(valueAsString(event.data.prompt), 80),
-        status: "done"
-      });
+    if (event.type !== "tool.success") {
       continue;
     }
-
-    if (event.type === "step.started") {
-      const step = Number(event.data.step ?? 0);
-      const failed = events.find(
-        (item) => item.type === "step.failed" && Number(item.data.step ?? 0) === step
-      );
-      const ended = events.find(
-        (item) => item.type === "step.ended" && Number(item.data.step ?? 0) === step
-      );
-      nodes.push({
-        id: event.id,
-        label: `第 ${step} 轮执行`,
-        detail: failed ? valueAsString(failed.data.error) : ended ? "本轮已结束" : "正在执行",
-        status: failed ? "failed" : ended ? "done" : "running"
-      });
-      continue;
-    }
-
-    if (event.type === "tool.called") {
-      const name = valueAsString(event.data.name);
-      const result = resultByToolCall.get(event.id);
-      const status =
-        result?.type === "tool.failed"
-          ? "failed"
-          : result?.type === "tool.pending" && !resolvedPending.has(result.id)
-            ? "waiting"
-            : result
-              ? "done"
-              : "running";
-      nodes.push({
-        id: event.id,
-        label: `工具：${toolLabel(name) || name || "未知工具"}`,
-        detail: toolCallDetail(event),
-        status
-      });
-      continue;
-    }
-
-    if (event.type === "assistant.message") {
-      nodes.push({
-        id: event.id,
-        label: "阶段说明",
-        detail: truncateInline(valueAsString(event.data.text), 90),
-        status: "done"
-      });
-      continue;
-    }
-
-    if (event.type === "agent.cancelRequested" || event.type === "agent.stopped") {
-      nodes.push({
-        id: event.id,
-        label: event.type === "agent.stopped" ? "已停止" : "请求停止",
-        detail: valueAsString(event.data.reason),
-        status: event.type === "agent.stopped" ? "done" : "waiting"
-      });
-      continue;
-    }
-
-    if (event.type === "step.failed") {
-      nodes.push({
-        id: event.id,
-        label: "执行失败",
-        detail: valueAsString(event.data.error),
-        status: "failed"
-      });
+    const result = asRecord(event.data.result);
+    const path = valueAsString(result.path);
+    const toolCallEventId = valueAsString(event.data.toolCallEventId);
+    const hasSnapshot = snapshots.some(
+      (snapshot) =>
+        snapshot.eventId === event.id || (toolCallEventId && snapshot.eventId === toolCallEventId)
+    );
+    if (!hasSnapshot && path && valueAsString(result.patch)) {
+      fallbackPatchPaths.add(path);
     }
   }
+  const changeCount = new Set([...snapshotChangePaths, ...fallbackPatchPaths]).size;
+  const status: ExecutionSummary["status"] = failed
+    ? "failed"
+    : waiting
+      ? "waiting"
+      : runningTool || runningStep
+        ? "running"
+        : "done";
+  const statusText =
+    status === "failed"
+      ? "执行异常"
+      : status === "waiting"
+        ? "等待确认"
+        : status === "running"
+          ? "执行中"
+          : "已完成";
 
-  return nodes;
+  return {
+    status,
+    statusText,
+    toolCount: toolCalls.length,
+    readCount,
+    searchCount,
+    commandCount,
+    changeCount,
+    detail: `${events.length} 条事件 · ${changeCount} 个文件变更`
+  };
 }
 
-function toolCallDetail(event: EventRecord) {
-  const input = event.data.input as Record<string, unknown> | undefined;
-  return (
-    valueAsString(input?.path) ||
-    valueAsString(input?.command) ||
-    valueAsString(input?.query) ||
-    "等待工具结果"
-  );
+function timelineItemIcon(item: TimelineItem) {
+  if (item.kind === "userPrompt") {
+    return <Pencil size={16} />;
+  }
+  if (item.kind === "assistantReply") {
+    return <Bot size={16} />;
+  }
+  if (item.kind === "reasoning") {
+    return <BrainCircuit size={16} />;
+  }
+  if (item.kind === "codeChange" || item.kind === "codeChangeSummary") {
+    return <FileCode2 size={16} />;
+  }
+  if (item.status === "failed") {
+    return <AlertTriangle size={16} />;
+  }
+  if (item.status === "waiting") {
+    return <Clock3 size={16} />;
+  }
+  if (item.status === "running") {
+    return <Loader2 className="spin" size={16} />;
+  }
+  return <Check size={16} />;
 }
 
-function executionStatusIcon(status: ExecutionNode["status"]) {
-  if (status === "failed") {
-    return <AlertTriangle size={14} />;
+const DIFF_CONTEXT_LINES = 3;
+
+function createUnifiedDiffPreview(filePath: string, oldContent: string, newContent: string) {
+  const oldLines = splitPatchLines(oldContent);
+  const newLines = splitPatchLines(newContent);
+  let prefixLength = 0;
+  while (
+    prefixLength < oldLines.length &&
+    prefixLength < newLines.length &&
+    oldLines[prefixLength] === newLines[prefixLength]
+  ) {
+    prefixLength += 1;
   }
-  if (status === "running") {
-    return <Loader2 className="spin" size={14} />;
+
+  let suffixLength = 0;
+  while (
+    suffixLength < oldLines.length - prefixLength &&
+    suffixLength < newLines.length - prefixLength &&
+    oldLines[oldLines.length - 1 - suffixLength] ===
+      newLines[newLines.length - 1 - suffixLength]
+  ) {
+    suffixLength += 1;
   }
-  if (status === "waiting") {
-    return <Clock3 size={14} />;
+
+  const oldChangeEnd = oldLines.length - suffixLength;
+  const newChangeEnd = newLines.length - suffixLength;
+  const oldStart = Math.max(0, prefixLength - DIFF_CONTEXT_LINES);
+  const newStart = Math.max(0, prefixLength - DIFF_CONTEXT_LINES);
+  const oldEnd = Math.min(oldLines.length, oldChangeEnd + DIFF_CONTEXT_LINES);
+  const newEnd = Math.min(newLines.length, newChangeEnd + DIFF_CONTEXT_LINES);
+  const lines = [
+    `--- a/${filePath}`,
+    `+++ b/${filePath}`,
+    `@@ -${oldStart + 1},${oldEnd - oldStart} +${newStart + 1},${newEnd - newStart} @@`
+  ];
+
+  for (const line of oldLines.slice(oldStart, prefixLength)) {
+    lines.push(` ${line}`);
   }
-  return <Check size={14} />;
+  for (const line of oldLines.slice(prefixLength, oldChangeEnd)) {
+    lines.push(`-${line}`);
+  }
+  for (const line of newLines.slice(prefixLength, newChangeEnd)) {
+    lines.push(`+${line}`);
+  }
+  const sharedSuffixStart = oldLines.length - suffixLength;
+  for (const line of oldLines.slice(sharedSuffixStart, oldEnd)) {
+    lines.push(` ${line}`);
+  }
+
+  return `${lines.join("\n")}\n`;
 }
 
-function SnapshotItem({
-  snapshot,
-  disabled,
-  onRollback
-}: {
-  snapshot: SnapshotRecord;
-  disabled: boolean;
-  onRollback: (snapshotId: string) => Promise<void>;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const stats = patchLineStats(snapshot.patch);
-  return (
-    <article className="snapshotItem">
-      <button className="snapshotHeader" onClick={() => setExpanded(!expanded)}>
-        <FileCode2 size={15} />
-        <span>{snapshot.path}</span>
-        <small>{snapshot.afterContent === null ? "删除" : "写入"}</small>
-        <b className="patchStat add">+{stats.added}</b>
-        <b className="patchStat del">-{stats.deleted}</b>
-      </button>
-      {expanded && <pre>{snapshot.patch}</pre>}
-      <button
-        className="rollbackButton"
-        disabled={disabled}
-        onClick={() => void onRollback(snapshot.id)}
-      >
-        <RotateCcw size={15} />
-        回滚
-      </button>
-    </article>
-  );
+function splitPatchLines(content: string) {
+  if (!content) {
+    return [""];
+  }
+  return content.replace(/\r\n/g, "\n").split("\n");
 }
 
 function patchLineStats(patch: string) {
@@ -2152,35 +3132,6 @@ function initialExpandedDirs(files: ProjectFile[]) {
   return result;
 }
 
-function eventIcon(type: string) {
-  if (type.includes("failed") || type.includes("blocked")) {
-    return <AlertTriangle size={16} />;
-  }
-  if (type.startsWith("tool.")) {
-    return <Wrench size={16} />;
-  }
-  if (type.startsWith("reasoning")) {
-    return <BrainCircuit size={16} />;
-  }
-  if (type.startsWith("context")) {
-    return <Database size={16} />;
-  }
-  return <Bot size={16} />;
-}
-
-function eventTone(type: string) {
-  if (type.includes("failed") || type.includes("blocked")) {
-    return "danger";
-  }
-  if (type.includes("success") || type.includes("approved")) {
-    return "success";
-  }
-  if (type.includes("pending")) {
-    return "pending";
-  }
-  return "neutral";
-}
-
 function eventLabel(event: EventRecord) {
   const labels: Record<string, string> = {
     "prompt.submitted": "用户提示词",
@@ -2214,6 +3165,40 @@ function pendingCommand(event: EventRecord) {
     valueAsString(event.data.command) ||
     "待确认命令"
   );
+}
+
+function visiblePermissionRequests(requests: PermissionRequestRecord[]) {
+  return requests.filter(
+    (request) => request.status === "pending" && !isToolPermissionRequest(request)
+  );
+}
+
+function isToolPermissionRequest(request: PermissionRequestRecord) {
+  const source = asRecord(request.sourceJson);
+  return source.type === "tool";
+}
+
+function shellAllowlistPrefix(command: string) {
+  const normalized = command.trim().toLowerCase().replace(/\s+/g, " ");
+  if (!normalized) {
+    return "";
+  }
+  const first = normalized.split(" ")[0] ?? normalized;
+  if (first === "cd") {
+    return "cd";
+  }
+  if (first === "npm" || first === "pnpm" || first === "yarn") {
+    const parts = normalized.split(" ");
+    if (parts[1] === "run" && parts[2]) {
+      return `${parts[0]} run ${parts[2]}`;
+    }
+    return parts.slice(0, 2).join(" ");
+  }
+  if (first === "cargo" || first === "git") {
+    const parts = normalized.split(" ");
+    return parts.slice(0, 2).join(" ");
+  }
+  return first;
 }
 
 function hasUnresolvedPendingTools(events: EventRecord[]) {
@@ -2250,14 +3235,6 @@ function valueAsString(value: unknown) {
   return typeof value === "string" ? value : "";
 }
 
-function truncateInline(value: string, maxChars: number) {
-  const compact = value.replace(/\s+/g, " ").trim();
-  if (compact.length <= maxChars) {
-    return compact;
-  }
-  return `${compact.slice(0, maxChars)}...`;
-}
-
 function errorMessage(error: unknown) {
   if (error instanceof Error) {
     return error.stack || error.message;
@@ -2280,8 +3257,10 @@ function preferredConfigProviderId(config: ProviderConfigFileResponse) {
   return config.selectedProviderId ?? config.providers[0]?.id ?? "";
 }
 
+const PLAN_EXECUTION_PROMPT_PREFIX = "请执行下面这份计划。";
+
 function buildPlanExecutionPrompt(planText: string) {
-  return `请执行下面这份计划。
+  return `${PLAN_EXECUTION_PROMPT_PREFIX}
 
 执行要求：
 - 按计划逐步修改代码，不要跳过必要的读取、搜索和验证。
@@ -2291,6 +3270,23 @@ function buildPlanExecutionPrompt(planText: string) {
 
 计划内容：
 ${planText}`;
+}
+
+function latestPlanExecutionEvents(events: EventRecord[]) {
+  let startIndex = -1;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.type === "prompt.submitted") {
+      if (valueAsString(event.data.prompt).trimStart().startsWith(PLAN_EXECUTION_PROMPT_PREFIX)) {
+        startIndex = index;
+      }
+      break;
+    }
+  }
+  if (startIndex < 0) {
+    return [];
+  }
+  return events.slice(startIndex);
 }
 
 function modeLabel(value: AgentMode) {

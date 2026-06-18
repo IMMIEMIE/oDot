@@ -363,13 +363,22 @@ pub fn update_session_title(
 pub fn update_session_mode(
     conn: &Connection,
     session_id: &str,
-    mode: AgentMode,
+    mode: Option<AgentMode>,
+    shell_mode: Option<ShellMode>,
 ) -> Result<SessionRecord, String> {
+    let current = get_session(conn, session_id)?;
+    let next_mode = mode.unwrap_or(current.mode);
+    let next_shell_mode = shell_mode.unwrap_or(current.shell_mode);
     let updated_at = util::now_string();
     let changed = conn
         .execute(
-            "UPDATE session SET mode = ?1, updated_at = ?2 WHERE id = ?3",
-            params![mode.as_str(), &updated_at, session_id],
+            "UPDATE session SET mode = ?1, shell_mode = ?2, updated_at = ?3 WHERE id = ?4",
+            params![
+                next_mode.as_str(),
+                next_shell_mode.as_str(),
+                &updated_at,
+                session_id
+            ],
         )
         .map_err(|error| error.to_string())?;
     if changed == 0 {
@@ -1011,7 +1020,7 @@ pub fn default_shell_policy() -> ShellPolicy {
 fn normalize_allowlist(items: Vec<String>) -> Vec<String> {
     let mut result = Vec::new();
     for item in items {
-        let normalized = item.trim().to_ascii_lowercase();
+        let normalized = crate::tools::normalize_shell_policy_item(&item);
         if !normalized.is_empty() && !result.contains(&normalized) {
             result.push(normalized);
         }
@@ -1318,6 +1327,24 @@ mod tests {
 
         assert_eq!(replied.status, "answered");
         assert!(permission_is_saved(&conn, "E:/oDot", "bash", "npm run build").unwrap());
+    }
+
+    #[test]
+    fn update_session_mode_can_persist_shell_mode_only() {
+        let conn = memory_db();
+        conn.execute(
+            "INSERT INTO session (id, project_root, mode, provider_id, title, status, shell_mode, created_at, updated_at)
+             VALUES ('s1', 'E:/oDot', 'agent', 'p1', 'Test', 'active', 'manual', '1', '1')",
+            [],
+        )
+        .unwrap();
+
+        let updated = update_session_mode(&conn, "s1", None, Some(ShellMode::Auto)).unwrap();
+
+        assert!(matches!(updated.shell_mode, ShellMode::Auto));
+        assert!(matches!(updated.mode, AgentMode::Agent));
+        let persisted = get_session(&conn, "s1").unwrap();
+        assert!(matches!(persisted.shell_mode, ShellMode::Auto));
     }
 
     #[test]

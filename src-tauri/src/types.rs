@@ -216,7 +216,8 @@ pub struct UpdateSessionTitleInput {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateSessionModeInput {
     pub session_id: String,
-    pub mode: AgentMode,
+    pub mode: Option<AgentMode>,
+    pub shell_mode: Option<ShellMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

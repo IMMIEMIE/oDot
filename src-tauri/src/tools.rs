@@ -304,23 +304,6 @@ fn execute_tool_inner(
             let command = required_string(&call.input, "command")?;
             let options = shell_run_options(&call.input);
             let cwd = shell_workdir(session, &options)?;
-            if execution_mode == ToolExecutionMode::Plan {
-                let permission = storage::create_permission_request(
-                    conn,
-                    &session.id,
-                    "bash",
-                    vec![command.clone()],
-                    vec![command.clone()],
-                    json!({ "type": "tool", "eventId": called_event.id }),
-                )?;
-                return Ok(ToolRun::Pending(json!({
-                    "command": command,
-                    "background": options.background,
-                    "timeoutSeconds": options.timeout_seconds,
-                    "permissionRequestId": permission.id,
-                    "reason": "计划模式下 shell 命令必须由用户确认。"
-                })));
-            }
             if shell_needs_approval(&command, shell_mode, shell_policy)
                 && !storage::permission_is_saved(conn, &session.project_root, "bash", &command)?
             {
@@ -721,7 +704,7 @@ fn shell_approval_reason(command: &str, mode: &ShellMode, policy: &ShellPolicy) 
 }
 
 fn is_low_risk_command(command: &str, policy: &ShellPolicy) -> bool {
-    let normalized = command.trim().to_ascii_lowercase();
+    let normalized = normalize_shell_policy_item(command);
     if normalized.is_empty() {
         return false;
     }
@@ -757,7 +740,16 @@ fn is_low_risk_command(command: &str, policy: &ShellPolicy) -> bool {
     policy
         .auto_allowlist
         .iter()
-        .any(|prefix| normalized == *prefix || normalized.starts_with(&format!("{prefix} ")))
+        .map(|prefix| normalize_shell_policy_item(prefix))
+        .any(|prefix| normalized == prefix || normalized.starts_with(&format!("{prefix} ")))
+}
+
+pub(crate) fn normalize_shell_policy_item(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 fn required_string(input: &Value, key: &str) -> Result<String, String> {
@@ -805,6 +797,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::AgentMode;
 
     fn policy(items: &[&str]) -> ShellPolicy {
         ShellPolicy {
@@ -817,6 +810,39 @@ mod tests {
             "Start-Sleep -Seconds 5"
         } else {
             "sleep 5"
+        }
+    }
+
+    fn echo_command() -> &'static str {
+        if cfg!(target_os = "windows") {
+            "Write-Output odot-plan-auto"
+        } else {
+            "printf odot-plan-auto"
+        }
+    }
+
+    fn test_session(project_root: String, shell_mode: ShellMode) -> SessionRecord {
+        SessionRecord {
+            id: "s1".to_string(),
+            project_root,
+            mode: AgentMode::Plan,
+            provider_id: "p1".to_string(),
+            title: "test".to_string(),
+            status: "active".to_string(),
+            shell_mode,
+            created_at: "now".to_string(),
+            updated_at: "now".to_string(),
+        }
+    }
+
+    fn test_event() -> EventRecord {
+        EventRecord {
+            id: "e1".to_string(),
+            session_id: "s1".to_string(),
+            seq: 1,
+            event_type: "tool.called".to_string(),
+            data: json!({}),
+            created_at: "now".to_string(),
         }
     }
 
@@ -842,7 +868,7 @@ mod tests {
 
     #[test]
     fn auto_shell_allows_allowlisted_prefixes() {
-        let policy = policy(&["npm run typecheck", "cargo test"]);
+        let policy = policy(&["npm run typecheck", "cargo test", "cd"]);
 
         assert!(!shell_needs_approval(
             "npm run typecheck -- --pretty false",
@@ -854,6 +880,62 @@ mod tests {
             &ShellMode::Auto,
             &policy
         ));
+        assert!(!shell_needs_approval(
+            "cd System",
+            &ShellMode::Auto,
+            &policy
+        ));
+    }
+
+    #[test]
+    fn auto_shell_normalizes_allowlisted_prefixes() {
+        let policy = policy(&["npm   run   typecheck"]);
+
+        assert!(!shell_needs_approval(
+            "NPM RUN TYPECHECK -- --pretty false",
+            &ShellMode::Auto,
+            &policy
+        ));
+    }
+
+    #[test]
+    fn plan_shell_auto_runs_allowlisted_command() {
+        let conn = Connection::open_in_memory().unwrap();
+        let session = test_session(".".to_string(), ShellMode::Auto);
+        let call = ToolCallRequest {
+            name: "shell".to_string(),
+            input: json!({
+                "command": echo_command(),
+                "timeoutSeconds": 3
+            }),
+        };
+        let policy = policy(&[echo_command()]);
+        let event = test_event();
+
+        let result = execute_tool_inner(
+            &conn,
+            &session,
+            &ShellMode::Auto,
+            &policy,
+            &call,
+            &event,
+            ToolExecutionMode::Plan,
+        )
+        .unwrap();
+
+        match result {
+            ToolRun::Success(data) => {
+                assert_eq!(data["exitCode"], 0);
+                assert!(data["stdout"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("odot-plan-auto"));
+            }
+            ToolRun::Pending(_) => {
+                panic!("allowlisted auto shell command should not require approval")
+            }
+            ToolRun::Failure(data) => panic!("allowlisted auto shell command failed: {data:?}"),
+        }
     }
 
     #[test]
