@@ -160,8 +160,8 @@ fn normalized_kind(event_type: &str) -> &str {
         "assistant.message" | "assistant.message.delta" => "assistant.message",
         "tool.called" | "tool.input.delta" => "tool.call",
         "tool.success" | "tool.failed" | "tool.rejected" | "tool.pending" => "tool.result",
-        "background.job.started" => "task.created",
-        "agent.stopped" | "step.ended" => "task.completed",
+        "background.job.started" | "task.created" => "task.created",
+        "agent.stopped" | "step.ended" | "task.completed" => "task.completed",
         _ => event_type,
     }
 }

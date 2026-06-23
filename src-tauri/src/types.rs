@@ -210,12 +210,14 @@ pub struct CreateSessionInput {
     pub provider_id: String,
     pub shell_mode: ShellMode,
     pub title: Option<String>,
+    pub parent_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRecord {
     pub id: String,
+    pub parent_session_id: Option<String>,
     pub project_root: String,
     pub mode: AgentMode,
     pub provider_id: String,

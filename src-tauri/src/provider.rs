@@ -576,6 +576,21 @@ fn native_tool_definitions() -> Value {
         {
             "type": "function",
             "function": {
+                "name": "task",
+                "description": "Launch an isolated subagent session for a focused task. Use multiple task calls in the same turn for independent work that can run in parallel. The parent waits for results.",
+                "parameters": object_schema(
+                    json!({
+                        "description": { "type": "string", "description": "Short 3-7 word task label." },
+                        "prompt": { "type": "string", "description": "Detailed task for the subagent." },
+                        "subagent_type": { "type": "string", "description": "Agent type. Use general when no specialized type is needed." }
+                    }),
+                    &["description", "prompt"]
+                )
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "todo_write",
                 "description": "Update the agent todo list for visible progress.",
                 "parameters": object_schema(

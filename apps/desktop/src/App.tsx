@@ -234,7 +234,12 @@ export function App() {
         setIsStopping(false);
         setNotice({ tone: "success", text: "Agent 已停止" });
       }
-      if (payload.kind === "session.start" || payload.kind === "task.completed") {
+      if (
+        payload.kind === "session.start" ||
+        payload.kind === "task.created" ||
+        payload.kind === "task.completed" ||
+        payload.kind === "task.failed"
+      ) {
         void refreshSessions().catch(() => undefined);
       }
     }).then((dispose) => {
@@ -278,6 +283,19 @@ export function App() {
         providers.some((provider) => provider.id === session.providerId)
       ),
     [providers, sessions]
+  );
+  const orderedSessions = useMemo(
+    () => orderSessionsByParent(availableSessions),
+    [availableSessions]
+  );
+  const selectedChildSessions = useMemo(
+    () =>
+      selectedSessionId
+        ? availableSessions.filter(
+            (session) => session.parentSessionId === selectedSessionId
+          )
+        : [],
+    [availableSessions, selectedSessionId]
   );
 
   useEffect(() => {
@@ -1243,14 +1261,14 @@ export function App() {
             新建会话
           </button>
           <div className="stackList">
-            {availableSessions.map((session) => (
+            {orderedSessions.map((session) => (
               <div
                 key={session.id}
                 className={`listRow ${
                   session.id === selectedSessionId ? "active" : ""
-                }`}
+                } ${session.parentSessionId ? "childSession" : ""}`}
               >
-                <Clock3 size={15} />
+                {session.parentSessionId ? <Bot size={15} /> : <Clock3 size={15} />}
                 {editingSessionId === session.id ? (
                   <input
                     className="sessionTitleInput"
@@ -1278,7 +1296,8 @@ export function App() {
                   >
                     <strong>{session.title}</strong>
                     <small>
-                      {modeLabel(session.mode)} / {shellModeLabel(session.shellMode)}
+                      {session.parentSessionId ? "子 Agent" : modeLabel(session.mode)} /{" "}
+                      {shellModeLabel(session.shellMode)}
                     </small>
                   </button>
                 )}
@@ -1355,6 +1374,12 @@ export function App() {
               <small>
                 {selectedProvider ? selectedModelLabel : "未选择服务"} / 已选 {selectedPaths.size} 个文件
               </small>
+              {selectedChildSessions.length > 0 && (
+                <small className="subagentStatus">
+                  子 Agent {selectedChildSessions.length} 个 /{" "}
+                  {selectedChildSessions.filter((session) => session.status === "active").length} 活跃
+                </small>
+              )}
             </div>
             <button
               className="iconTextButton"
@@ -3807,6 +3832,9 @@ type ContextUsage = {
   notes: string[];
 };
 
+const CONTEXT_ESTIMATE_EVENT_LIMIT = 2_000;
+const CONTEXT_ESTIMATE_TOOL_RESULT_LIMIT = 40_000;
+
 function contextUsageFromEvents(eventsResponse: SessionEventsResponse): ContextUsage | null {
   const event = [...eventsResponse.events]
     .reverse()
@@ -3868,11 +3896,14 @@ function estimateContextUsage({
 }): ContextUsage {
   const limit = contextLimitFromConfig(configContent, selectedProviderId);
   const maxTokens = limit ?? 128_000;
-  const recentEventText = eventsResponse.events
-    .slice(-36)
+  const estimatedEvents = eventsResponse.events.slice(-CONTEXT_ESTIMATE_EVENT_LIMIT);
+  const recentEventText = estimatedEvents
     .map(
       (event) =>
-        `#${event.seq} ${event.type} ${truncateText(safeJson(event.data), 2_000)}`
+        `#${event.seq} ${event.type} ${truncateText(
+          safeJson(event.data),
+          event.type.startsWith("tool.") ? CONTEXT_ESTIMATE_TOOL_RESULT_LIMIT : 2_000
+        )}`
     )
     .join("\n");
   const summaryText = eventsResponse.summaries[0]?.text ?? "";
@@ -3907,7 +3938,7 @@ function estimateContextUsage({
     model: splitProviderRecordId(selectedProviderId).modelId,
     limitIsDefault,
     notes: [
-      `来源: 本地估算，最近事件 ${Math.min(eventsResponse.events.length, 36)} / ${eventsResponse.events.length}。`,
+      `来源: 本地估算，最近事件 ${estimatedEvents.length} / ${eventsResponse.events.length}。`,
       limitIsDefault ? "上下文上限来自默认 128,000 tokens。" : "",
       "说明: 按当前发送给模型的压缩上下文估算，非供应商实际 usage。"
     ].filter((note) => note.length > 0)
@@ -4079,6 +4110,37 @@ function providerChoices(
   } catch {
     return providers.map((item) => item.id.split("/")[0]);
   }
+}
+
+function orderSessionsByParent(sessions: SessionRecord[]) {
+  const children = new Map<string, SessionRecord[]>();
+  const roots: SessionRecord[] = [];
+  for (const session of sessions) {
+    if (session.parentSessionId) {
+      const list = children.get(session.parentSessionId) ?? [];
+      list.push(session);
+      children.set(session.parentSessionId, list);
+    } else {
+      roots.push(session);
+    }
+  }
+
+  const ordered: SessionRecord[] = [];
+  const push = (session: SessionRecord) => {
+    ordered.push(session);
+    for (const child of children.get(session.id) ?? []) {
+      push(child);
+    }
+  };
+  for (const root of roots) {
+    push(root);
+  }
+  for (const session of sessions) {
+    if (!ordered.some((item) => item.id === session.id)) {
+      ordered.push(session);
+    }
+  }
+  return ordered;
 }
 
 function modelChoices(content: string, providerId: string, fallback: string) {

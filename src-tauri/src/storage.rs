@@ -52,6 +52,7 @@ fn init_db(conn: &Connection) -> Result<(), String> {
 
         CREATE TABLE IF NOT EXISTS session (
           id TEXT PRIMARY KEY,
+          parent_session_id TEXT,
           project_root TEXT NOT NULL,
           mode TEXT NOT NULL,
           provider_id TEXT NOT NULL,
@@ -183,6 +184,12 @@ fn init_db(conn: &Connection) -> Result<(), String> {
         "total_output_tokens",
         "ALTER TABLE session ADD COLUMN total_output_tokens INTEGER NOT NULL DEFAULT 0",
     )?;
+    ensure_column(
+        conn,
+        "session",
+        "parent_session_id",
+        "ALTER TABLE session ADD COLUMN parent_session_id TEXT",
+    )?;
     Ok(())
 }
 
@@ -310,12 +317,13 @@ pub fn create_session(
     conn.execute(
         r#"
         INSERT INTO session
-          (id, project_root, mode, provider_id, title, status, shell_mode, created_at, updated_at)
+          (id, parent_session_id, project_root, mode, provider_id, title, status, shell_mode, created_at, updated_at)
         VALUES
-          (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?8)
+          (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, ?9)
         "#,
         params![
             &id,
+            &input.parent_session_id,
             root.to_string_lossy().to_string(),
             input.mode.as_str(),
             &input.provider_id,
@@ -330,10 +338,28 @@ pub fn create_session(
     get_session(conn, &id)
 }
 
+pub fn create_child_session(
+    conn: &Connection,
+    parent: &SessionRecord,
+    title: &str,
+) -> Result<SessionRecord, String> {
+    create_session(
+        conn,
+        CreateSessionInput {
+            project_root: parent.project_root.clone(),
+            mode: AgentMode::Agent,
+            provider_id: parent.provider_id.clone(),
+            shell_mode: parent.shell_mode.clone(),
+            title: Some(title.to_string()),
+            parent_session_id: Some(parent.id.clone()),
+        },
+    )
+}
+
 pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionRecord>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, project_root, mode, provider_id, title, status, shell_mode, total_cost, total_input_tokens, total_output_tokens, created_at, updated_at
+            "SELECT id, parent_session_id, project_root, mode, provider_id, title, status, shell_mode, total_cost, total_input_tokens, total_output_tokens, created_at, updated_at
              FROM session ORDER BY updated_at DESC",
         )
         .map_err(|error| error.to_string())?;
@@ -345,7 +371,7 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionRecord>, String> {
 
 pub fn get_session(conn: &Connection, id: &str) -> Result<SessionRecord, String> {
     conn.query_row(
-        "SELECT id, project_root, mode, provider_id, title, status, shell_mode, total_cost, total_input_tokens, total_output_tokens, created_at, updated_at
+        "SELECT id, parent_session_id, project_root, mode, provider_id, title, status, shell_mode, total_cost, total_input_tokens, total_output_tokens, created_at, updated_at
          FROM session WHERE id = ?1",
         params![id],
         session_from_row,
@@ -470,6 +496,9 @@ pub fn update_session_mode(
 }
 
 pub fn delete_session(conn: &Connection, id: &str) -> Result<(), String> {
+    for child_id in direct_child_session_ids(conn, id)? {
+        delete_session(conn, &child_id)?;
+    }
     let tx = conn
         .unchecked_transaction()
         .map_err(|error| error.to_string())?;
@@ -502,6 +531,16 @@ pub fn delete_session(conn: &Connection, id: &str) -> Result<(), String> {
     tx.execute("DELETE FROM session WHERE id = ?1", params![id])
         .map_err(|error| error.to_string())?;
     tx.commit().map_err(|error| error.to_string())
+}
+
+fn direct_child_session_ids(conn: &Connection, id: &str) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT id FROM session WHERE parent_session_id = ?1")
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map(params![id], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    collect_rows(rows)
 }
 
 pub fn append_event(
@@ -1177,21 +1216,22 @@ fn provider_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord
 }
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
-    let mode: String = row.get(2)?;
-    let shell_mode: String = row.get(6)?;
+    let mode: String = row.get(3)?;
+    let shell_mode: String = row.get(7)?;
     Ok(SessionRecord {
         id: row.get(0)?,
-        project_root: row.get(1)?,
+        parent_session_id: row.get(1)?,
+        project_root: row.get(2)?,
         mode: AgentMode::from_str(&mode).unwrap_or(AgentMode::Ask),
-        provider_id: row.get(3)?,
-        title: row.get(4)?,
-        status: row.get(5)?,
+        provider_id: row.get(4)?,
+        title: row.get(5)?,
+        status: row.get(6)?,
         shell_mode: ShellMode::from_str(&shell_mode).unwrap_or(ShellMode::Manual),
-        total_cost: row.get(7)?,
-        total_input_tokens: row.get(8)?,
-        total_output_tokens: row.get(9)?,
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
+        total_cost: row.get(8)?,
+        total_input_tokens: row.get(9)?,
+        total_output_tokens: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
     })
 }
 
@@ -1336,6 +1376,7 @@ mod tests {
         let conn = memory_db();
         let session = SessionRecord {
             id: "session-1".to_string(),
+            parent_session_id: None,
             project_root: "E:/oDot".to_string(),
             mode: AgentMode::Agent,
             provider_id: "provider/model".to_string(),
@@ -1353,6 +1394,12 @@ mod tests {
             "INSERT INTO session (id, project_root, mode, provider_id, title, status, shell_mode, created_at, updated_at)
              VALUES (?1, ?2, 'agent', ?3, ?4, 'active', 'auto', '1', '1')",
             params![&session.id, &session.project_root, &session.provider_id, &session.title],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, parent_session_id, project_root, mode, provider_id, title, status, shell_mode, created_at, updated_at)
+             VALUES ('child-1', ?1, ?2, 'agent', ?3, 'Child', 'active', 'auto', '1', '1')",
+            params![&session.id, &session.project_root, &session.provider_id],
         )
         .unwrap();
         append_event(
@@ -1383,6 +1430,7 @@ mod tests {
         delete_session(&conn, &session.id).unwrap();
 
         assert!(get_session(&conn, &session.id).is_err());
+        assert!(get_session(&conn, "child-1").is_err());
         assert!(list_events(&conn, &session.id).unwrap().is_empty());
         assert!(list_snapshots(&conn, &session.id).unwrap().is_empty());
         assert!(list_context_summaries(&conn, &session.id)
@@ -1526,6 +1574,36 @@ mod tests {
         assert!(matches!(updated.mode, AgentMode::Agent));
         let persisted = get_session(&conn, "s1").unwrap();
         assert!(matches!(persisted.shell_mode, ShellMode::Auto));
+    }
+
+    #[test]
+    fn child_session_records_parent_id() {
+        let conn = memory_db();
+        conn.execute(
+            "INSERT INTO provider (id, kind, name, model, credential_ref, created_at, updated_at)
+             VALUES ('p1', 'openai', 'Provider', 'model', 'provider:p1', '1', '1')",
+            [],
+        )
+        .unwrap();
+        let parent = create_session(
+            &conn,
+            CreateSessionInput {
+                project_root: ".".to_string(),
+                mode: AgentMode::Agent,
+                provider_id: "p1".to_string(),
+                shell_mode: ShellMode::Auto,
+                title: Some("Parent".to_string()),
+                parent_session_id: None,
+            },
+        )
+        .unwrap();
+        let child = create_child_session(&conn, &parent, "Child").unwrap();
+
+        assert_eq!(child.parent_session_id.as_deref(), Some(parent.id.as_str()));
+        let listed = list_sessions(&conn).unwrap();
+        assert!(listed
+            .iter()
+            .any(|session| session.parent_session_id.as_deref() == Some(parent.id.as_str())));
     }
 
     #[test]

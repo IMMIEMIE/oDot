@@ -859,6 +859,7 @@ mod tests {
     fn test_session(project_root: String, shell_mode: ShellMode) -> SessionRecord {
         SessionRecord {
             id: "s1".to_string(),
+            parent_session_id: None,
             project_root,
             mode: AgentMode::Plan,
             provider_id: "p1".to_string(),

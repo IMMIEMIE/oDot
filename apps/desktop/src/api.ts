@@ -57,10 +57,12 @@ export type CreateSessionInput = {
   providerId: string;
   shellMode: ShellMode;
   title?: string;
+  parentSessionId?: string | null;
 };
 
 export type SessionRecord = {
   id: string;
+  parentSessionId?: string | null;
   projectRoot: string;
   mode: AgentMode;
   providerId: string;

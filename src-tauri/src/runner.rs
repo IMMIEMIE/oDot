@@ -5,7 +5,7 @@ use crate::{
     types::{
         AgentMode, ContextSummaryRecord, EventRecord, ModelTurn, PromptAttachment,
         PromptAttachmentKind, PromptSessionInput, ProviderPricing, ProviderRequestConfig,
-        SessionEventsResponse, SessionInputDelivery, SubmitPromptInput, ToolMode,
+        SessionEventsResponse, SessionInputDelivery, SubmitPromptInput, ToolCallRequest, ToolMode,
     },
     util,
 };
@@ -20,10 +20,13 @@ use std::{
 use tauri::AppHandle;
 
 const MAX_STEPS: usize = 25;
-const RECENT_EVENT_LIMIT: usize = 80;
+const MAX_CONTEXT_EVENT_LIMIT: usize = 2_000;
 const RECENT_EVENT_CHAR_BUDGET: usize = 48_000;
 const RECENT_EVENT_MIN_KEEP: usize = 12;
 const AUTO_COMPACT_EVENT_THRESHOLD: usize = 80;
+const DEFAULT_CONTEXT_TOKEN_LIMIT: u64 = 128_000;
+const DEFAULT_OUTPUT_TOKEN_LIMIT: u64 = 4_096;
+const TOOL_RESULT_REPLAY_CHAR_LIMIT: usize = 40_000;
 const STREAM_DELTA_FLUSH_CHARS: usize = 96;
 const STREAM_DELTA_FLUSH_MS: u64 = 120;
 const COMPACTION_PROMPT: &str = r#"请对以下对话历史生成结构化摘要，包含以下部分：
@@ -238,8 +241,13 @@ async fn run_session_steps(
                 &request_config.model,
                 provider_id_str,
             )?;
-            let messages =
-                build_stream_messages(conn, &session.id, &stream_system_prompt, current_prompt)?;
+            let messages = build_stream_messages(
+                conn,
+                &session.id,
+                &stream_system_prompt,
+                current_prompt,
+                &request_config,
+            )?;
             let mut sink = StreamEventSink::new(
                 conn,
                 &session.id,
@@ -273,7 +281,8 @@ async fn run_session_steps(
             sink.flush_all()?;
             turn
         } else {
-            let user_prompt = build_user_prompt(conn, &session.id, current_prompt)?;
+            let user_prompt =
+                build_user_prompt(conn, &session.id, current_prompt, &request_config)?;
             let completion =
                 match provider::complete(&request_config, &system_prompt, &user_prompt).await {
                     Ok(value) => value,
@@ -373,13 +382,9 @@ async fn run_session_steps(
                         stopped = true;
                         break;
                     }
-                    let outcome = tools::execute_tool_with_mode(
-                        conn,
-                        &session,
-                        &session.shell_mode,
-                        call,
-                        tools::ToolExecutionMode::Ask,
-                    )?;
+                    let outcome =
+                        execute_turn_tool(app, conn, session, call, tools::ToolExecutionMode::Ask)
+                            .await?;
                     has_pending |= outcome.pending;
                 }
                 if stopped {
@@ -421,13 +426,9 @@ async fn run_session_steps(
                         stopped = true;
                         break;
                     }
-                    let outcome = tools::execute_tool_with_mode(
-                        conn,
-                        &session,
-                        &session.shell_mode,
-                        call,
-                        tools::ToolExecutionMode::Plan,
-                    )?;
+                    let outcome =
+                        execute_turn_tool(app, conn, session, call, tools::ToolExecutionMode::Plan)
+                            .await?;
                     has_pending |= outcome.pending;
                 }
                 if stopped {
@@ -463,19 +464,11 @@ async fn run_session_steps(
                     break;
                 }
 
-                let mut has_pending = false;
-                let mut stopped = false;
-                for call in &turn.tool_calls {
-                    if stop_if_cancelled(conn, &session.id, step_index)? {
-                        stopped = true;
-                        break;
-                    }
-                    let outcome = tools::execute_tool(conn, &session, &session.shell_mode, call)?;
-                    has_pending |= outcome.pending;
-                }
-                if stopped {
+                if stop_if_cancelled(conn, &session.id, step_index)? {
                     break;
                 }
+                let has_pending =
+                    execute_agent_turn_tools(app, conn, session, &turn.tool_calls).await?;
 
                 storage::append_event(
                     conn,
@@ -496,6 +489,272 @@ async fn run_session_steps(
     }
 
     Ok(storage::session_events_response(conn, &session.id)?)
+}
+
+async fn execute_turn_tool(
+    app: &AppHandle,
+    conn: &Connection,
+    session: &crate::types::SessionRecord,
+    call: &ToolCallRequest,
+    mode: tools::ToolExecutionMode,
+) -> Result<tools::ToolOutcome, String> {
+    if normalize_tool_name(&call.name) == "task" {
+        if mode != tools::ToolExecutionMode::Agent {
+            return execute_task_blocked(conn, session, call);
+        }
+        execute_task_tool(app, conn, session, call).await
+    } else {
+        tools::execute_tool_with_mode(conn, session, &session.shell_mode, call, mode)
+    }
+}
+
+fn execute_task_blocked(
+    conn: &Connection,
+    session: &crate::types::SessionRecord,
+    call: &ToolCallRequest,
+) -> Result<tools::ToolOutcome, String> {
+    let called = storage::append_event(
+        conn,
+        &session.id,
+        "tool.called",
+        json!({
+            "toolCallId": call.tool_call_id,
+            "name": call.name,
+            "input": call.input
+        }),
+    )?;
+    storage::append_event(
+        conn,
+        &session.id,
+        "tool.failed",
+        json!({
+            "toolCallEventId": called.id,
+            "name": call.name,
+            "result": {
+                "blocked": true,
+                "reason": "当前模式禁止执行 task，请切换到 Agent 模式。"
+            }
+        }),
+    )?;
+    Ok(tools::ToolOutcome { pending: false })
+}
+
+struct TaskRun {
+    called_event_id: String,
+    call_name: String,
+    child_id: String,
+    description: String,
+    subagent_type: String,
+    handle: tauri::async_runtime::JoinHandle<Result<SessionEventsResponse, String>>,
+}
+
+async fn execute_agent_turn_tools(
+    app: &AppHandle,
+    conn: &Connection,
+    session: &crate::types::SessionRecord,
+    calls: &[ToolCallRequest],
+) -> Result<bool, String> {
+    let mut has_pending = false;
+    let mut task_runs = Vec::new();
+    for call in calls {
+        if normalize_tool_name(&call.name) == "task" {
+            task_runs.push(start_task_tool(app, conn, session, call)?);
+        } else {
+            let outcome = tools::execute_tool(conn, session, &session.shell_mode, call)?;
+            has_pending |= outcome.pending;
+        }
+    }
+    for task in task_runs {
+        let outcome = finish_task_tool(conn, &session.id, task).await?;
+        has_pending |= outcome.pending;
+    }
+    Ok(has_pending)
+}
+
+async fn execute_task_tool(
+    app: &AppHandle,
+    conn: &Connection,
+    session: &crate::types::SessionRecord,
+    call: &ToolCallRequest,
+) -> Result<tools::ToolOutcome, String> {
+    let task = start_task_tool(app, conn, session, call)?;
+    finish_task_tool(conn, &session.id, task).await
+}
+
+fn start_task_tool(
+    app: &AppHandle,
+    conn: &Connection,
+    session: &crate::types::SessionRecord,
+    call: &ToolCallRequest,
+) -> Result<TaskRun, String> {
+    let description =
+        task_string(&call.input, &["description"]).unwrap_or_else(|_| "Subagent task".to_string());
+    let prompt = task_string(&call.input, &["prompt", "task"])?;
+    let subagent_type = task_string(&call.input, &["subagent_type", "subagentType"])
+        .unwrap_or_else(|_| "general".to_string());
+    let child_title = format!("{description} (@{subagent_type} subagent)");
+    let child = storage::create_child_session(conn, session, &child_title)?;
+    let called = storage::append_event(
+        conn,
+        &session.id,
+        "tool.called",
+        json!({
+            "toolCallId": call.tool_call_id,
+            "name": call.name,
+            "input": call.input,
+            "metadata": {
+                "parentSessionId": session.id,
+                "sessionId": child.id,
+                "subagentType": subagent_type
+            }
+        }),
+    )?;
+    storage::append_event(
+        conn,
+        &session.id,
+        "task.created",
+        json!({
+            "toolCallEventId": called.id,
+            "sessionId": child.id,
+            "description": description,
+            "subagentType": subagent_type
+        }),
+    )?;
+
+    let app_handle = app.clone();
+    let child_id = child.id.clone();
+    let child_id_for_task = child_id.clone();
+    let prompt_for_task = prompt.clone();
+    let handle = tauri::async_runtime::spawn_blocking(move || {
+        let child_conn = storage::open_db(&app_handle)?;
+        tauri::async_runtime::block_on(prompt_session(
+            &app_handle,
+            &child_conn,
+            PromptSessionInput {
+                id: None,
+                session_id: child_id_for_task,
+                prompt: prompt_for_task,
+                attachments: Vec::new(),
+                delivery: Some(SessionInputDelivery::Queue),
+                resume: true,
+            },
+        ))
+    });
+
+    Ok(TaskRun {
+        called_event_id: called.id,
+        call_name: call.name.clone(),
+        child_id,
+        description,
+        subagent_type,
+        handle,
+    })
+}
+
+async fn finish_task_tool(
+    conn: &Connection,
+    parent_session_id: &str,
+    task: TaskRun,
+) -> Result<tools::ToolOutcome, String> {
+    let result = task.handle.await.map_err(|error| error.to_string())?;
+
+    match result {
+        Ok(response) => {
+            let output = task_output_text(&response);
+            storage::set_session_status(conn, &task.child_id, "completed")?;
+            storage::append_event(
+                conn,
+                parent_session_id,
+                "tool.success",
+                json!({
+                    "toolCallEventId": task.called_event_id,
+                    "name": task.call_name,
+                    "result": {
+                        "taskId": task.child_id,
+                        "sessionId": task.child_id,
+                        "description": task.description,
+                        "subagentType": task.subagent_type,
+                        "status": "completed",
+                        "output": output
+                    }
+                }),
+            )?;
+            storage::append_event(
+                conn,
+                parent_session_id,
+                "task.completed",
+                json!({
+                    "toolCallEventId": task.called_event_id,
+                    "sessionId": task.child_id,
+                    "description": task.description
+                }),
+            )?;
+        }
+        Err(error) => {
+            storage::set_session_status(conn, &task.child_id, "failed")?;
+            storage::append_event(
+                conn,
+                parent_session_id,
+                "tool.failed",
+                json!({
+                    "toolCallEventId": task.called_event_id,
+                    "name": task.call_name,
+                    "result": {
+                        "taskId": task.child_id,
+                        "sessionId": task.child_id,
+                        "description": task.description,
+                        "subagentType": task.subagent_type,
+                        "status": "failed",
+                        "error": error
+                    }
+                }),
+            )?;
+            storage::append_event(
+                conn,
+                parent_session_id,
+                "task.failed",
+                json!({
+                    "toolCallEventId": task.called_event_id,
+                    "sessionId": task.child_id,
+                    "description": task.description,
+                    "error": error
+                }),
+            )?;
+        }
+    }
+
+    Ok(tools::ToolOutcome { pending: false })
+}
+
+fn task_string(input: &Value, keys: &[&str]) -> Result<String, String> {
+    for key in keys {
+        if let Some(value) = input.get(*key).and_then(Value::as_str) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Ok(value.to_string());
+            }
+        }
+    }
+    Err(format!("task 缺少必填字段: {}", keys[0]))
+}
+
+fn task_output_text(response: &SessionEventsResponse) -> String {
+    response
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.event_type == "assistant.message")
+        .and_then(|event| event.data.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or("子任务已完成，但没有返回文本结果。")
+        .to_string()
+}
+
+fn normalize_tool_name(name: &str) -> String {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "todowrite" => "todo_write".to_string(),
+        other => other.to_string(),
+    }
 }
 
 fn stop_if_cancelled(
@@ -749,6 +1008,7 @@ Tool guidance:
 - shell: run verification commands. Foreground commands time out by default; use background=true for long-running dev servers such as npm run dev.
 - question: ask the user when blocked on an important choice.
 - todo_write: publish a short task checklist.
+- task: launch an isolated subagent session for focused work. Use multiple task calls in one turn for independent parallel subtasks; the parent waits for results.
 Use read for file contents and search for project text. Do not read project files with shell commands such as Get-Content, more, cat, grep, or sed when read/search can do it.
 
 Shell environment:
@@ -773,7 +1033,7 @@ JSON schema:
   "message": "user-facing response or progress note",
   "toolCalls": [
     {{
-      "name": "read|search|grep|edit|write|delete|shell|question|todo_write",
+      "name": "read|search|grep|edit|write|delete|shell|question|todo_write|task",
       "input": {{}}
     }}
   ],
@@ -789,6 +1049,7 @@ Tool inputs:
 - shell: {{"command":"test/lint/build command","workdir":"optional/path","timeoutSeconds":60,"background":false,"description":"short purpose"}}. Use background=true for long-running dev servers such as npm run dev.
 - question: {{"question":"short question"}}
 - todo_write: {{"todos":[{{"text":"task","status":"pending|in_progress|done"}}]}}
+- task: {{"description":"short label","prompt":"detailed subtask","subagent_type":"general"}}
 Use read for file contents and search for project text. Do not read project files with shell commands such as Get-Content, more, cat, grep, or sed when read/search can do it.
 
 Shell environment:
@@ -834,12 +1095,11 @@ fn build_stream_system_prompt(
     ))
 }
 
-fn build_stream_messages(
+fn load_context_events(
     conn: &Connection,
     session_id: &str,
-    system_prompt: &str,
-    current_prompt: &str,
-) -> Result<Vec<Value>, String> {
+    provider: &ProviderRequestConfig,
+) -> Result<Vec<EventRecord>, String> {
     let summaries = storage::list_context_summaries(conn, session_id)?;
     let events = if let Some(summary) = summaries
         .first()
@@ -851,13 +1111,95 @@ fn build_stream_messages(
             summary.recent_event_seq.saturating_sub(1),
         )?;
         if events.is_empty() {
-            storage::list_recent_events(conn, session_id, RECENT_EVENT_LIMIT)?
+            storage::list_recent_events(conn, session_id, MAX_CONTEXT_EVENT_LIMIT)?
         } else {
             events
         }
     } else {
-        storage::list_recent_events(conn, session_id, RECENT_EVENT_LIMIT)?
+        storage::list_events(conn, session_id)?
     };
+    Ok(select_events_for_context(
+        &events,
+        provider_context_input_budget(provider),
+    ))
+}
+
+fn provider_context_input_budget(provider: &ProviderRequestConfig) -> usize {
+    let context_limit = provider
+        .input_token_limit
+        .or(provider.context_token_limit)
+        .unwrap_or(DEFAULT_CONTEXT_TOKEN_LIMIT);
+    let reserved_output = provider
+        .output_token_limit
+        .unwrap_or(DEFAULT_OUTPUT_TOKEN_LIMIT);
+    let available = context_limit.saturating_sub(reserved_output);
+    let budget = if available > 0 {
+        available
+    } else {
+        context_limit.saturating_mul(3) / 4
+    };
+    budget.saturating_mul(9).saturating_div(10) as usize
+}
+
+fn select_events_for_context(events: &[EventRecord], token_budget: usize) -> Vec<EventRecord> {
+    if events.len() <= RECENT_EVENT_MIN_KEEP {
+        return events.to_vec();
+    }
+
+    let mut selected = Vec::new();
+    let mut used = 0usize;
+    for (index, event) in events.iter().enumerate().rev() {
+        let estimated = estimate_context_tokens(&event_context_text(event));
+        let kept_from_tail = events.len().saturating_sub(index);
+        if selected.len() >= MAX_CONTEXT_EVENT_LIMIT {
+            break;
+        }
+        if used + estimated > token_budget && kept_from_tail > RECENT_EVENT_MIN_KEEP {
+            break;
+        }
+        used += estimated;
+        selected.push(event.clone());
+    }
+    selected.reverse();
+    selected
+}
+
+fn event_context_text(event: &EventRecord) -> String {
+    match event.event_type.as_str() {
+        "prompt.submitted" => event
+            .data
+            .get("prompt")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        "assistant.message" => event
+            .data
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| sanitize_assistant_content(text).text)
+            .unwrap_or_default(),
+        "tool.called" => json_text(event.data.get("input").unwrap_or(&Value::Null)),
+        "tool.success" | "tool.failed" | "tool.rejected" => tool_result_content(event),
+        _ => compact_json(&event.data),
+    }
+}
+
+fn estimate_context_tokens(text: &str) -> usize {
+    let mut tokens: f64 = 0.0;
+    for ch in text.chars() {
+        tokens += if ch.is_ascii() { 0.25 } else { 1.0 };
+    }
+    tokens.ceil().max(1.0) as usize
+}
+
+fn build_stream_messages(
+    conn: &Connection,
+    session_id: &str,
+    system_prompt: &str,
+    current_prompt: &str,
+    provider: &ProviderRequestConfig,
+) -> Result<Vec<Value>, String> {
+    let events = load_context_events(conn, session_id, provider)?;
     let tool_call_ids = provider_tool_call_ids(&events);
     let mut messages = vec![json!({
         "role": "system",
@@ -1050,12 +1392,15 @@ fn tool_result_content(event: &EventRecord) -> String {
                 .get("error")
                 .and_then(Value::as_str)
                 .map(ToString::to_string)
-                .unwrap_or_else(|| compact_json(event.data.get("result").unwrap_or(&Value::Null)));
-            truncate(&format!("Tool failed: {error}"), 12_000)
+                .unwrap_or_else(|| json_text(event.data.get("result").unwrap_or(&Value::Null)));
+            truncate(
+                &format!("Tool failed: {error}"),
+                TOOL_RESULT_REPLAY_CHAR_LIMIT,
+            )
         }
         _ => truncate(
-            &compact_json(event.data.get("result").unwrap_or(&Value::Null)),
-            12_000,
+            &json_text(event.data.get("result").unwrap_or(&Value::Null)),
+            TOOL_RESULT_REPLAY_CHAR_LIMIT,
         ),
     }
 }
@@ -1474,8 +1819,9 @@ fn build_user_prompt(
     conn: &Connection,
     session_id: &str,
     current_prompt: &str,
+    provider: &ProviderRequestConfig,
 ) -> Result<String, String> {
-    let events = storage::list_recent_events(conn, session_id, RECENT_EVENT_LIMIT)?;
+    let events = load_context_events(conn, session_id, provider)?;
     let summaries = storage::list_context_summaries(conn, session_id)?;
     let summary = summaries
         .first()
@@ -1970,8 +2316,12 @@ fn summarize_events(events: &[crate::types::EventRecord]) -> String {
 }
 
 fn compact_json(value: &Value) -> String {
-    let text = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
+    let text = json_text(value);
     truncate(&text, 2_000)
+}
+
+fn json_text(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
 }
 
 fn truncate(value: &str, max_chars: usize) -> String {
@@ -1994,10 +2344,11 @@ mod tests {
         let json = build_system_prompt("agent", false, "test-model", "test-provider");
 
         assert!(native.contains("- shell: run verification commands."));
+        assert!(native.contains("- task: launch an isolated subagent session"));
         assert!(!native.contains("bash/shell"));
         assert!(native.contains("Use read for file contents and search for project text."));
         assert!(json.contains(
-            "\"name\": \"read|search|grep|edit|write|delete|shell|question|todo_write\""
+            "\"name\": \"read|search|grep|edit|write|delete|shell|question|todo_write|task\""
         ));
         assert!(!json.contains("shell|bash"));
         assert!(json.contains("Do not read project files with shell commands"));
@@ -2022,6 +2373,50 @@ mod tests {
         assert!(timeline.lines().any(|line| line.starts_with("#69 ")));
         assert!(!timeline.lines().any(|line| line.starts_with("#1 ")));
         assert!(timeline.chars().count() <= RECENT_EVENT_CHAR_BUDGET);
+    }
+
+    #[test]
+    fn context_selection_uses_token_budget_not_fixed_event_count() {
+        let events = (1..=120)
+            .map(|seq| EventRecord {
+                id: format!("e{seq}"),
+                session_id: "s1".to_string(),
+                seq,
+                event_type: "prompt.submitted".to_string(),
+                data: json!({ "prompt": format!("remember item {seq}") }),
+                created_at: "now".to_string(),
+            })
+            .collect::<Vec<_>>();
+
+        let selected = select_events_for_context(&events, 10_000);
+
+        assert_eq!(selected.len(), 120);
+        assert_eq!(selected.first().map(|event| event.seq), Some(1));
+        assert_eq!(selected.last().map(|event| event.seq), Some(120));
+    }
+
+    #[test]
+    fn tool_result_content_replays_more_than_compact_json_preview() {
+        let content = "a".repeat(6_000);
+        let event = EventRecord {
+            id: "result".to_string(),
+            session_id: "s1".to_string(),
+            seq: 1,
+            event_type: "tool.success".to_string(),
+            data: json!({
+                "name": "read",
+                "result": {
+                    "path": "src/main.rs",
+                    "content": content
+                }
+            }),
+            created_at: "now".to_string(),
+        };
+
+        let replay = tool_result_content(&event);
+
+        assert!(replay.contains(&"a".repeat(5_000)));
+        assert!(!replay.contains("已截断"));
     }
 
     #[test]
