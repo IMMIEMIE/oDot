@@ -1,5 +1,12 @@
 import { create } from "zustand";
-import type { EventRecord, SessionEventsResponse } from "./api";
+import type {
+  BackgroundJobRecord,
+  ContextSummaryRecord,
+  EventRecord,
+  PermissionRequestRecord,
+  SnapshotRecord,
+  SessionEventsResponse
+} from "./api";
 
 export const EMPTY_SESSION_EVENTS: SessionEventsResponse = {
   events: [],
@@ -16,7 +23,11 @@ export type ODotRealtimeEvent = {
   kind: string;
   sessionId: string;
   seq: number;
-  event: EventRecord;
+  event?: EventRecord;
+  permission?: PermissionRequestRecord;
+  job?: BackgroundJobRecord;
+  snapshot?: SnapshotRecord;
+  summary?: ContextSummaryRecord;
 };
 
 type SessionEventState = {
@@ -45,7 +56,7 @@ export const useSessionEventStore = create<SessionEventState>((set) => ({
     })),
   applyRealtimeEvent: (incoming) =>
     set((state) => ({
-      eventsResponse: mergeEventRecord(state.eventsResponse, incoming.event)
+      eventsResponse: mergeRealtimeEvent(state.eventsResponse, incoming)
     }))
 }));
 
@@ -76,8 +87,59 @@ function mergeEventRecord(
   current: SessionEventsResponse,
   incoming: EventRecord
 ): SessionEventsResponse {
-  return mergeSessionEvents(current, {
-    ...EMPTY_SESSION_EVENTS,
-    events: [incoming]
-  });
+  const byId = new Map(current.events.map((event) => [event.id, event]));
+  byId.set(incoming.id, incoming);
+  return {
+    ...current,
+    events: Array.from(byId.values()).sort((a, b) => a.seq - b.seq)
+  };
+}
+
+function mergeRealtimeEvent(
+  current: SessionEventsResponse,
+  incoming: ODotRealtimeEvent
+): SessionEventsResponse {
+  let next = current;
+  if (incoming.event) {
+    next = mergeEventRecord(next, incoming.event);
+  }
+  if (incoming.permission) {
+    next = {
+      ...next,
+      permissions: mergeById(next.permissions, incoming.permission).sort((a, b) =>
+        a.createdAt.localeCompare(b.createdAt)
+      )
+    };
+  }
+  if (incoming.job) {
+    next = {
+      ...next,
+      jobs: mergeById(next.jobs, incoming.job).sort((a, b) =>
+        b.startedAt.localeCompare(a.startedAt)
+      )
+    };
+  }
+  if (incoming.snapshot) {
+    next = {
+      ...next,
+      snapshots: mergeById(next.snapshots, incoming.snapshot).sort((a, b) =>
+        b.createdAt.localeCompare(a.createdAt)
+      )
+    };
+  }
+  if (incoming.summary) {
+    next = {
+      ...next,
+      summaries: mergeById(next.summaries, incoming.summary).sort((a, b) =>
+        b.createdAt.localeCompare(a.createdAt)
+      )
+    };
+  }
+  return next;
+}
+
+function mergeById<T extends { id: string }>(items: T[], incoming: T): T[] {
+  const byId = new Map(items.map((item) => [item.id, item]));
+  byId.set(incoming.id, incoming);
+  return Array.from(byId.values());
 }

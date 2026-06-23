@@ -1,4 +1,6 @@
-use crate::types::EventRecord;
+use crate::types::{
+    BackgroundJobRecord, ContextSummaryRecord, EventRecord, PermissionRequestRecord, SnapshotRecord,
+};
 use serde::Serialize;
 use std::sync::OnceLock;
 use tokio::sync::broadcast;
@@ -14,7 +16,16 @@ pub struct RealtimeEvent {
     pub kind: String,
     pub session_id: String,
     pub seq: i64,
-    pub event: EventRecord,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<EventRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission: Option<PermissionRequestRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job: Option<BackgroundJobRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SnapshotRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<ContextSummaryRecord>,
 }
 
 pub fn init() {
@@ -31,6 +42,30 @@ pub fn publish_event(event: &EventRecord) {
     }
 }
 
+pub fn publish_permission(permission: &PermissionRequestRecord) {
+    if let Some(sender) = EVENT_BUS.get() {
+        let _ = sender.send(realtime_permission(permission));
+    }
+}
+
+pub fn publish_job(job: &BackgroundJobRecord) {
+    if let Some(sender) = EVENT_BUS.get() {
+        let _ = sender.send(realtime_job(job));
+    }
+}
+
+pub fn publish_snapshot(snapshot: &SnapshotRecord) {
+    if let Some(sender) = EVENT_BUS.get() {
+        let _ = sender.send(realtime_snapshot(snapshot));
+    }
+}
+
+pub fn publish_summary(summary: &ContextSummaryRecord) {
+    if let Some(sender) = EVENT_BUS.get() {
+        let _ = sender.send(realtime_summary(summary));
+    }
+}
+
 fn sender() -> &'static broadcast::Sender<RealtimeEvent> {
     EVENT_BUS.get_or_init(|| {
         let (sender, _) = broadcast::channel(BUS_CAPACITY);
@@ -44,7 +79,77 @@ fn realtime_event(event: &EventRecord) -> RealtimeEvent {
         kind: normalized_kind(&event.event_type).to_string(),
         session_id: event.session_id.clone(),
         seq: event.seq,
-        event: event.clone(),
+        event: Some(event.clone()),
+        permission: None,
+        job: None,
+        snapshot: None,
+        summary: None,
+    }
+}
+
+fn realtime_permission(permission: &PermissionRequestRecord) -> RealtimeEvent {
+    RealtimeEvent {
+        version: 1,
+        kind: if permission.status == "pending" {
+            "permission.requested"
+        } else {
+            "permission.answered"
+        }
+        .to_string(),
+        session_id: permission.session_id.clone(),
+        seq: 0,
+        event: None,
+        permission: Some(permission.clone()),
+        job: None,
+        snapshot: None,
+        summary: None,
+    }
+}
+
+fn realtime_job(job: &BackgroundJobRecord) -> RealtimeEvent {
+    RealtimeEvent {
+        version: 1,
+        kind: if job.status == "running" {
+            "background.job.started"
+        } else {
+            "background.job.updated"
+        }
+        .to_string(),
+        session_id: job.session_id.clone(),
+        seq: 0,
+        event: None,
+        permission: None,
+        job: Some(job.clone()),
+        snapshot: None,
+        summary: None,
+    }
+}
+
+fn realtime_snapshot(snapshot: &SnapshotRecord) -> RealtimeEvent {
+    RealtimeEvent {
+        version: 1,
+        kind: "snapshot.created".to_string(),
+        session_id: snapshot.session_id.clone(),
+        seq: 0,
+        event: None,
+        permission: None,
+        job: None,
+        snapshot: Some(snapshot.clone()),
+        summary: None,
+    }
+}
+
+fn realtime_summary(summary: &ContextSummaryRecord) -> RealtimeEvent {
+    RealtimeEvent {
+        version: 1,
+        kind: "context.summary.created".to_string(),
+        session_id: summary.session_id.clone(),
+        seq: summary.recent_event_seq,
+        event: None,
+        permission: None,
+        job: None,
+        snapshot: None,
+        summary: Some(summary.clone()),
     }
 }
 

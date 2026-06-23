@@ -626,7 +626,9 @@ pub fn insert_snapshot(
     )
     .map_err(|error| error.to_string())?;
 
-    get_snapshot(conn, &snapshot.id)
+    let snapshot = get_snapshot(conn, &snapshot.id)?;
+    event_bus::publish_snapshot(&snapshot);
+    Ok(snapshot)
 }
 
 pub fn get_snapshot(conn: &Connection, id: &str) -> Result<SnapshotRecord, String> {
@@ -667,13 +669,15 @@ pub fn insert_context_summary(
     )
     .map_err(|error| error.to_string())?;
 
-    Ok(ContextSummaryRecord {
+    let summary = ContextSummaryRecord {
         id,
         session_id: session_id.to_string(),
         text,
         recent_event_seq,
         created_at,
-    })
+    };
+    event_bus::publish_summary(&summary);
+    Ok(summary)
 }
 
 pub fn list_context_summaries(
@@ -917,7 +921,9 @@ pub fn create_permission_request(
         params![&id, session_id, action, &resources_json, &save_json, &source_json_text, &now, &now],
     )
     .map_err(|error| error.to_string())?;
-    get_permission_request(conn, &id)
+    let permission = get_permission_request(conn, &id)?;
+    event_bus::publish_permission(&permission);
+    Ok(permission)
 }
 
 pub fn get_permission_request(
@@ -951,7 +957,9 @@ pub fn reply_permission_request(
             save_permission(conn, project_root, &request.action, resource)?;
         }
     }
-    get_permission_request(conn, request_id)
+    let permission = get_permission_request(conn, request_id)?;
+    event_bus::publish_permission(&permission);
+    Ok(permission)
 }
 
 pub fn list_permission_requests(
@@ -1024,7 +1032,9 @@ pub fn insert_background_job(
         params![&id, session_id, command, cwd, pid as i64, &log_path, &now],
     )
     .map_err(|error| error.to_string())?;
-    get_background_job(conn, &id)
+    let job = get_background_job(conn, &id)?;
+    event_bus::publish_job(&job);
+    Ok(job)
 }
 
 pub fn get_background_job(conn: &Connection, id: &str) -> Result<BackgroundJobRecord, String> {
@@ -1064,7 +1074,9 @@ pub fn update_background_job_status(
         params![status, &now, id],
     )
     .map_err(|error| error.to_string())?;
-    get_background_job(conn, id)
+    let job = get_background_job(conn, id)?;
+    event_bus::publish_job(&job);
+    Ok(job)
 }
 
 pub fn session_events_response(

@@ -224,9 +224,11 @@ export function App() {
         return;
       }
       applyRealtimeEvent(payload);
-      scheduleRealtimeTailRefresh(payload.sessionId);
+      if (payload.event) {
+        scheduleRealtimeTailRefresh(payload.sessionId);
+      }
       if (
-        payload.event.type === "agent.stopped" &&
+        payload.event?.type === "agent.stopped" &&
         payload.event.seq > stopBaselineSeqRef.current
       ) {
         setIsStopping(false);
@@ -549,6 +551,16 @@ export function App() {
     return response;
   }
 
+  function applyEventRecord(event: EventRecord) {
+    applyRealtimeEvent({
+      version: 1,
+      kind: event.type,
+      sessionId: event.sessionId,
+      seq: event.seq,
+      event
+    });
+  }
+
   function scheduleRealtimeTailRefresh(sessionId: string) {
     if (realtimeTailTimerRef.current) {
       window.clearTimeout(realtimeTailTimerRef.current);
@@ -642,7 +654,7 @@ export function App() {
       await refreshSessions();
       setSelectedSessionId(session.id);
       setNotice({ tone: "success", text: "会话已创建" });
-      await loadEvents(session.id);
+      setEventsResponse(EMPTY_EVENTS);
       return session;
     } catch (error) {
       reportError(error);
@@ -809,13 +821,12 @@ export function App() {
       return;
     }
     try {
-      await cancelSession(sessionId);
-      const response = await loadEventTail(sessionId);
-      const stopped = response.events.some(
-        (event) =>
-          event.type === "agent.stopped" && event.seq > stopBaselineSeqRef.current
-      );
-      if (stopped) {
+      const event = await cancelSession(sessionId);
+      applyEventRecord(event);
+      if (
+        event.type === "agent.stopped" &&
+        event.seq > stopBaselineSeqRef.current
+      ) {
         setIsStopping(false);
         setNotice({ tone: "success", text: "Agent 已停止" });
       }
@@ -833,7 +844,7 @@ export function App() {
     setNotice({ tone: "info", text: "Agent 正在继续" });
     try {
       const sessionId = selectedSessionId;
-      await approveToolCall(eventId);
+      const approvedEvent = await approveToolCall(eventId);
       if (sessionId) {
         const response = await continueSession(sessionId);
         if (activeRunIdRef.current !== runId) {
@@ -847,7 +858,7 @@ export function App() {
             : "Agent 已结束"
         });
       } else {
-        await loadEvents();
+        applyEventRecord(approvedEvent);
         setNotice({ tone: "success", text: "命令已批准" });
       }
     } catch (error) {
@@ -889,8 +900,8 @@ export function App() {
   async function handleReject(eventId: string) {
     setIsMutating(true);
     try {
-      await rejectToolCall(eventId);
-      await loadEvents();
+      const event = await rejectToolCall(eventId);
+      applyEventRecord(event);
       setNotice({ tone: "success", text: "命令已拒绝" });
     } catch (error) {
       reportError(error);
@@ -902,8 +913,14 @@ export function App() {
   async function handlePermissionReply(requestId: string, reply: PermissionReply) {
     setIsMutating(true);
     try {
-      await replyPermission({ requestId, reply });
-      await loadEvents();
+      const permission = await replyPermission({ requestId, reply });
+      applyRealtimeEvent({
+        version: 1,
+        kind: "permission.answered",
+        sessionId: permission.sessionId,
+        seq: 0,
+        permission
+      });
       setNotice({ tone: reply === "reject" ? "error" : "success", text: "权限已处理" });
     } catch (error) {
       reportError(error);
@@ -961,7 +978,9 @@ export function App() {
       for (const snapshotId of snapshotIds) {
         await rollbackSnapshot(snapshotId);
       }
-      await loadEvents();
+      if (selectedSessionId) {
+        scheduleRealtimeTailRefresh(selectedSessionId);
+      }
       await loadFiles(projectRoot);
       setNotice({ tone: "success", text: successText });
     } catch (error) {
@@ -978,8 +997,15 @@ export function App() {
     }
     setIsMutating(true);
     try {
-      await compactSession(selectedSessionId);
-      await loadEvents();
+      const summary = await compactSession(selectedSessionId);
+      applyRealtimeEvent({
+        version: 1,
+        kind: "context.summary.created",
+        sessionId: summary.sessionId,
+        seq: summary.recentEventSeq,
+        summary
+      });
+      scheduleRealtimeTailRefresh(selectedSessionId);
       setNotice({ tone: "success", text: "上下文已压缩" });
     } catch (error) {
       reportError(error);
