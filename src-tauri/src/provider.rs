@@ -1,5 +1,5 @@
 use crate::{
-    llm_runtime::{LlmStreamEvent, OpenAiChatStreamParser},
+    llm_runtime::{sanitize_assistant_content, LlmStreamEvent, OpenAiChatStreamParser},
     types::{ModelTurn, ProviderKind, ProviderRequestConfig, ToolCallRequest, ToolMode},
 };
 use futures_util::StreamExt;
@@ -345,7 +345,17 @@ fn parse_openai_compatible_turn(payload: &Value) -> Result<Option<ModelTurn>, St
         .pointer("/choices/0/message")
         .ok_or_else(|| "AI 服务返回缺少 choices[0].message。".to_string())?;
     let content = openai_message_content(message.get("content"));
+    let sanitized = content
+        .as_deref()
+        .map(sanitize_assistant_content)
+        .filter(|value| !value.text.trim().is_empty() || !value.reasoning.trim().is_empty());
     let tool_calls = parse_openai_tool_calls(message.get("tool_calls"))?;
+    let content = sanitized
+        .as_ref()
+        .and_then(|value| (!value.text.trim().is_empty()).then(|| value.text.clone()));
+    let summary = sanitized
+        .as_ref()
+        .and_then(|value| (!value.reasoning.trim().is_empty()).then(|| value.reasoning.clone()));
 
     if tool_calls.is_empty()
         && content
@@ -361,7 +371,7 @@ fn parse_openai_compatible_turn(payload: &Value) -> Result<Option<ModelTurn>, St
     }
 
     Ok(Some(ModelTurn {
-        summary: None,
+        summary,
         message: content,
         done: tool_calls.is_empty(),
         tool_calls,
@@ -686,7 +696,10 @@ mod tests {
             api_key: "test-key".to_string(),
             headers: std::collections::HashMap::new(),
             body: serde_json::Map::new(),
+            context_token_limit: None,
+            input_token_limit: None,
             output_token_limit: None,
+            pricing: Default::default(),
             config_path: "odot.json".to_string(),
         }
     }

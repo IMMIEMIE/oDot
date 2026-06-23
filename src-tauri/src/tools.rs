@@ -26,6 +26,7 @@ pub struct ToolOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolExecutionMode {
     Agent,
+    Ask,
     Plan,
 }
 
@@ -232,8 +233,8 @@ fn execute_tool_inner(
             })))
         }
         "edit" => {
-            if execution_mode == ToolExecutionMode::Plan {
-                return Ok(plan_mode_mutation_blocked("edit"));
+            if execution_mode != ToolExecutionMode::Agent {
+                return Ok(read_only_mode_mutation_blocked(execution_mode, "edit"));
             }
             let path = required_string(&call.input, "path")?;
             let old_string = required_string_any(&call.input, &["oldString", "old_string"])?;
@@ -253,8 +254,8 @@ fn execute_tool_inner(
             })))
         }
         "write" => {
-            if execution_mode == ToolExecutionMode::Plan {
-                return Ok(plan_mode_mutation_blocked("write"));
+            if execution_mode != ToolExecutionMode::Agent {
+                return Ok(read_only_mode_mutation_blocked(execution_mode, "write"));
             }
             let path = required_string(&call.input, "path")?;
             let content = required_string(&call.input, "content")?;
@@ -275,8 +276,8 @@ fn execute_tool_inner(
             })))
         }
         "delete" => {
-            if execution_mode == ToolExecutionMode::Plan {
-                return Ok(plan_mode_mutation_blocked("delete"));
+            if execution_mode != ToolExecutionMode::Agent {
+                return Ok(read_only_mode_mutation_blocked(execution_mode, "delete"));
             }
             let path = required_string(&call.input, "path")?;
             let snapshot = mutation::delete_file(conn, session, &called_event.id, &path)?;
@@ -367,10 +368,15 @@ fn invalid_tool_result(input: &Value) -> Value {
     })
 }
 
-fn plan_mode_mutation_blocked(tool_name: &str) -> ToolRun {
+fn read_only_mode_mutation_blocked(execution_mode: ToolExecutionMode, tool_name: &str) -> ToolRun {
+    let mode_label = match execution_mode {
+        ToolExecutionMode::Ask => "问答模式",
+        ToolExecutionMode::Plan => "计划模式",
+        ToolExecutionMode::Agent => "Agent 模式",
+    };
     ToolRun::Failure(json!({
         "blocked": true,
-        "reason": format!("计划模式禁止执行 {tool_name}，请只读取、搜索或输出计划。")
+        "reason": format!("{mode_label}禁止执行 {tool_name}，请只读取、搜索或运行不会修改代码的检查命令。")
     }))
 }
 
@@ -859,6 +865,9 @@ mod tests {
             title: "test".to_string(),
             status: "active".to_string(),
             shell_mode,
+            total_cost: 0.0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
             created_at: "now".to_string(),
             updated_at: "now".to_string(),
         }
@@ -873,6 +882,12 @@ mod tests {
             data: json!({}),
             created_at: "now".to_string(),
         }
+    }
+
+    fn temp_project() -> PathBuf {
+        let root = std::env::temp_dir().join(format!("odot-tools-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        root
     }
 
     #[test]
@@ -965,6 +980,77 @@ mod tests {
                 panic!("allowlisted auto shell command should not require approval")
             }
             ToolRun::Failure(data) => panic!("allowlisted auto shell command failed: {data:?}"),
+        }
+    }
+
+    #[test]
+    fn ask_mode_can_run_read_tool() {
+        let root = temp_project();
+        fs::write(root.join("note.txt"), "ask can inspect").unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        let session = test_session(root.to_string_lossy().to_string(), ShellMode::Manual);
+        let call = ToolCallRequest {
+            tool_call_id: None,
+            name: "read".to_string(),
+            input: json!({ "path": "note.txt" }),
+        };
+        let event = test_event();
+
+        let result = execute_tool_inner(
+            &conn,
+            &session,
+            &ShellMode::Manual,
+            &policy(&[]),
+            &call,
+            &event,
+            ToolExecutionMode::Ask,
+        )
+        .unwrap();
+
+        match result {
+            ToolRun::Success(data) => {
+                assert_eq!(data["path"], "note.txt");
+                assert!(data["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("ask can inspect"));
+            }
+            other => panic!("ask mode read should succeed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ask_mode_blocks_code_mutation_tools() {
+        let conn = Connection::open_in_memory().unwrap();
+        let session = test_session(".".to_string(), ShellMode::Manual);
+        let call = ToolCallRequest {
+            tool_call_id: None,
+            name: "write".to_string(),
+            input: json!({ "path": "note.txt", "content": "mutate" }),
+        };
+        let event = test_event();
+
+        let result = execute_tool_inner(
+            &conn,
+            &session,
+            &ShellMode::Manual,
+            &policy(&[]),
+            &call,
+            &event,
+            ToolExecutionMode::Ask,
+        )
+        .unwrap();
+
+        match result {
+            ToolRun::Failure(data) => {
+                assert_eq!(data["blocked"], true);
+                assert!(data["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("问答模式禁止执行 write"));
+            }
+            other => panic!("ask mode write should be blocked, got {other:?}"),
         }
     }
 

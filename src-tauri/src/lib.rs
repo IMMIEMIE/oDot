@@ -110,7 +110,7 @@ fn tail_session_events(
         events: storage::list_events_after(&conn, &input.session_id, input.after_seq.unwrap_or(0))?,
         snapshots: storage::list_snapshots(&conn, &input.session_id)?,
         summaries: storage::list_context_summaries(&conn, &input.session_id)?,
-        inputs: storage::list_session_inputs(&conn, &input.session_id)?,
+        inputs: storage::list_public_session_inputs(&conn, &input.session_id)?,
         runs: storage::list_session_runs(&conn, &input.session_id)?,
         permissions: storage::list_permission_requests(&conn, &input.session_id)?,
         jobs: storage::list_background_jobs(&conn, &input.session_id)?,
@@ -224,9 +224,28 @@ fn rollback_snapshot(app: AppHandle, snapshot_id: String) -> Result<SnapshotReco
 }
 
 #[tauri::command]
-fn compact_session(app: AppHandle, session_id: String) -> Result<ContextSummaryRecord, String> {
-    let conn = storage::open_db(&app)?;
-    runner::compact_session(&conn, &session_id)
+async fn compact_session(
+    app: AppHandle,
+    session_id: String,
+) -> Result<ContextSummaryRecord, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = storage::open_db(&app)?;
+        let session = storage::get_session(&conn, &session_id)?;
+        match config_file::load_provider_request_config(
+            &app,
+            &session.project_root,
+            &session.provider_id,
+        ) {
+            Ok(provider) => tauri::async_runtime::block_on(runner::compact_session_with_provider(
+                &conn,
+                &session_id,
+                &provider,
+            )),
+            Err(_) => runner::compact_session(&conn, &session_id),
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]

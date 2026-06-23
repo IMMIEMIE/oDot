@@ -1,11 +1,13 @@
 import {
   AlertTriangle,
+  ArrowUp,
   Bot,
   BrainCircuit,
   Check,
   ChevronLeft,
   ChevronDown,
   ChevronRight,
+  ChevronUp,
   Clock3,
   Database,
   FileCode2,
@@ -14,19 +16,21 @@ import {
   KeyRound,
   Loader2,
   Pencil,
+  Plus,
   Play,
   RefreshCw,
   RotateCcw,
   Save,
   Search,
   Settings,
+  Square,
   Terminal,
   Trash2,
   Wrench,
   X
 } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { PointerEvent, ReactNode } from "react";
+import type { ChangeEvent, PointerEvent, ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import {
   approveToolCall,
@@ -55,6 +59,7 @@ import {
   type EventRecord,
   type PermissionRequestRecord,
   type PermissionReply,
+  type PromptAttachmentInput,
   type ProjectFile,
   type ProviderConfigFileResponse,
   type ProviderRecord,
@@ -75,6 +80,8 @@ const EMPTY_EVENTS: SessionEventsResponse = {
   jobs: []
 };
 const LIVE_REFRESH_INTERVAL_MS = 250;
+const MAX_TEXT_ATTACHMENT_BYTES = 250_000;
+const MAX_IMAGE_ATTACHMENT_BYTES = 5 * 1024 * 1024;
 
 type Notice = {
   tone: "info" | "success" | "error";
@@ -82,6 +89,18 @@ type Notice = {
 };
 
 type ThemeMode = "system" | "light" | "dark";
+type PromptAttachmentKind = "text" | "image";
+
+type PromptAttachment = {
+  id: string;
+  name: string;
+  mime: string;
+  size: number;
+  kind: PromptAttachmentKind;
+  content: string;
+};
+
+type PromptAttachmentSummary = Omit<PromptAttachmentInput, "content">;
 
 type TreeNode = {
   type: "dir" | "file";
@@ -110,6 +129,7 @@ export function App() {
   });
   const [eventsResponse, setEventsResponse] =
     useState<SessionEventsResponse>(EMPTY_EVENTS);
+  const [dismissedJobIds, setDismissedJobIds] = useState<Set<string>>(new Set());
   const [streamingEventId, setStreamingEventId] = useState<string | null>(null);
   const [prompt, setPrompt] = useState("");
   const [lastError, setLastError] = useState<string | null>(null);
@@ -133,11 +153,17 @@ export function App() {
     return stored === "light" || stored === "dark" || stored === "system" ? stored : "system";
   });
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
+  const timelineScrollRef = useRef<HTMLDivElement | null>(null);
+  const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const attachmentInputRef = useRef<HTMLInputElement | null>(null);
+  const modelMenuRef = useRef<HTMLDivElement | null>(null);
   const liveRefreshTimerRef = useRef<number | undefined>(undefined);
   const stopRefreshTimerRef = useRef<number | undefined>(undefined);
   const activeRunIdRef = useRef(0);
   const stopBaselineSeqRef = useRef(0);
   const rollbackInFlightRef = useRef(false);
+  const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
+  const [promptAttachments, setPromptAttachments] = useState<PromptAttachment[]>([]);
   const [leftWidth, setLeftWidth] = useState(() => {
     const stored = Number(localStorage.getItem("odot.leftWidth"));
     return Number.isFinite(stored) && stored >= 300 ? stored : 420;
@@ -195,6 +221,18 @@ export function App() {
     () => providers.find((provider) => provider.id === selectedProviderId),
     [providers, selectedProviderId]
   );
+  const selectedModelLabel = selectedProvider
+    ? providerModelLabel(selectedProvider)
+    : "未选择模型";
+  const allowedAttachmentKinds = useMemo(
+    () => attachmentKindsFromConfig(configContent, selectedProviderId),
+    [configContent, selectedProviderId]
+  );
+  const attachmentAccept = useMemo(
+    () => attachmentAcceptValue(allowedAttachmentKinds),
+    [allowedAttachmentKinds]
+  );
+  const canUploadAttachments = allowedAttachmentKinds.length > 0;
 
   const selectedSession = useMemo(
     () => sessions.find((session) => session.id === selectedSessionId),
@@ -220,6 +258,33 @@ export function App() {
     }
   }, [availableSessions, selectedSessionId]);
 
+  useEffect(() => {
+    if (!providers.length) {
+      if (selectedProviderId) {
+        setSelectedProviderId("");
+      }
+      return;
+    }
+    if (
+      !selectedProviderId ||
+      !providers.some((provider) => provider.id === selectedProviderId)
+    ) {
+      const preferredProviderId = preferredConfigProviderId({
+        providers,
+        selectedProviderId: null,
+        path: "",
+        content: configContent
+      });
+      setSelectedProviderId(preferredProviderId);
+    }
+  }, [configContent, providers, selectedProviderId]);
+
+  useEffect(() => {
+    setPromptAttachments((current) =>
+      current.filter((attachment) => allowedAttachmentKinds.includes(attachment.kind))
+    );
+  }, [allowedAttachmentKinds]);
+
   const filteredFiles = useMemo(() => {
     const query = fileFilter.trim().toLowerCase();
     if (!query) {
@@ -241,8 +306,17 @@ export function App() {
     );
   }, [eventsResponse.events]);
 
+  const visibleJobs = useMemo(
+    () =>
+      eventsResponse.jobs.filter(
+        (job) => job.status !== "cancelled" && !dismissedJobIds.has(job.id)
+      ),
+    [dismissedJobIds, eventsResponse.jobs]
+  );
+
   const contextUsage = useMemo(
     () =>
+      contextUsageFromEvents(eventsResponse) ??
       estimateContextUsage({
         eventsResponse,
         configContent,
@@ -272,12 +346,65 @@ export function App() {
   );
 
   const latestEventId = eventsResponse.events.at(-1)?.id ?? "";
+  const promptEventCount = useMemo(
+    () => eventsResponse.events.filter((event) => event.type === "prompt.submitted").length,
+    [eventsResponse.events]
+  );
   const isAgentWorking = isSubmitting || isContinuing;
   const isPromptLocked = isAgentWorking || isStopping || pendingToolEvents.length > 0;
 
   useLayoutEffect(() => {
     timelineEndRef.current?.scrollIntoView({ block: "end" });
   }, [latestEventId, streamingEventId]);
+
+  useLayoutEffect(() => {
+    const input = promptInputRef.current;
+    if (!input) {
+      return;
+    }
+
+    input.style.height = "auto";
+    const computed = window.getComputedStyle(input);
+    const lineHeight = Number.parseFloat(computed.lineHeight) || 22;
+    const padding =
+      (Number.parseFloat(computed.paddingTop) || 0) +
+      (Number.parseFloat(computed.paddingBottom) || 0);
+    const maxHeight = lineHeight * 4 + padding;
+    const nextHeight = Math.min(input.scrollHeight, maxHeight);
+    input.style.height = `${nextHeight}px`;
+    input.style.overflowY = input.scrollHeight > maxHeight ? "auto" : "hidden";
+  }, [prompt, isPromptLocked]);
+
+  useEffect(() => {
+    if (!isModelMenuOpen) {
+      return;
+    }
+
+    function closeOnOutsidePointer(event: globalThis.PointerEvent) {
+      if (!modelMenuRef.current?.contains(event.target as Node)) {
+        setIsModelMenuOpen(false);
+      }
+    }
+
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setIsModelMenuOpen(false);
+      }
+    }
+
+    window.addEventListener("pointerdown", closeOnOutsidePointer);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", closeOnOutsidePointer);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [isModelMenuOpen]);
+
+  useEffect(() => {
+    if (isPromptLocked || selectedSessionId) {
+      setIsModelMenuOpen(false);
+    }
+  }, [isPromptLocked, selectedSessionId]);
 
   async function bootstrap() {
     setIsBooting(true);
@@ -312,56 +439,6 @@ export function App() {
     } finally {
       setIsBooting(false);
     }
-  }
-
-  async function reloadProviderConfig() {
-    try {
-      const config = await loadProviderConfig(projectRoot);
-      setConfigPath(config.path);
-      setConfigContent(config.content);
-      setProviders(config.providers);
-      const preferredProviderId = preferredConfigProviderId(config);
-      if (
-        preferredProviderId !== selectedProviderId ||
-        !config.providers.some((provider) => provider.id === selectedProviderId)
-      ) {
-        setSelectedProviderId(preferredProviderId);
-        setSelectedSessionId("");
-        setEventsResponse(EMPTY_EVENTS);
-      }
-      setNotice({ tone: "success", text: "AI 服务配置已重新加载" });
-    } catch (error) {
-      reportError(error);
-    }
-  }
-
-  async function saveConfig() {
-    setIsSavingConfig(true);
-    try {
-      await applyProviderConfig(configContent);
-      setNotice({ tone: "success", text: "AI 服务配置已保存并同步" });
-    } catch (error) {
-      reportError(error);
-    } finally {
-      setIsSavingConfig(false);
-    }
-  }
-
-  async function applyProviderConfig(content: string) {
-    const config = await saveProviderConfig(content, projectRoot);
-    setConfigPath(config.path);
-    setConfigContent(config.content);
-    setProviders(config.providers);
-    const preferredProviderId = preferredConfigProviderId(config);
-    if (
-      preferredProviderId !== selectedProviderId ||
-      !config.providers.some((provider) => provider.id === selectedProviderId)
-    ) {
-      setSelectedProviderId(preferredProviderId);
-      setSelectedSessionId("");
-      setEventsResponse(EMPTY_EVENTS);
-    }
-    return config;
   }
 
   async function saveSettings(content: string, policy: ShellPolicy) {
@@ -534,8 +611,34 @@ export function App() {
     }
   }
 
+  async function handleAttachmentInputChange(event: ChangeEvent<HTMLInputElement>) {
+    const selectedFiles = Array.from(event.target.files ?? []);
+    event.target.value = "";
+    if (!selectedFiles.length) {
+      return;
+    }
+    try {
+      const nextAttachments = await Promise.all(
+        selectedFiles.map((file) => readPromptAttachment(file, allowedAttachmentKinds))
+      );
+      setPromptAttachments((current) => [...current, ...nextAttachments]);
+      setNotice({
+        tone: "success",
+        text: `已添加 ${nextAttachments.length} 个附件`
+      });
+    } catch (error) {
+      reportError(error);
+    }
+  }
+
+  function removePromptAttachment(id: string) {
+    setPromptAttachments((current) =>
+      current.filter((attachment) => attachment.id !== id)
+    );
+  }
+
   async function handleSubmitPrompt() {
-    if (!prompt.trim() || isPromptLocked) {
+    if ((!prompt.trim() && !promptAttachments.length) || isPromptLocked) {
       return;
     }
     const runId = activeRunIdRef.current + 1;
@@ -550,11 +653,12 @@ export function App() {
       }, LIVE_REFRESH_INTERVAL_MS);
       const selectedFileText = Array.from(selectedPaths).sort().join("\n");
       const finalPrompt = selectedFileText
-        ? `${prompt}\n\n已选择文件:\n${selectedFileText}`
+        ? `${prompt.trim() || "请根据附件内容继续。"}\n\n已选择文件:\n${selectedFileText}`
         : prompt;
       const response = await promptSession({
         sessionId: session.id,
         prompt: finalPrompt,
+        attachments: promptAttachments.map(toPromptAttachmentInput),
         delivery: "queue",
         resume: true
       });
@@ -571,6 +675,7 @@ export function App() {
       setStreamingEventId(latestAssistantEvent?.id ?? null);
       await refreshSessions();
       setPrompt("");
+      setPromptAttachments([]);
       setNotice({
         tone: "success",
         text: hasUnresolvedPendingTools(response.events)
@@ -808,12 +913,30 @@ export function App() {
   }
 
   async function handleCancelJob(jobId: string) {
+    const job = eventsResponse.jobs.find((item) => item.id === jobId);
     setIsMutating(true);
+    setDismissedJobIds((current) => new Set(current).add(jobId));
+    setEventsResponse((current) => ({
+      ...current,
+      jobs: current.jobs.filter((item) => item.id !== jobId)
+    }));
     try {
       await cancelJob(jobId);
-      await loadEvents();
       setNotice({ tone: "success", text: "后台任务已停止" });
     } catch (error) {
+      setDismissedJobIds((current) => {
+        const next = new Set(current);
+        next.delete(jobId);
+        return next;
+      });
+      if (job) {
+        setEventsResponse((current) => ({
+          ...current,
+          jobs: current.jobs.some((item) => item.id === jobId)
+            ? current.jobs
+            : [job, ...current.jobs]
+        }));
+      }
       reportError(error);
     } finally {
       setIsMutating(false);
@@ -863,6 +986,38 @@ export function App() {
     } finally {
       setIsMutating(false);
     }
+  }
+
+  function scrollToPrompt(direction: "previous" | "next") {
+    const container = timelineScrollRef.current;
+    if (!container) {
+      return;
+    }
+    const promptBlocks = Array.from(
+      container.querySelectorAll<HTMLElement>("[data-prompt-block='true']")
+    );
+    if (!promptBlocks.length) {
+      return;
+    }
+
+    const containerTop = container.getBoundingClientRect().top;
+    const currentTop = container.scrollTop;
+    const promptPositions = promptBlocks.map((element) => ({
+      element,
+      top: element.getBoundingClientRect().top - containerTop + currentTop
+    }));
+    const threshold = currentTop + 24;
+    const target =
+      direction === "previous"
+        ? [...promptPositions].reverse().find((item) => item.top < threshold - 48) ??
+          promptPositions[0]
+        : promptPositions.find((item) => item.top > threshold) ??
+          promptPositions[promptPositions.length - 1];
+
+    container.scrollTo({
+      top: Math.max(0, target.top - 12),
+      behavior: "smooth"
+    });
   }
 
   async function handleDeleteSession(sessionId: string) {
@@ -998,27 +1153,6 @@ export function App() {
               onClick={() => setIsSettingsOpen(true)}
             >
               <Settings size={16} />
-            </button>
-          </div>
-          <button className="providerSummary" onClick={() => setIsSettingsOpen(true)}>
-            <span>
-              <strong>{selectedProvider?.name ?? "未选择服务"}</strong>
-              <small>{selectedProvider?.id ?? (configPath || "配置文件尚未加载")}</small>
-            </span>
-            <Settings size={16} />
-          </button>
-          <div className="providerMiniActions">
-            <button className="iconTextButton" onClick={() => void reloadProviderConfig()}>
-              <RefreshCw size={16} />
-              重新加载
-            </button>
-            <button
-              className="iconTextButton"
-              disabled={isSavingConfig || !configContent.trim()}
-              onClick={() => void saveConfig()}
-            >
-              {isSavingConfig ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
-              保存
             </button>
           </div>
         </section>
@@ -1178,29 +1312,6 @@ export function App() {
                 }
               }}
             />
-            <Segmented
-              value={shellMode}
-              options={[
-                ["manual", "手动命令"],
-                ["auto", "自动命令"]
-              ]}
-              onChange={(value) => {
-                const nextShellMode = value as ShellMode;
-                setShellMode(nextShellMode);
-                if (selectedSessionId) {
-                  void updateSessionMode({
-                    sessionId: selectedSessionId,
-                    shellMode: nextShellMode
-                  })
-                    .then((updated) =>
-                      setSessions((current) =>
-                        current.map((s) => s.id === updated.id ? updated : s)
-                      )
-                    )
-                    .catch(reportError);
-                }
-              }}
-            />
           </div>
           <div className={`notice ${notice.tone}`}>
             {(isBooting || isAgentWorking || isStopping) && (
@@ -1213,15 +1324,10 @@ export function App() {
         <section className="timelinePane">
           <div className="paneHeader">
             <div>
-              <div className="contextUsage" title={contextUsage.title}>
-                <span>上下文 {contextUsage.percent}%</span>
-                <div className="contextTrack" aria-hidden="true">
-                  <i style={{ width: `${contextUsage.percent}%` }} />
-                </div>
-              </div>
+              <ContextUsageMeter usage={contextUsage} />
               <strong>{selectedSession?.title ?? "暂无活动会话"}</strong>
               <small>
-                {selectedProvider?.name ?? "未选择服务"} / 已选 {selectedPaths.size} 个文件
+                {selectedProvider ? selectedModelLabel : "未选择服务"} / 已选 {selectedPaths.size} 个文件
               </small>
             </div>
             <button
@@ -1234,7 +1340,7 @@ export function App() {
             </button>
           </div>
 
-          <div className="timeline">
+          <div className="timeline" ref={timelineScrollRef}>
             <ConversationTimeline
               events={eventsResponse.events}
               snapshots={eventsResponse.snapshots}
@@ -1265,46 +1371,196 @@ export function App() {
           )}
 
           <div className="promptBar">
-            <textarea
-              value={prompt}
-              disabled={isPromptLocked}
-              onChange={(event) => setPrompt(event.target.value)}
-              placeholder={
-                isAgentWorking
-                  ? "Agent 正在工作，结束后才能继续发送。"
-                  : isStopping
-                    ? "Agent 正在停止，确认截断后才能继续发送。"
-                  : pendingToolEvents.length
-                    ? "请先处理待确认命令。"
-                    : "让 oDot 检查、规划、修改、验证或回滚代码。"
-              }
-              onKeyDown={(event) => {
-                if (
-                  event.key === "Enter" &&
-                  !event.shiftKey &&
-                  (!event.nativeEvent.isComposing || event.ctrlKey || event.metaKey)
-                ) {
-                  event.preventDefault();
-                  void handleSubmitPrompt();
+            <div className="promptComposer">
+              <input
+                ref={attachmentInputRef}
+                className="promptAttachmentInput"
+                type="file"
+                multiple
+                accept={attachmentAccept}
+                onChange={(event) => void handleAttachmentInputChange(event)}
+              />
+              <textarea
+                ref={promptInputRef}
+                className="promptInput"
+                rows={1}
+                value={prompt}
+                disabled={isPromptLocked}
+                onChange={(event) => setPrompt(event.target.value)}
+                placeholder={
+                  isAgentWorking
+                    ? "Agent 正在工作，结束后才能继续发送。"
+                    : isStopping
+                      ? "Agent 正在停止，确认截断后才能继续发送。"
+                    : pendingToolEvents.length
+                      ? "请先处理待确认命令。"
+                      : "要求后续变更"
                 }
-              }}
-            />
-            <button
-              className={`runButton ${isAgentWorking ? "stop" : ""}`}
-              disabled={
-                isAgentWorking
-                  ? false
-                  : !prompt.trim() || isPromptLocked || !selectedProviderId
-              }
-              onClick={() =>
-                isAgentWorking
-                  ? void handleStopAgent()
-                  : void handleSubmitPrompt()
-              }
-            >
-              {isAgentWorking ? <X size={18} /> : <Play size={18} />}
-              {isAgentWorking ? "停止" : "运行"}
-            </button>
+                onKeyDown={(event) => {
+                  if (
+                    event.key === "Enter" &&
+                    !event.shiftKey &&
+                    (!event.nativeEvent.isComposing || event.ctrlKey || event.metaKey)
+                  ) {
+                    event.preventDefault();
+                    void handleSubmitPrompt();
+                  }
+                }}
+              />
+              {promptAttachments.length > 0 && (
+                <div className="promptAttachmentList" aria-label="已上传附件">
+                  {promptAttachments.map((attachment) => (
+                    <span className="promptAttachmentChip" key={attachment.id}>
+                      <span>{attachment.name}</span>
+                      <small>
+                        {attachment.kind === "image" ? "图片" : "文本"} ·{" "}
+                        {formatBytes(attachment.size)}
+                      </small>
+                      <button
+                        type="button"
+                        aria-label={`移除附件 ${attachment.name}`}
+                        disabled={isPromptLocked}
+                        onClick={() => removePromptAttachment(attachment.id)}
+                      >
+                        <X size={13} />
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
+              <div className="promptActionRow">
+                <div className="composerControls">
+                  <button
+                    type="button"
+                    className="composerAttachButton"
+                    title={
+                      selectedProviderId
+                        ? attachmentUploadTitle(allowedAttachmentKinds)
+                        : "请先选择模型"
+                    }
+                    aria-label="上传附件"
+                    disabled={isPromptLocked || !selectedProviderId || !canUploadAttachments}
+                    onClick={() => attachmentInputRef.current?.click()}
+                  >
+                    <Plus size={18} />
+                  </button>
+                  <div
+                    ref={modelMenuRef}
+                    className="composerModelSelect"
+                    title={
+                      selectedSessionId
+                        ? "当前会话已绑定模型，新会话前可切换"
+                        : "选择模型"
+                    }
+                  >
+                    <button
+                      type="button"
+                      className="composerModelButton"
+                      disabled={isPromptLocked || Boolean(selectedSessionId)}
+                      aria-haspopup="listbox"
+                      aria-expanded={isModelMenuOpen}
+                      aria-label="选择模型"
+                      onClick={() => setIsModelMenuOpen((open) => !open)}
+                    >
+                      <span>{selectedProvider ? selectedModelLabel : "未配置模型"}</span>
+                      <ChevronDown size={15} />
+                    </button>
+                    {isModelMenuOpen && !isPromptLocked && !selectedSessionId && (
+                      <div className="composerModelMenu" role="listbox" aria-label="选择模型">
+                        {!providers.length && (
+                          <div className="composerModelEmpty">未配置模型</div>
+                        )}
+                        {providers.map((provider) => {
+                          const isSelected = provider.id === selectedProviderId;
+                          return (
+                            <button
+                              type="button"
+                              key={provider.id}
+                              className={`composerModelOption ${isSelected ? "active" : ""}`}
+                              role="option"
+                              aria-selected={isSelected}
+                              onClick={() => {
+                                setSelectedProviderId(provider.id);
+                                setIsModelMenuOpen(false);
+                              }}
+                            >
+                              <span>{providerModelLabel(provider)}</span>
+                              {isSelected && <Check size={15} />}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                  <Segmented
+                    className="composerShellMode"
+                    value={shellMode}
+                    disabled={isPromptLocked}
+                    options={[
+                      ["manual", "手动"],
+                      ["auto", "自动"]
+                    ]}
+                    onChange={(value) => {
+                      const nextShellMode = value as ShellMode;
+                      setShellMode(nextShellMode);
+                      if (selectedSessionId) {
+                        void updateSessionMode({
+                          sessionId: selectedSessionId,
+                          shellMode: nextShellMode
+                        })
+                          .then((updated) =>
+                            setSessions((current) =>
+                              current.map((s) => (s.id === updated.id ? updated : s))
+                            )
+                          )
+                          .catch(reportError);
+                      }
+                    }}
+                  />
+                  <div className="promptNavGroup">
+                    <button
+                      type="button"
+                      className="promptNavIconButton"
+                      title="上一条提示词"
+                      aria-label="上一条提示词"
+                      disabled={!promptEventCount}
+                      onClick={() => scrollToPrompt("previous")}
+                    >
+                      <ChevronUp size={16} />
+                    </button>
+                    <button
+                      type="button"
+                      className="promptNavIconButton"
+                      title="下一条提示词"
+                      aria-label="下一条提示词"
+                      disabled={!promptEventCount}
+                      onClick={() => scrollToPrompt("next")}
+                    >
+                      <ChevronDown size={16} />
+                    </button>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className={`composerSendButton ${isAgentWorking ? "stop" : ""}`}
+                  aria-label={isAgentWorking ? "停止 Agent" : "发送提示词"}
+                  disabled={
+                    isAgentWorking
+                      ? false
+                      : (!prompt.trim() && !promptAttachments.length) ||
+                        isPromptLocked ||
+                        !selectedProviderId
+                  }
+                  onClick={() =>
+                    isAgentWorking
+                      ? void handleStopAgent()
+                      : void handleSubmitPrompt()
+                  }
+                >
+                  {isAgentWorking ? <Square size={17} /> : <ArrowUp size={19} />}
+                </button>
+              </div>
+            </div>
           </div>
         </section>
       </main>
@@ -1414,7 +1670,7 @@ export function App() {
             <section className="rightSection">
               <SectionTitle icon={<Clock3 size={16} />} title="后台任务" />
               <div className="stackList">
-                {eventsResponse.jobs.map((job) => (
+                {visibleJobs.map((job) => (
                   <div className="approvalRow" key={job.id}>
                     <code>{job.status} #{job.pid} {job.command}</code>
                     <button
@@ -1427,7 +1683,7 @@ export function App() {
                     </button>
                   </div>
                 ))}
-                {!eventsResponse.jobs.length && <EmptyLine text="暂无后台任务" />}
+                {!visibleJobs.length && <EmptyLine text="暂无后台任务" />}
               </div>
             </section>
 
@@ -1765,6 +2021,7 @@ type TimelineItem = {
   kind: TimelineItemKind;
   title: string;
   text?: string;
+  attachments?: PromptAttachmentSummary[];
   status: TimelineStatus;
   event?: EventRecord;
   details: EventRecord[];
@@ -1773,6 +2030,67 @@ type TimelineItem = {
   codeChangeGroup?: TimelineCodeChangeGroup;
   rollbackSnapshotIds?: string[];
 };
+
+function ContextUsageMeter({ usage }: { usage: ContextUsage }) {
+  const tooltipId = "context-usage-details";
+  return (
+    <div
+      className={`contextUsage ${usage.severity}`}
+      tabIndex={0}
+      aria-describedby={tooltipId}
+    >
+      <span>
+        上下文 {usage.percent}% · {usage.source === "provider" ? "实际" : "估算"}
+      </span>
+      <div className="contextTrack" aria-hidden="true">
+        <i style={{ width: `${usage.barPercent}%` }} />
+      </div>
+      <div className="contextUsagePopover" id={tooltipId} role="tooltip">
+        <header>
+          <strong>{formatInteger(usage.usedTokens)} tokens</strong>
+          <span>
+            / {formatInteger(usage.maxTokens)} · {usage.percent}%
+          </span>
+        </header>
+        <dl>
+          <div>
+            <dt>输入</dt>
+            <dd>{formatInteger(usage.tokens.input)}</dd>
+          </div>
+          <div>
+            <dt>输出</dt>
+            <dd>{formatInteger(usage.tokens.output)}</dd>
+          </div>
+          <div>
+            <dt>推理</dt>
+            <dd>{formatInteger(usage.tokens.reasoning)}</dd>
+          </div>
+          <div>
+            <dt>缓存读取</dt>
+            <dd>{formatInteger(usage.tokens.cache.read)}</dd>
+          </div>
+          <div>
+            <dt>缓存写入</dt>
+            <dd>{formatInteger(usage.tokens.cache.write)}</dd>
+          </div>
+          <div>
+            <dt>总量</dt>
+            <dd>{formatInteger(usage.tokens.total)}</dd>
+          </div>
+        </dl>
+        <p>
+          {usage.providerId || "未知 Provider"} / {usage.model || "未知模型"}
+          {usage.step ? ` / step ${usage.step}` : ""}
+        </p>
+        {usage.notes.map((note) => (
+          <p className="contextUsageNote" key={note}>
+            {note}
+          </p>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 function ConversationTimeline({
   events,
@@ -1843,7 +2161,10 @@ function TimelineItemView({
   const icon = timelineItemIcon(item);
 
   return (
-    <article className={`timelineItem ${item.kind} ${item.status}`}>
+    <article
+      className={`timelineItem ${item.kind} ${item.status}`}
+      data-prompt-block={item.kind === "userPrompt" ? "true" : undefined}
+    >
       <div className="timelineItemRail">
         <div className="timelineItemIcon">{icon}</div>
       </div>
@@ -1855,7 +2176,19 @@ function TimelineItemView({
 
         {item.kind === "userPrompt" && (
           <>
-            <p className="promptText">{item.text}</p>
+            {item.text && <p className="promptText">{item.text}</p>}
+            {!!item.attachments?.length && (
+              <div className="timelineAttachmentList" aria-label="提示词附件">
+                {item.attachments.map((attachment, index) => (
+                  <span className="timelineAttachmentChip" key={`${item.id}-${index}-${attachment.name}`}>
+                    {attachment.name}
+                    <small>
+                      {attachment.kind === "image" ? "图片" : "文本"} · {formatBytes(attachment.size)}
+                    </small>
+                  </span>
+                ))}
+              </div>
+            )}
             <div className="timelineItemActions">
               <button
                 type="button"
@@ -2486,6 +2819,7 @@ function buildTimelineItems(
         kind: "userPrompt",
         title: "用户提示词",
         text: valueAsString(event.data.prompt),
+        attachments: promptAttachmentSummaries(event.data.attachments),
         status: "done",
         event,
         details: [event],
@@ -2508,7 +2842,7 @@ function buildTimelineItems(
           id: `assistant-stream-${step}`,
           kind: "assistantReply",
           title: "助手回复",
-          text: group.text,
+          text: stripReasoningControlTags(group.text),
           status: "running",
           event,
           details: group.events
@@ -2540,7 +2874,7 @@ function buildTimelineItems(
         id: event.id,
         kind: "assistantReply",
         title: "助手回复",
-        text: valueAsString(event.data.text),
+        text: stripReasoningControlTags(valueAsString(event.data.text)),
         status: "done",
         event,
         details: deltaGroup ? [event, ...deltaGroup.events] : [event]
@@ -3131,18 +3465,24 @@ function SectionTitle({ icon, title }: { icon: ReactNode; title: string }) {
 function Segmented({
   value,
   options,
-  onChange
+  onChange,
+  className = "",
+  disabled = false
 }: {
   value: string;
   options: Array<[string, string]>;
   onChange: (value: string) => void;
+  className?: string;
+  disabled?: boolean;
 }) {
   return (
-    <div className="segmented">
+    <div className={`segmented ${className}`.trim()}>
       {options.map(([optionValue, label]) => (
         <button
+          type="button"
           key={optionValue}
           className={value === optionValue ? "active" : ""}
+          disabled={disabled}
           onClick={() => onChange(optionValue)}
         >
           {label}
@@ -3319,6 +3659,35 @@ function valueAsString(value: unknown) {
   return typeof value === "string" ? value : "";
 }
 
+function stripReasoningControlTags(value: string) {
+  let output = "";
+  let index = 0;
+  let inReasoning = false;
+  while (index < value.length) {
+    const tagStart = value.indexOf("<", index);
+    if (tagStart === -1) {
+      if (!inReasoning) {
+        output += value.slice(index);
+      }
+      break;
+    }
+    if (!inReasoning) {
+      output += value.slice(index, tagStart);
+    }
+    const match = value.slice(tagStart).match(/^<\/?think(?:_[A-Za-z0-9_-]+)?(?:\s[^>]*)?>/);
+    if (!match) {
+      if (!inReasoning) {
+        output += "<";
+      }
+      index = tagStart + 1;
+      continue;
+    }
+    inReasoning = !match[0].startsWith("</");
+    index = tagStart + match[0].length;
+  }
+  return output;
+}
+
 function errorMessage(error: unknown) {
   if (error instanceof Error) {
     return error.stack || error.message;
@@ -3402,12 +3771,82 @@ function toolLabel(value: string) {
   return labels[value] ?? value;
 }
 
-type ContextUsageEstimate = {
+type ContextUsageSeverity = "ok" | "warning" | "danger";
+type ContextUsageSource = "provider" | "estimate";
+
+type ContextUsageTokens = {
+  input: number;
+  output: number;
+  reasoning: number;
+  cache: {
+    read: number;
+    write: number;
+  };
+  total: number;
+};
+
+type ContextUsage = {
   percent: number;
+  barPercent: number;
   usedTokens: number;
   maxTokens: number;
-  title: string;
+  source: ContextUsageSource;
+  severity: ContextUsageSeverity;
+  tokens: ContextUsageTokens;
+  providerId?: string;
+  model?: string;
+  step?: number;
+  limitIsDefault: boolean;
+  notes: string[];
 };
+
+function contextUsageFromEvents(eventsResponse: SessionEventsResponse): ContextUsage | null {
+  const event = [...eventsResponse.events]
+    .reverse()
+    .find((item) => item.type === "context.usage");
+  if (!event) {
+    return null;
+  }
+
+  const data = asRecord(event.data);
+  const tokens = asRecord(data.tokens);
+  const cache = asRecord(tokens.cache);
+  const contextLimit = valueAsNumber(data.contextLimit);
+  const maxTokens = contextLimit ?? 128_000;
+  const usedTokens = valueAsNumber(data.usedForContext) ?? valueAsNumber(tokens.total) ?? 0;
+  const percent =
+    valueAsNumber(data.percent) ?? Math.ceil((usedTokens / Math.max(1, maxTokens)) * 100);
+  const normalizedTokens: ContextUsageTokens = {
+    input: valueAsNumber(tokens.input) ?? 0,
+    output: valueAsNumber(tokens.output) ?? 0,
+    reasoning: valueAsNumber(tokens.reasoning) ?? 0,
+    cache: {
+      read: valueAsNumber(cache.read) ?? 0,
+      write: valueAsNumber(cache.write) ?? 0
+    },
+    total: valueAsNumber(tokens.total) ?? usedTokens
+  };
+  const limitIsDefault = !contextLimit;
+  const notes = [
+    "来源: Provider 实际 usage。",
+    limitIsDefault ? "上下文上限来自默认 128,000 tokens。" : ""
+  ].filter((note) => note.length > 0);
+
+  return {
+    percent,
+    barPercent: Math.min(100, Math.max(0, percent)),
+    usedTokens,
+    maxTokens,
+    source: "provider",
+    severity: contextUsageSeverity(percent),
+    tokens: normalizedTokens,
+    providerId: valueAsString(data.providerId),
+    model: valueAsString(data.model),
+    step: valueAsNumber(data.step) ?? undefined,
+    limitIsDefault,
+    notes
+  };
+}
 
 function estimateContextUsage({
   eventsResponse,
@@ -3419,7 +3858,7 @@ function estimateContextUsage({
   configContent: string;
   selectedProviderId: string;
   draftPrompt: string;
-}): ContextUsageEstimate {
+}): ContextUsage {
   const limit = contextLimitFromConfig(configContent, selectedProviderId);
   const maxTokens = limit ?? 128_000;
   const recentEventText = eventsResponse.events
@@ -3437,20 +3876,45 @@ function estimateContextUsage({
     `Recent event timeline:\n${recentEventText}`
   ].join("\n\n");
   const usedTokens = estimateTokens(promptShape);
-  const percent = Math.min(100, Math.ceil((usedTokens / maxTokens) * 100));
-  const title = [
-    `估算使用量: ${formatInteger(usedTokens)} tokens`,
-    `上下文上限: ${formatInteger(maxTokens)} tokens${limit ? "" : " (默认估算)"}`,
-    `最近事件: ${Math.min(eventsResponse.events.length, 36)} / ${eventsResponse.events.length}`,
-    "说明: 按当前发送给模型的压缩上下文估算，非供应商实际 billing usage。"
-  ].join("\n");
+  const percent = Math.ceil((usedTokens / maxTokens) * 100);
+  const limitIsDefault = !limit;
 
   return {
     percent,
+    barPercent: Math.min(100, Math.max(0, percent)),
     usedTokens,
     maxTokens,
-    title
+    source: "estimate",
+    severity: contextUsageSeverity(percent),
+    tokens: {
+      input: usedTokens,
+      output: 0,
+      reasoning: 0,
+      cache: {
+        read: 0,
+        write: 0
+      },
+      total: usedTokens
+    },
+    providerId: splitProviderRecordId(selectedProviderId).providerId,
+    model: splitProviderRecordId(selectedProviderId).modelId,
+    limitIsDefault,
+    notes: [
+      `来源: 本地估算，最近事件 ${Math.min(eventsResponse.events.length, 36)} / ${eventsResponse.events.length}。`,
+      limitIsDefault ? "上下文上限来自默认 128,000 tokens。" : "",
+      "说明: 按当前发送给模型的压缩上下文估算，非供应商实际 usage。"
+    ].filter((note) => note.length > 0)
   };
+}
+
+function contextUsageSeverity(percent: number): ContextUsageSeverity {
+  if (percent >= 95) {
+    return "danger";
+  }
+  if (percent >= 80) {
+    return "warning";
+  }
+  return "ok";
 }
 
 function contextLimitFromConfig(content: string, selectedProviderId: string) {
@@ -3520,11 +3984,19 @@ function parseProviderSettings(
     const selected = splitProviderRecordId(
       selectedProviderId || valueAsString(config.model)
     );
+    const providerKeys = Object.keys(providers ?? {});
     const providerId =
-      selected.providerId || (Object.keys(providers ?? {})[0] ?? "");
+      selected.providerId && providers?.[selected.providerId]
+        ? selected.providerId
+        : (providerKeys[0] ?? "");
     const provider = providerRecord(config, providerId);
     const models = provider.models as Record<string, unknown> | undefined;
-    const modelId = selected.modelId || (Object.keys(models ?? {})[0] ?? "");
+    const modelKeys = Object.keys(models ?? {});
+    const modelId =
+      selected.modelId &&
+      (models?.[selected.modelId] || !modelKeys.length)
+        ? selected.modelId
+        : (modelKeys[0] ?? "");
     const options = asRecord(provider.options);
     const model = asRecord(models?.[modelId]);
     const modelProvider = asRecord(model.provider);
@@ -3592,11 +4064,11 @@ function providerChoices(
     const config = JSON.parse(content) as Record<string, unknown>;
     const provider = asRecord(config.provider);
     const choices = Object.keys(provider);
-    const fallbackProvider = splitProviderRecordId(fallback).providerId || fallback;
-    if (fallbackProvider && !choices.includes(fallbackProvider)) {
-      choices.push(fallbackProvider);
+    if (choices.length) {
+      return choices;
     }
-    return choices.length ? choices : providers.map((item) => item.id.split("/")[0]);
+    const fallbackProvider = splitProviderRecordId(fallback).providerId || fallback;
+    return fallbackProvider ? [fallbackProvider] : providers.map((item) => item.id.split("/")[0]);
   } catch {
     return providers.map((item) => item.id.split("/")[0]);
   }
@@ -3608,13 +4080,254 @@ function modelChoices(content: string, providerId: string, fallback: string) {
     const provider = providerRecord(config, providerId);
     const models = asRecord(provider.models);
     const choices = Object.keys(models);
-    if (fallback && !choices.includes(fallback)) {
-      choices.push(fallback);
+    if (choices.length) {
+      return choices;
     }
-    return choices.length ? choices : ["default"];
+    return fallback || providerId ? [fallback || "default"] : ["default"];
   } catch {
     return fallback ? [fallback] : ["default"];
   }
+}
+
+function providerModelLabel(provider: ProviderRecord) {
+  const displayName = stripProviderNamePrefix(provider.name);
+  if (displayName && displayName !== provider.name.trim()) {
+    return displayName;
+  }
+  return (
+    provider.model ||
+    splitProviderRecordId(provider.id).modelId ||
+    provider.name ||
+    provider.id
+  );
+}
+
+function stripProviderNamePrefix(value: string) {
+  const trimmed = value.trim();
+  const separator = " / ";
+  if (!trimmed.includes(separator)) {
+    return trimmed;
+  }
+  return trimmed.split(separator).slice(1).join(separator).trim() || trimmed;
+}
+
+function attachmentKindsFromConfig(
+  content: string,
+  selectedProviderId: string
+): PromptAttachmentKind[] {
+  try {
+    const config = JSON.parse(content) as Record<string, unknown>;
+    const selected = splitProviderRecordId(
+      selectedProviderId || valueAsString(config.model)
+    );
+    const provider = providerRecord(config, selected.providerId);
+    const model = asRecord(asRecord(provider.models)[selected.modelId]);
+    const modalities = asRecord(model.modalities);
+    const input = Array.isArray(modalities.input) ? modalities.input : ["text"];
+    const kinds = input
+      .map((item) => valueAsString(item).toLowerCase())
+      .filter((item): item is PromptAttachmentKind => item === "text" || item === "image");
+    return Array.from(new Set(kinds));
+  } catch {
+    return ["text"];
+  }
+}
+
+function attachmentAcceptValue(kinds: PromptAttachmentKind[]) {
+  const values: string[] = [];
+  if (kinds.includes("image")) {
+    values.push("image/*");
+  }
+  if (kinds.includes("text")) {
+    values.push(
+      "text/*",
+      "application/json",
+      "application/xml",
+      ".txt",
+      ".md",
+      ".markdown",
+      ".json",
+      ".jsonl",
+      ".csv",
+      ".ts",
+      ".tsx",
+      ".js",
+      ".jsx",
+      ".py",
+      ".rs",
+      ".go",
+      ".java",
+      ".kt",
+      ".swift",
+      ".c",
+      ".cpp",
+      ".h",
+      ".hpp",
+      ".cs",
+      ".html",
+      ".css",
+      ".scss",
+      ".xml",
+      ".yaml",
+      ".yml",
+      ".toml",
+      ".sql",
+      ".sh",
+      ".ps1",
+      ".bat",
+      ".log"
+    );
+  }
+  return values.join(",");
+}
+
+function attachmentUploadTitle(kinds: PromptAttachmentKind[]) {
+  if (!kinds.length) {
+    return "当前模型配置不支持附件上传";
+  }
+  const labels = kinds.map((kind) => (kind === "image" ? "图片" : "文本文件"));
+  return `上传附件，可选类型：${labels.join("、")}`;
+}
+
+async function readPromptAttachment(
+  file: File,
+  allowedKinds: PromptAttachmentKind[]
+): Promise<PromptAttachment> {
+  const kind = promptAttachmentKindForFile(file, allowedKinds);
+  if (!kind) {
+    throw new Error(`当前模型不支持该附件类型：${file.name}`);
+  }
+  if (kind === "text" && file.size > MAX_TEXT_ATTACHMENT_BYTES) {
+    throw new Error(`文本附件过大：${file.name}，最大 ${formatBytes(MAX_TEXT_ATTACHMENT_BYTES)}。`);
+  }
+  if (kind === "image" && file.size > MAX_IMAGE_ATTACHMENT_BYTES) {
+    throw new Error(`图片附件过大：${file.name}，最大 ${formatBytes(MAX_IMAGE_ATTACHMENT_BYTES)}。`);
+  }
+
+  return {
+    id: newId(),
+    name: file.name,
+    mime: attachmentMimeForFile(file, kind),
+    size: file.size,
+    kind,
+    content: kind === "image" ? await readFileAsDataUrl(file, attachmentMimeForFile(file, kind)) : await readFileAsText(file)
+  };
+}
+
+function promptAttachmentKindForFile(
+  file: File,
+  allowedKinds: PromptAttachmentKind[]
+): PromptAttachmentKind | null {
+  if (allowedKinds.includes("image") && fileLooksImage(file)) {
+    return "image";
+  }
+  if (allowedKinds.includes("text") && fileLooksText(file)) {
+    return "text";
+  }
+  return null;
+}
+
+function fileLooksImage(file: File) {
+  return (
+    file.type.startsWith("image/") ||
+    /\.(png|jpe?g|gif|webp|bmp|avif)$/i.test(file.name)
+  );
+}
+
+function attachmentMimeForFile(file: File, kind: PromptAttachmentKind) {
+  if (file.type) {
+    return file.type;
+  }
+  if (kind === "image") {
+    const ext = file.name.toLowerCase().split(".").pop();
+    if (ext === "jpg" || ext === "jpeg") return "image/jpeg";
+    if (ext === "png") return "image/png";
+    if (ext === "gif") return "image/gif";
+    if (ext === "webp") return "image/webp";
+    if (ext === "bmp") return "image/bmp";
+    if (ext === "avif") return "image/avif";
+    return "image/png";
+  }
+  return "text/plain";
+}
+
+function fileLooksText(file: File) {
+  if (file.type.startsWith("text/")) {
+    return true;
+  }
+  const mime = file.type.toLowerCase();
+  if (
+    [
+      "application/json",
+      "application/xml",
+      "application/javascript",
+      "application/typescript",
+      "application/x-sh",
+      "application/x-yaml"
+    ].includes(mime)
+  ) {
+    return true;
+  }
+  return /\.(txt|md|markdown|json|jsonl|csv|ts|tsx|js|jsx|py|rs|go|java|kt|swift|c|cpp|h|hpp|cs|html|css|scss|xml|ya?ml|toml|sql|sh|ps1|bat|log)$/i.test(
+    file.name
+  );
+}
+
+function readFileAsText(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ""));
+    reader.onerror = () => reject(reader.error ?? new Error(`无法读取附件：${file.name}`));
+    reader.readAsText(file);
+  });
+}
+
+function readFileAsDataUrl(file: File, mime: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const value = String(reader.result ?? "");
+      resolve(value.replace(/^data:[^;,]*/, `data:${mime}`));
+    };
+    reader.onerror = () => reject(reader.error ?? new Error(`无法读取附件：${file.name}`));
+    reader.readAsDataURL(file);
+  });
+}
+
+function toPromptAttachmentInput(attachment: PromptAttachment): PromptAttachmentInput {
+  return {
+    name: attachment.name,
+    mime: attachment.mime,
+    size: attachment.size,
+    kind: attachment.kind,
+    content: attachment.content
+  };
+}
+
+function promptAttachmentSummaries(value: unknown): PromptAttachmentSummary[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.flatMap((item) => {
+    const record = asRecord(item);
+    const name = valueAsString(record.name);
+    const kind = valueAsString(record.kind);
+    if (!name || (kind !== "text" && kind !== "image")) {
+      return [];
+    }
+    return [
+      {
+        name,
+        kind,
+        mime: valueAsString(record.mime) || (kind === "image" ? "image/*" : "text/plain"),
+        size: valueAsNumber(record.size) ?? 0
+      }
+    ];
+  });
+}
+
+function newId() {
+  return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
 }
 
 function providerRecord(config: Record<string, unknown>, providerId: string) {

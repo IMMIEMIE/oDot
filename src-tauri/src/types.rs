@@ -178,6 +178,14 @@ pub struct ProviderRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ProviderPricing {
+    pub input_per_million: f64,
+    pub output_per_million: f64,
+    pub cache_read_per_million: f64,
+    pub cache_write_per_million: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderRequestConfig {
     pub kind: ProviderKind,
@@ -187,7 +195,10 @@ pub struct ProviderRequestConfig {
     pub api_key: String,
     pub headers: HashMap<String, String>,
     pub body: serde_json::Map<String, Value>,
+    pub context_token_limit: Option<u64>,
+    pub input_token_limit: Option<u64>,
     pub output_token_limit: Option<u64>,
+    pub pricing: ProviderPricing,
     pub config_path: String,
 }
 
@@ -211,6 +222,9 @@ pub struct SessionRecord {
     pub title: String,
     pub status: String,
     pub shell_mode: ShellMode,
+    pub total_cost: f64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -273,12 +287,31 @@ pub struct SessionInputRecord {
     pub id: String,
     pub session_id: String,
     pub prompt: String,
+    #[serde(default)]
+    pub attachments: Vec<PromptAttachment>,
     pub delivery: SessionInputDelivery,
     pub resume: bool,
     pub status: String,
     pub promoted_event_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptAttachment {
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+    pub kind: PromptAttachmentKind,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PromptAttachmentKind {
+    Text,
+    Image,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -356,6 +389,8 @@ pub struct ProjectFile {
 pub struct SubmitPromptInput {
     pub session_id: String,
     pub prompt: String,
+    #[serde(default)]
+    pub attachments: Vec<PromptAttachment>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -364,6 +399,8 @@ pub struct PromptSessionInput {
     pub id: Option<String>,
     pub session_id: String,
     pub prompt: String,
+    #[serde(default)]
+    pub attachments: Vec<PromptAttachment>,
     pub delivery: Option<SessionInputDelivery>,
     #[serde(default = "default_resume")]
     pub resume: bool,

@@ -1,7 +1,7 @@
 use crate::{
     storage,
     types::{
-        ProviderConfigFileResponse, ProviderInput, ProviderKind, ProviderRecord,
+        ProviderConfigFileResponse, ProviderInput, ProviderKind, ProviderPricing, ProviderRecord,
         ProviderRequestConfig, ToolMode,
     },
 };
@@ -49,6 +49,7 @@ struct ConfigModel {
     #[serde(default, rename = "toolMode", alias = "tool_mode")]
     tool_mode: Option<ToolMode>,
     limit: Option<ModelLimit>,
+    pricing: Option<ModelPricing>,
     request: Option<ConfigRequest>,
     #[serde(default)]
     options: HashMap<String, Value>,
@@ -56,7 +57,21 @@ struct ConfigModel {
 
 #[derive(Debug, Clone, Deserialize)]
 struct ModelLimit {
+    context: Option<u64>,
+    input: Option<u64>,
     output: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ModelPricing {
+    #[serde(default)]
+    input: f64, // price per 1M input tokens (USD)
+    #[serde(default)]
+    output: f64, // price per 1M output tokens (USD)
+    #[serde(default)]
+    cache_read: Option<f64>, // price per 1M cache read tokens (USD)
+    #[serde(default)]
+    cache_write: Option<f64>, // price per 1M cache write tokens (USD)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -260,6 +275,7 @@ where
             provider: None,
             tool_mode: None,
             limit: None,
+            pricing: None,
             request: None,
             options: HashMap::new(),
         };
@@ -306,7 +322,14 @@ where
     })?;
     let headers = merge_headers(provider, model);
     let body = merge_body(provider, model);
+    let context_token_limit = model.limit.as_ref().and_then(|limit| limit.context);
+    let input_token_limit = model.limit.as_ref().and_then(|limit| limit.input);
     let output_token_limit = model.limit.as_ref().and_then(|limit| limit.output);
+    let pricing = model
+        .pricing
+        .as_ref()
+        .map(provider_pricing)
+        .unwrap_or_default();
 
     Ok(ProviderRequestConfig {
         kind,
@@ -316,7 +339,10 @@ where
         api_key,
         headers,
         body,
+        context_token_limit,
+        input_token_limit,
         output_token_limit,
+        pricing,
         config_path: config_path.to_string_lossy().to_string(),
     })
 }
@@ -368,12 +394,22 @@ fn model_entries(provider: &ConfigProvider) -> Vec<(String, ConfigModel)> {
                 provider: None,
                 tool_mode: None,
                 limit: None,
+                pricing: None,
                 request: None,
                 options: HashMap::new(),
             },
         )]
     } else {
         provider.models.clone().into_iter().collect()
+    }
+}
+
+fn provider_pricing(pricing: &ModelPricing) -> ProviderPricing {
+    ProviderPricing {
+        input_per_million: pricing.input,
+        output_per_million: pricing.output,
+        cache_read_per_million: pricing.cache_read.unwrap_or(pricing.input),
+        cache_write_per_million: pricing.cache_write.unwrap_or(pricing.input),
     }
 }
 
@@ -646,6 +682,7 @@ mod tests {
           "name": "ark-code-latest",
           "limit": {{
             "context": 256000,
+            "input": 240000,
             "output": 4096
           }}
         }}
@@ -687,6 +724,8 @@ mod tests {
 
         assert_eq!(request.api_key, "ark-json-key");
         assert_eq!(request.tool_mode, ToolMode::Native);
+        assert_eq!(request.context_token_limit, Some(256000));
+        assert_eq!(request.input_token_limit, Some(240000));
         assert_eq!(request.output_token_limit, Some(4096));
         assert_eq!(
             request.base_url.as_deref(),

@@ -43,6 +43,14 @@ export type ProviderConfigFileResponse = {
   selectedProviderId?: string | null;
 };
 
+export type PromptAttachmentInput = {
+  name: string;
+  mime: string;
+  size: number;
+  kind: "text" | "image";
+  content: string;
+};
+
 export type CreateSessionInput = {
   projectRoot: string;
   mode: AgentMode;
@@ -97,6 +105,7 @@ export type SessionInputRecord = {
   id: string;
   sessionId: string;
   prompt: string;
+  attachments: Omit<PromptAttachmentInput, "content">[];
   delivery: SessionInputDelivery;
   resume: boolean;
   status: string;
@@ -249,6 +258,7 @@ export async function tailSessionEvents(input: {
 export async function submitPrompt(input: {
   sessionId: string;
   prompt: string;
+  attachments?: PromptAttachmentInput[];
 }): Promise<SessionEventsResponse> {
   assertTauri();
   return invoke<SessionEventsResponse>("submit_prompt", { input });
@@ -258,6 +268,7 @@ export async function promptSession(input: {
   id?: string;
   sessionId: string;
   prompt: string;
+  attachments?: PromptAttachmentInput[];
   delivery?: SessionInputDelivery;
   resume?: boolean;
 }): Promise<SessionEventsResponse> {

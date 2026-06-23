@@ -24,9 +24,16 @@ pub enum LlmStreamEvent {
     },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SanitizedAssistantContent {
+    pub text: String,
+    pub reasoning: String,
+}
+
 #[derive(Debug, Default)]
 pub struct OpenAiChatStreamParser {
     buffer: String,
+    content: ReasoningTagSplitter,
     tools: HashMap<usize, ToolAccumulator>,
     finish_reason: Option<String>,
     usage: Option<Value>,
@@ -66,7 +73,7 @@ impl OpenAiChatStreamParser {
                 events.extend(self.parse_data(&data)?);
             }
         }
-        events.extend(self.emit_tool_calls()?);
+        events.extend(self.emit_terminal_events()?);
         events.extend(self.emit_finish());
         Ok(events)
     }
@@ -77,7 +84,7 @@ impl OpenAiChatStreamParser {
             return Ok(Vec::new());
         }
         if trimmed == "[DONE]" {
-            let mut events = self.emit_tool_calls()?;
+            let mut events = self.emit_terminal_events()?;
             events.extend(self.emit_finish());
             return Ok(events);
         }
@@ -104,6 +111,7 @@ impl OpenAiChatStreamParser {
         }
 
         if choices.is_empty() && self.usage.is_some() {
+            events.extend(self.emit_terminal_events()?);
             events.extend(self.emit_finish());
             return Ok(events);
         }
@@ -111,12 +119,7 @@ impl OpenAiChatStreamParser {
         for choice in choices {
             if let Some(delta) = choice.get("delta") {
                 if let Some(text) = delta.get("content").and_then(Value::as_str) {
-                    if !text.is_empty() {
-                        events.push(LlmStreamEvent::TextDelta {
-                            part_id: "text-0".to_string(),
-                            text: text.to_string(),
-                        });
-                    }
+                    events.extend(self.content.push(text).into_iter().map(content_delta_event));
                 }
                 if let Some(text) = delta
                     .get("reasoning_content")
@@ -141,7 +144,7 @@ impl OpenAiChatStreamParser {
 
             if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
                 self.finish_reason = Some(reason.to_string());
-                events.extend(self.emit_tool_calls()?);
+                events.extend(self.emit_terminal_events()?);
                 if self.usage.is_some() {
                     events.extend(self.emit_finish());
                 }
@@ -239,6 +242,154 @@ impl OpenAiChatStreamParser {
             usage: self.usage.clone(),
         }]
     }
+
+    fn emit_terminal_events(&mut self) -> Result<Vec<LlmStreamEvent>, String> {
+        let mut events = self
+            .content
+            .finish()
+            .into_iter()
+            .map(content_delta_event)
+            .collect::<Vec<_>>();
+        events.extend(self.emit_tool_calls()?);
+        Ok(events)
+    }
+}
+
+#[derive(Debug, Default)]
+struct ReasoningTagSplitter {
+    pending: String,
+    in_reasoning: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ContentDelta {
+    Text(String),
+    Reasoning(String),
+}
+
+impl ReasoningTagSplitter {
+    fn push(&mut self, text: &str) -> Vec<ContentDelta> {
+        self.pending.push_str(text);
+        self.drain(false)
+    }
+
+    fn finish(&mut self) -> Vec<ContentDelta> {
+        self.drain(true)
+    }
+
+    fn drain(&mut self, final_chunk: bool) -> Vec<ContentDelta> {
+        let input = std::mem::take(&mut self.pending);
+        let mut events = Vec::new();
+        let mut cursor = 0;
+
+        while cursor < input.len() {
+            let Some(relative_tag_start) = input[cursor..].find('<') else {
+                push_content_delta(&mut events, self.in_reasoning, &input[cursor..]);
+                break;
+            };
+            let tag_start = cursor + relative_tag_start;
+            if tag_start > cursor {
+                push_content_delta(&mut events, self.in_reasoning, &input[cursor..tag_start]);
+            }
+
+            match parse_reasoning_tag(&input[tag_start..]) {
+                TagScan::Complete { byte_len, closing } => {
+                    self.in_reasoning = !closing;
+                    cursor = tag_start + byte_len;
+                }
+                TagScan::Incomplete if !final_chunk => {
+                    self.pending.push_str(&input[tag_start..]);
+                    break;
+                }
+                TagScan::Incomplete | TagScan::NotTag => {
+                    push_content_delta(&mut events, self.in_reasoning, "<");
+                    cursor = tag_start + 1;
+                }
+            }
+        }
+
+        events
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TagScan {
+    Complete { byte_len: usize, closing: bool },
+    Incomplete,
+    NotTag,
+}
+
+fn parse_reasoning_tag(input: &str) -> TagScan {
+    if !input.starts_with('<') {
+        return TagScan::NotTag;
+    }
+    let Some(end) = input.find('>') else {
+        return TagScan::Incomplete;
+    };
+    let mut body = input[1..end].trim();
+    let closing = body.starts_with('/');
+    if closing {
+        body = body[1..].trim_start();
+    }
+    let name = body.split_whitespace().next().unwrap_or_default();
+    if name == "think" || name.starts_with("think_") {
+        TagScan::Complete {
+            byte_len: end + 1,
+            closing,
+        }
+    } else {
+        TagScan::NotTag
+    }
+}
+
+fn push_content_delta(events: &mut Vec<ContentDelta>, in_reasoning: bool, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let next = if in_reasoning {
+        ContentDelta::Reasoning(text.to_string())
+    } else {
+        ContentDelta::Text(text.to_string())
+    };
+    if let Some(last) = events.last_mut() {
+        match (last, &next) {
+            (ContentDelta::Text(existing), ContentDelta::Text(value))
+            | (ContentDelta::Reasoning(existing), ContentDelta::Reasoning(value)) => {
+                existing.push_str(value);
+                return;
+            }
+            _ => {}
+        }
+    }
+    events.push(next);
+}
+
+fn content_delta_event(delta: ContentDelta) -> LlmStreamEvent {
+    match delta {
+        ContentDelta::Text(text) => LlmStreamEvent::TextDelta {
+            part_id: "text-0".to_string(),
+            text,
+        },
+        ContentDelta::Reasoning(text) => LlmStreamEvent::ReasoningDelta {
+            part_id: "reasoning-0".to_string(),
+            text,
+        },
+    }
+}
+
+pub fn sanitize_assistant_content(text: &str) -> SanitizedAssistantContent {
+    let mut splitter = ReasoningTagSplitter::default();
+    let mut result = SanitizedAssistantContent {
+        text: String::new(),
+        reasoning: String::new(),
+    };
+    for delta in splitter.push(text).into_iter().chain(splitter.finish()) {
+        match delta {
+            ContentDelta::Text(text) => result.text.push_str(&text),
+            ContentDelta::Reasoning(text) => result.reasoning.push_str(&text),
+        }
+    }
+    result
 }
 
 fn next_sse_block(buffer: &str) -> Option<(String, usize)> {
@@ -333,6 +484,58 @@ mod tests {
                 part_id: "reasoning-0".to_string(),
                 text: "think".to_string()
             }]
+        );
+    }
+
+    #[test]
+    fn strips_unmatched_think_never_used_closing_tag() {
+        let events = parse(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello</think_never_used_51bce0c785ca2f68081bfa7d91973934>\"}}]}\n\n",
+        );
+
+        assert_eq!(
+            events,
+            vec![LlmStreamEvent::TextDelta {
+                part_id: "text-0".to_string(),
+                text: "hello".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn strips_split_think_never_used_closing_tag() {
+        let events = parse(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello</think_never_\"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{\"content\":\"used_51bce0c785ca2f68081bfa7d91973934>\"}}]}\n\n",
+        );
+
+        assert_eq!(
+            events,
+            vec![LlmStreamEvent::TextDelta {
+                part_id: "text-0".to_string(),
+                text: "hello".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn moves_content_think_block_to_reasoning() {
+        let events = parse(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"<think>hidden</think>visible\"}}]}\n\n",
+        );
+
+        assert_eq!(
+            events,
+            vec![
+                LlmStreamEvent::ReasoningDelta {
+                    part_id: "reasoning-0".to_string(),
+                    text: "hidden".to_string()
+                },
+                LlmStreamEvent::TextDelta {
+                    part_id: "text-0".to_string(),
+                    text: "visible".to_string()
+                }
+            ]
         );
     }
 

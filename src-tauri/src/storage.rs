@@ -2,9 +2,9 @@ use crate::{
     provider,
     types::{
         AgentMode, BackgroundJobRecord, ContextSummaryRecord, CreateSessionInput, EventRecord,
-        PermissionReply, PermissionRequestRecord, ProviderInput, ProviderKind, ProviderRecord,
-        SessionEventsResponse, SessionInputDelivery, SessionInputRecord, SessionRecord,
-        SessionRunRecord, ShellMode, ShellPolicy, SnapshotRecord,
+        PermissionReply, PermissionRequestRecord, PromptAttachment, ProviderInput, ProviderKind,
+        ProviderRecord, SessionEventsResponse, SessionInputDelivery, SessionInputRecord,
+        SessionRecord, SessionRunRecord, ShellMode, ShellPolicy, SnapshotRecord,
     },
     util,
 };
@@ -58,6 +58,9 @@ fn init_db(conn: &Connection) -> Result<(), String> {
           title TEXT NOT NULL,
           status TEXT NOT NULL,
           shell_mode TEXT NOT NULL,
+          total_cost REAL NOT NULL DEFAULT 0,
+          total_input_tokens INTEGER NOT NULL DEFAULT 0,
+          total_output_tokens INTEGER NOT NULL DEFAULT 0,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
@@ -103,6 +106,7 @@ fn init_db(conn: &Connection) -> Result<(), String> {
           id TEXT PRIMARY KEY,
           session_id TEXT NOT NULL,
           prompt TEXT NOT NULL,
+          attachments_json TEXT NOT NULL DEFAULT '[]',
           delivery TEXT NOT NULL,
           resume INTEGER NOT NULL,
           status TEXT NOT NULL,
@@ -154,7 +158,53 @@ fn init_db(conn: &Connection) -> Result<(), String> {
         );
         "#,
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    ensure_column(
+        conn,
+        "session_input",
+        "attachments_json",
+        "ALTER TABLE session_input ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column(
+        conn,
+        "session",
+        "total_cost",
+        "ALTER TABLE session ADD COLUMN total_cost REAL NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "session",
+        "total_input_tokens",
+        "ALTER TABLE session ADD COLUMN total_input_tokens INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "session",
+        "total_output_tokens",
+        "ALTER TABLE session ADD COLUMN total_output_tokens INTEGER NOT NULL DEFAULT 0",
+    )?;
+    Ok(())
+}
+
+fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    alter_sql: &str,
+) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|error| error.to_string())?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| error.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| error.to_string())?;
+    if !columns.iter().any(|value| value == column) {
+        conn.execute(alter_sql, [])
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 pub fn save_provider(conn: &Connection, input: ProviderInput) -> Result<ProviderRecord, String> {
@@ -283,7 +333,7 @@ pub fn create_session(
 pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionRecord>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, project_root, mode, provider_id, title, status, shell_mode, created_at, updated_at
+            "SELECT id, project_root, mode, provider_id, title, status, shell_mode, total_cost, total_input_tokens, total_output_tokens, created_at, updated_at
              FROM session ORDER BY updated_at DESC",
         )
         .map_err(|error| error.to_string())?;
@@ -295,7 +345,7 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionRecord>, String> {
 
 pub fn get_session(conn: &Connection, id: &str) -> Result<SessionRecord, String> {
     conn.query_row(
-        "SELECT id, project_root, mode, provider_id, title, status, shell_mode, created_at, updated_at
+        "SELECT id, project_root, mode, provider_id, title, status, shell_mode, total_cost, total_input_tokens, total_output_tokens, created_at, updated_at
          FROM session WHERE id = ?1",
         params![id],
         session_from_row,
@@ -310,6 +360,37 @@ pub fn set_session_status(conn: &Connection, session_id: &str, status: &str) -> 
         params![status, &updated_at, session_id],
     )
     .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub fn add_session_usage(
+    conn: &Connection,
+    session_id: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    cost: f64,
+) -> Result<(), String> {
+    let updated_at = util::now_string();
+    let changed = conn
+        .execute(
+            "UPDATE session
+             SET total_input_tokens = total_input_tokens + ?1,
+                 total_output_tokens = total_output_tokens + ?2,
+                 total_cost = total_cost + ?3,
+                 updated_at = ?4
+             WHERE id = ?5",
+            params![
+                input_tokens as i64,
+                output_tokens as i64,
+                cost,
+                &updated_at,
+                session_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err(format!("未找到会话: {session_id}"));
+    }
     Ok(())
 }
 
@@ -453,6 +534,20 @@ pub fn append_event(
     .map_err(|error| error.to_string())?;
 
     get_event(conn, &id)
+}
+
+pub fn update_event_data(conn: &Connection, event_id: &str, data: &Value) -> Result<(), String> {
+    let data_json = serde_json::to_string(data).map_err(|error| error.to_string())?;
+    let changed = conn
+        .execute(
+            "UPDATE event SET data_json = ?1 WHERE id = ?2",
+            params![&data_json, event_id],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err(format!("未找到事件: {event_id}"));
+    }
+    Ok(())
 }
 
 pub fn get_event(conn: &Connection, id: &str) -> Result<EventRecord, String> {
@@ -617,6 +712,7 @@ pub fn admit_session_input(
     id: Option<String>,
     session_id: &str,
     prompt: &str,
+    attachments: &[PromptAttachment],
     delivery: SessionInputDelivery,
     resume: bool,
 ) -> Result<SessionInputRecord, String> {
@@ -624,6 +720,7 @@ pub fn admit_session_input(
     if let Ok(existing) = get_session_input(conn, &id) {
         if existing.session_id == session_id
             && existing.prompt == prompt
+            && existing.attachments == attachments
             && existing.delivery.as_str() == delivery.as_str()
             && existing.resume == resume
         {
@@ -634,14 +731,24 @@ pub fn admit_session_input(
 
     get_session(conn, session_id)?;
     let now = util::now_string();
+    let attachments_json = serde_json::to_string(attachments).map_err(|error| error.to_string())?;
     conn.execute(
         r#"
         INSERT INTO session_input
-          (id, session_id, prompt, delivery, resume, status, promoted_event_id, created_at, updated_at)
+          (id, session_id, prompt, attachments_json, delivery, resume, status, promoted_event_id, created_at, updated_at)
         VALUES
-          (?1, ?2, ?3, ?4, ?5, 'pending', NULL, ?6, ?7)
+          (?1, ?2, ?3, ?4, ?5, ?6, 'pending', NULL, ?7, ?8)
         "#,
-        params![&id, session_id, prompt, delivery.as_str(), resume as i64, &now, &now],
+        params![
+            &id,
+            session_id,
+            prompt,
+            attachments_json,
+            delivery.as_str(),
+            resume as i64,
+            &now,
+            &now
+        ],
     )
     .map_err(|error| error.to_string())?;
     get_session_input(conn, &id)
@@ -649,7 +756,7 @@ pub fn admit_session_input(
 
 pub fn get_session_input(conn: &Connection, id: &str) -> Result<SessionInputRecord, String> {
     conn.query_row(
-        "SELECT id, session_id, prompt, delivery, resume, status, promoted_event_id, created_at, updated_at
+        "SELECT id, session_id, prompt, attachments_json, delivery, resume, status, promoted_event_id, created_at, updated_at
          FROM session_input WHERE id = ?1",
         params![id],
         session_input_from_row,
@@ -663,7 +770,7 @@ pub fn next_pending_session_input(
 ) -> Result<Option<SessionInputRecord>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, session_id, prompt, delivery, resume, status, promoted_event_id, created_at, updated_at
+            "SELECT id, session_id, prompt, attachments_json, delivery, resume, status, promoted_event_id, created_at, updated_at
              FROM session_input WHERE session_id = ?1 AND status = 'pending'
              ORDER BY CASE delivery WHEN 'steer' THEN 0 ELSE 1 END, created_at ASC LIMIT 1",
         )
@@ -694,7 +801,7 @@ pub fn list_session_inputs(
 ) -> Result<Vec<SessionInputRecord>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, session_id, prompt, delivery, resume, status, promoted_event_id, created_at, updated_at
+            "SELECT id, session_id, prompt, attachments_json, delivery, resume, status, promoted_event_id, created_at, updated_at
              FROM session_input WHERE session_id = ?1 ORDER BY created_at ASC",
         )
         .map_err(|error| error.to_string())?;
@@ -702,6 +809,19 @@ pub fn list_session_inputs(
         .query_map(params![session_id], session_input_from_row)
         .map_err(|error| error.to_string())?;
     collect_rows(rows)
+}
+
+pub fn list_public_session_inputs(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<SessionInputRecord>, String> {
+    let mut inputs = list_session_inputs(conn, session_id)?;
+    for input in &mut inputs {
+        for attachment in &mut input.attachments {
+            attachment.content.clear();
+        }
+    }
+    Ok(inputs)
 }
 
 pub fn begin_session_run(conn: &Connection, session_id: &str) -> Result<SessionRunRecord, String> {
@@ -953,7 +1073,7 @@ pub fn session_events_response(
         events: list_events(conn, session_id)?,
         snapshots: list_snapshots(conn, session_id)?,
         summaries: list_context_summaries(conn, session_id)?,
-        inputs: list_session_inputs(conn, session_id)?,
+        inputs: list_public_session_inputs(conn, session_id)?,
         runs: list_session_runs(conn, session_id)?,
         permissions: list_permission_requests(conn, session_id)?,
         jobs: list_background_jobs(conn, session_id)?,
@@ -1053,8 +1173,11 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> 
         title: row.get(4)?,
         status: row.get(5)?,
         shell_mode: ShellMode::from_str(&shell_mode).unwrap_or(ShellMode::Manual),
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
+        total_cost: row.get(7)?,
+        total_input_tokens: row.get(8)?,
+        total_output_tokens: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
     })
 }
 
@@ -1096,18 +1219,20 @@ fn context_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Context
 }
 
 fn session_input_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionInputRecord> {
-    let delivery: String = row.get(3)?;
-    let resume: i64 = row.get(4)?;
+    let attachments_json: String = row.get(3)?;
+    let delivery: String = row.get(4)?;
+    let resume: i64 = row.get(5)?;
     Ok(SessionInputRecord {
         id: row.get(0)?,
         session_id: row.get(1)?,
         prompt: row.get(2)?,
+        attachments: serde_json::from_str(&attachments_json).unwrap_or_default(),
         delivery: SessionInputDelivery::from_str(&delivery).unwrap_or(SessionInputDelivery::Queue),
         resume: resume != 0,
-        status: row.get(5)?,
-        promoted_event_id: row.get(6)?,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
+        status: row.get(6)?,
+        promoted_event_id: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
     })
 }
 
@@ -1203,6 +1328,9 @@ mod tests {
             title: "Test".to_string(),
             status: "active".to_string(),
             shell_mode: ShellMode::Auto,
+            total_cost: 0.0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
             created_at: "1".to_string(),
             updated_at: "1".to_string(),
         };
@@ -1290,6 +1418,7 @@ mod tests {
             Some("input-1".to_string()),
             "s1",
             "hi",
+            &[],
             SessionInputDelivery::Queue,
             true,
         )
@@ -1299,6 +1428,7 @@ mod tests {
             Some("input-1".to_string()),
             "s1",
             "hi",
+            &[],
             SessionInputDelivery::Queue,
             true,
         )
@@ -1306,6 +1436,43 @@ mod tests {
 
         assert_eq!(first.id, second.id);
         assert_eq!(list_session_inputs(&conn, "s1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn public_session_inputs_redact_attachment_content() {
+        let conn = memory_db();
+        conn.execute(
+            "INSERT INTO session (id, project_root, mode, provider_id, title, status, shell_mode, created_at, updated_at)
+             VALUES ('s1', 'E:/oDot', 'agent', 'p1', 'Test', 'auto', 'auto', '1', '1')",
+            [],
+        )
+        .unwrap();
+
+        admit_session_input(
+            &conn,
+            Some("input-1".to_string()),
+            "s1",
+            "hi",
+            &[PromptAttachment {
+                name: "screen.png".to_string(),
+                mime: "image/png".to_string(),
+                size: 42,
+                kind: crate::types::PromptAttachmentKind::Image,
+                content: "data:image/png;base64,abc".to_string(),
+            }],
+            SessionInputDelivery::Queue,
+            true,
+        )
+        .unwrap();
+
+        let private = list_session_inputs(&conn, "s1").unwrap();
+        let public = list_public_session_inputs(&conn, "s1").unwrap();
+        assert_eq!(
+            private[0].attachments[0].content,
+            "data:image/png;base64,abc"
+        );
+        assert_eq!(public[0].attachments[0].content, "");
+        assert_eq!(public[0].attachments[0].name, "screen.png");
     }
 
     #[test]
