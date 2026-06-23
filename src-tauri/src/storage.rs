@@ -1,5 +1,5 @@
 use crate::{
-    provider,
+    event_bus, provider,
     types::{
         AgentMode, BackgroundJobRecord, ContextSummaryRecord, CreateSessionInput, EventRecord,
         PermissionReply, PermissionRequestRecord, PromptAttachment, ProviderInput, ProviderKind,
@@ -533,7 +533,9 @@ pub fn append_event(
     )
     .map_err(|error| error.to_string())?;
 
-    get_event(conn, &id)
+    let event = get_event(conn, &id)?;
+    event_bus::publish_event(&event);
+    Ok(event)
 }
 
 pub fn update_event_data(conn: &Connection, event_id: &str, data: &Value) -> Result<(), String> {

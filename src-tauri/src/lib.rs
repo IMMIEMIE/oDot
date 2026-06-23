@@ -1,4 +1,5 @@
 mod config_file;
+mod event_bus;
 mod llm_runtime;
 mod mutation;
 mod provider;
@@ -9,7 +10,7 @@ mod types;
 mod util;
 mod workspace;
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 use types::{
     ContextSummaryRecord, CreateSessionInput, EventRecord, ProjectFile, PromptSessionInput,
     ProviderConfigFileResponse, ProviderInput, ProviderRecord, ReplyPermissionInput,
@@ -270,6 +271,20 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            event_bus::init();
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut receiver = event_bus::subscribe();
+                loop {
+                    match receiver.recv().await {
+                        Ok(event) => {
+                            let _ = app_handle.emit("odot:event", event);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()

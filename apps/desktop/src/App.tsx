@@ -29,6 +29,7 @@ import {
   Wrench,
   X
 } from "lucide-react";
+import { listen } from "@tauri-apps/api/event";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, PointerEvent, ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
@@ -69,17 +70,14 @@ import {
   type ShellMode,
   type SnapshotRecord
 } from "./api";
+import {
+  EMPTY_SESSION_EVENTS as EMPTY_EVENTS,
+  currentSessionEvents,
+  mergeSessionEvents,
+  type ODotRealtimeEvent,
+  useSessionEventStore
+} from "./sessionStore";
 
-const EMPTY_EVENTS: SessionEventsResponse = {
-  events: [],
-  snapshots: [],
-  summaries: [],
-  inputs: [],
-  runs: [],
-  permissions: [],
-  jobs: []
-};
-const LIVE_REFRESH_INTERVAL_MS = 250;
 const MAX_TEXT_ATTACHMENT_BYTES = 250_000;
 const MAX_IMAGE_ATTACHMENT_BYTES = 5 * 1024 * 1024;
 
@@ -127,8 +125,13 @@ export function App() {
   const [shellPolicy, setShellPolicy] = useState<ShellPolicy>({
     autoAllowlist: []
   });
-  const [eventsResponse, setEventsResponse] =
-    useState<SessionEventsResponse>(EMPTY_EVENTS);
+  const eventsResponse = useSessionEventStore((state) => state.eventsResponse);
+  const setEventsResponse = useSessionEventStore(
+    (state) => state.setEventsResponse
+  );
+  const applyRealtimeEvent = useSessionEventStore(
+    (state) => state.applyRealtimeEvent
+  );
   const [dismissedJobIds, setDismissedJobIds] = useState<Set<string>>(new Set());
   const [streamingEventId, setStreamingEventId] = useState<string | null>(null);
   const [prompt, setPrompt] = useState("");
@@ -157,8 +160,7 @@ export function App() {
   const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
   const modelMenuRef = useRef<HTMLDivElement | null>(null);
-  const liveRefreshTimerRef = useRef<number | undefined>(undefined);
-  const stopRefreshTimerRef = useRef<number | undefined>(undefined);
+  const realtimeTailTimerRef = useRef<number | undefined>(undefined);
   const activeRunIdRef = useRef(0);
   const stopBaselineSeqRef = useRef(0);
   const rollbackInFlightRef = useRef(false);
@@ -173,11 +175,8 @@ export function App() {
   useEffect(() => {
     void bootstrap();
     return () => {
-      if (liveRefreshTimerRef.current) {
-        window.clearInterval(liveRefreshTimerRef.current);
-      }
-      if (stopRefreshTimerRef.current) {
-        window.clearInterval(stopRefreshTimerRef.current);
+      if (realtimeTailTimerRef.current) {
+        window.clearTimeout(realtimeTailTimerRef.current);
       }
     };
   }, []);
@@ -216,6 +215,38 @@ export function App() {
     window.addEventListener("resize", syncRightPaneByViewport);
     return () => window.removeEventListener("resize", syncRightPaneByViewport);
   }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<ODotRealtimeEvent>("odot:event", ({ payload }) => {
+      if (disposed || payload.sessionId !== selectedSessionId) {
+        return;
+      }
+      applyRealtimeEvent(payload);
+      scheduleRealtimeTailRefresh(payload.sessionId);
+      if (
+        payload.event.type === "agent.stopped" &&
+        payload.event.seq > stopBaselineSeqRef.current
+      ) {
+        setIsStopping(false);
+        setNotice({ tone: "success", text: "Agent 已停止" });
+      }
+      if (payload.kind === "session.start" || payload.kind === "task.completed") {
+        void refreshSessions().catch(() => undefined);
+      }
+    }).then((dispose) => {
+      if (disposed) {
+        dispose();
+      } else {
+        unlisten = dispose;
+      }
+    }).catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [selectedSessionId, applyRealtimeEvent]);
 
   const selectedProvider = useMemo(
     () => providers.find((provider) => provider.id === selectedProviderId),
@@ -512,10 +543,20 @@ export function App() {
   }
 
   async function loadEventTail(sessionId: string) {
-    const afterSeq = eventsResponse.events.at(-1)?.seq ?? 0;
+    const afterSeq = currentSessionEvents().events.at(-1)?.seq ?? 0;
     const response = await tailSessionEvents({ sessionId, afterSeq });
     setEventsResponse((current) => mergeSessionEvents(current, response));
     return response;
+  }
+
+  function scheduleRealtimeTailRefresh(sessionId: string) {
+    if (realtimeTailTimerRef.current) {
+      window.clearTimeout(realtimeTailTimerRef.current);
+    }
+    realtimeTailTimerRef.current = window.setTimeout(() => {
+      realtimeTailTimerRef.current = undefined;
+      void loadEventTail(sessionId).catch(() => undefined);
+    }, 100);
   }
 
   async function loadFiles(root = projectRoot) {
@@ -648,9 +689,6 @@ export function App() {
     try {
       const session = await ensureSession();
       const previousMaxSeq = eventsResponse.events.at(-1)?.seq ?? 0;
-      liveRefreshTimerRef.current = window.setInterval(() => {
-        void loadEventTail(session.id).catch(() => undefined);
-      }, LIVE_REFRESH_INTERVAL_MS);
       const selectedFileText = Array.from(selectedPaths).sort().join("\n");
       const finalPrompt = selectedFileText
         ? `${prompt.trim() || "请根据附件内容继续。"}\n\n已选择文件:\n${selectedFileText}`
@@ -692,10 +730,6 @@ export function App() {
       }
     } finally {
       if (activeRunIdRef.current === runId) {
-        if (liveRefreshTimerRef.current) {
-          window.clearInterval(liveRefreshTimerRef.current);
-          liveRefreshTimerRef.current = undefined;
-        }
         setIsSubmitting(false);
       }
     }
@@ -728,10 +762,6 @@ export function App() {
         )
       );
 
-      liveRefreshTimerRef.current = window.setInterval(() => {
-        void loadEventTail(executionSession.id).catch(() => undefined);
-      }, LIVE_REFRESH_INTERVAL_MS);
-
       const response = await promptSession({
         sessionId: executionSession.id,
         prompt: buildPlanExecutionPrompt(planText),
@@ -760,10 +790,6 @@ export function App() {
       reportError(error);
     } finally {
       if (activeRunIdRef.current === runId) {
-        if (liveRefreshTimerRef.current) {
-          window.clearInterval(liveRefreshTimerRef.current);
-          liveRefreshTimerRef.current = undefined;
-        }
         setIsSubmitting(false);
       }
     }
@@ -774,14 +800,6 @@ export function App() {
     const baselineSeq = eventsResponse.events.at(-1)?.seq ?? 0;
     stopBaselineSeqRef.current = baselineSeq;
     activeRunIdRef.current += 1;
-    if (liveRefreshTimerRef.current) {
-      window.clearInterval(liveRefreshTimerRef.current);
-      liveRefreshTimerRef.current = undefined;
-    }
-    if (stopRefreshTimerRef.current) {
-      window.clearInterval(stopRefreshTimerRef.current);
-      stopRefreshTimerRef.current = undefined;
-    }
     setIsSubmitting(false);
     setIsContinuing(false);
     setIsStopping(true);
@@ -792,26 +810,15 @@ export function App() {
     }
     try {
       await cancelSession(sessionId);
-      stopRefreshTimerRef.current = window.setInterval(() => {
-        void getSessionEvents(sessionId)
-          .then((response) => {
-            setEventsResponse(response);
-            const stopped = response.events.some(
-              (event) =>
-                event.type === "agent.stopped" &&
-                event.seq > stopBaselineSeqRef.current
-            );
-            if (stopped) {
-              if (stopRefreshTimerRef.current) {
-                window.clearInterval(stopRefreshTimerRef.current);
-                stopRefreshTimerRef.current = undefined;
-              }
-              setIsStopping(false);
-              setNotice({ tone: "success", text: "Agent 已停止" });
-            }
-          })
-          .catch(() => undefined);
-      }, 700);
+      const response = await loadEventTail(sessionId);
+      const stopped = response.events.some(
+        (event) =>
+          event.type === "agent.stopped" && event.seq > stopBaselineSeqRef.current
+      );
+      if (stopped) {
+        setIsStopping(false);
+        setNotice({ tone: "success", text: "Agent 已停止" });
+      }
     } catch (error) {
       setIsStopping(false);
       reportError(error);
@@ -828,9 +835,6 @@ export function App() {
       const sessionId = selectedSessionId;
       await approveToolCall(eventId);
       if (sessionId) {
-        liveRefreshTimerRef.current = window.setInterval(() => {
-          void loadEventTail(sessionId).catch(() => undefined);
-        }, LIVE_REFRESH_INTERVAL_MS);
         const response = await continueSession(sessionId);
         if (activeRunIdRef.current !== runId) {
           return;
@@ -853,10 +857,6 @@ export function App() {
       reportError(error);
     } finally {
       if (activeRunIdRef.current === runId) {
-        if (liveRefreshTimerRef.current) {
-          window.clearInterval(liveRefreshTimerRef.current);
-          liveRefreshTimerRef.current = undefined;
-        }
         setIsContinuing(false);
         setIsMutating(false);
       }
@@ -3634,25 +3634,6 @@ function hasUnresolvedPendingTools(events: EventRecord[]) {
   return events.some(
     (event) => event.type === "tool.pending" && !resolved.has(event.id)
   );
-}
-
-function mergeSessionEvents(
-  current: SessionEventsResponse,
-  incoming: SessionEventsResponse
-): SessionEventsResponse {
-  const byId = new Map(current.events.map((event) => [event.id, event]));
-  for (const event of incoming.events) {
-    byId.set(event.id, event);
-  }
-  return {
-    events: Array.from(byId.values()).sort((a, b) => a.seq - b.seq),
-    snapshots: incoming.snapshots.length ? incoming.snapshots : current.snapshots,
-    summaries: incoming.summaries.length ? incoming.summaries : current.summaries,
-    inputs: incoming.inputs ?? current.inputs,
-    runs: incoming.runs ?? current.runs,
-    permissions: incoming.permissions ?? current.permissions,
-    jobs: incoming.jobs ?? current.jobs
-  };
 }
 
 function valueAsString(value: unknown) {
