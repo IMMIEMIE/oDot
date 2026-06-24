@@ -231,7 +231,7 @@ textarea:focus {
 
 .projectSection {
   min-height: 180px;
-  flex: 1.2;
+  flex: 1;
   grid-template-rows: auto auto auto minmax(0, 1fr);
 }
 
@@ -254,6 +254,12 @@ textarea:focus {
   justify-content: space-between;
   gap: 8px;
   min-width: 0;
+}
+
+.sectionActions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .configPath {
@@ -792,6 +798,11 @@ textarea:focus {
   gap: 10px;
 }
 
+.timelineItem.reasoning {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+}
+
 .timelineItemRail {
   position: relative;
   display: grid;
@@ -869,13 +880,18 @@ textarea:focus {
   background: var(--surface);
 }
 
-.timelineItem.reasoning .timelineItemBody,
 .timelineItem.statusSummary .timelineItemBody,
 .timelineItem.hiddenDetail .timelineItemBody {
-  padding: 10px 11px;
+  padding: 8px 10px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--surface-soft);
+}
+
+.timelineItem.reasoning .timelineItemBody {
+  padding: 0;
+  border: 0;
+  background: transparent;
 }
 
 .timelineItemHeader {
@@ -1020,8 +1036,62 @@ textarea:focus {
   white-space: pre-wrap;
 }
 
+.reasoningBlock {
+  min-width: 0;
+  color: var(--muted);
+}
+
+.reasoningBlock summary {
+  width: 100%;
+  min-height: 24px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 650;
+  list-style: none;
+  user-select: none;
+}
+
+.reasoningBlock summary:hover {
+  color: var(--text-soft);
+}
+
+.reasoningBlock summary::-webkit-details-marker {
+  display: none;
+}
+
+.reasoningBlock summary svg {
+  flex: 0 0 auto;
+}
+
+.reasoningBlock .reasoningOpenIcon {
+  display: none;
+}
+
+.reasoningBlock[open] .reasoningClosedIcon {
+  display: none;
+}
+
+.reasoningBlock[open] .reasoningOpenIcon {
+  display: block;
+}
+
 .reasoningBlock .markdownFrame {
+  margin-top: 6px;
+  padding: 8px 0 0 21px;
   color: #52606d;
+  font-size: 12px;
+}
+
+.reasoningBlock .markdownBody {
+  gap: 6px;
+  line-height: 1.45;
 }
 
 pre {
@@ -1055,6 +1125,66 @@ pre {
 .hiddenDetails {
   display: grid;
   gap: 7px;
+}
+
+.errorRecoveryCard {
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid rgba(189, 58, 45, 0.25);
+  border-radius: 8px;
+  background: rgba(189, 58, 45, 0.06);
+}
+
+.errorRecoveryMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.errorRecoveryMeta span {
+  min-height: 22px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 8px;
+  border-radius: 999px;
+  color: #7a2a22;
+  background: rgba(189, 58, 45, 0.1);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.errorCauseChain {
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.errorCauseChain summary {
+  min-height: 24px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  color: #7a2a22;
+  font-weight: 750;
+  list-style: none;
+}
+
+.errorCauseChain summary::-webkit-details-marker {
+  display: none;
+}
+
+.errorCauseChain ol {
+  margin: 6px 0 0;
+  padding-left: 22px;
+  display: grid;
+  gap: 5px;
+}
+
+.errorRecoveryActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .detailsToggle {
@@ -1845,6 +1975,30 @@ pre {
   box-shadow: 0 24px 60px rgba(17, 24, 39, 0.28);
 }
 
+.sessionsModal {
+  width: min(560px, calc(100vw - 44px));
+}
+
+.sessionsModalBody {
+  min-height: 0;
+  overflow: hidden;
+  padding: 14px;
+  display: grid;
+  grid-template-rows: 38px minmax(0, 1fr);
+  gap: 12px;
+}
+
+.sessionsModalBody > .commandButton {
+  height: 38px;
+  min-height: 38px;
+}
+
+.sessionManagerList {
+  align-content: start;
+  min-height: 260px;
+  padding-right: 2px;
+}
+
 .modalHeader,
 .modalFooter {
   display: flex;
@@ -2089,6 +2243,20 @@ pre {
   color: #f0a8a0;
   background: rgba(189, 58, 45, 0.12);
   border-color: rgba(189, 58, 45, 0.35);
+}
+
+:root[data-theme="dark"] .errorRecoveryCard {
+  border-color: rgba(240, 112, 101, 0.28);
+  background: rgba(189, 58, 45, 0.1);
+}
+
+:root[data-theme="dark"] .errorRecoveryMeta span {
+  color: #f0a8a0;
+  background: rgba(240, 112, 101, 0.12);
+}
+
+:root[data-theme="dark"] .errorCauseChain summary {
+  color: #f0a8a0;
 }
 
 .settingsJsonEditor {

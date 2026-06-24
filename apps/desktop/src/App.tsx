@@ -15,6 +15,7 @@ import {
   History,
   KeyRound,
   Loader2,
+  MessageSquare,
   Pencil,
   Plus,
   Play,
@@ -31,7 +32,12 @@ import {
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { ChangeEvent, PointerEvent, ReactNode } from "react";
+import type {
+  ChangeEvent,
+  ClipboardEvent as ReactClipboardEvent,
+  PointerEvent,
+  ReactNode
+} from "react";
 import ReactMarkdown from "react-markdown";
 import {
   approveToolCall,
@@ -149,6 +155,7 @@ export function App() {
   const [isStopping, setIsStopping] = useState(false);
   const [isMutating, setIsMutating] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isSessionsOpen, setIsSessionsOpen] = useState(false);
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
   const [editingSessionTitle, setEditingSessionTitle] = useState("");
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
@@ -157,6 +164,7 @@ export function App() {
   });
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
   const timelineScrollRef = useRef<HTMLDivElement | null>(null);
+  const shouldStickToTimelineBottomRef = useRef(true);
   const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
   const modelMenuRef = useRef<HTMLDivElement | null>(null);
@@ -405,8 +413,20 @@ export function App() {
   const isPromptLocked = isAgentWorking || isStopping || pendingToolEvents.length > 0;
 
   useLayoutEffect(() => {
-    timelineEndRef.current?.scrollIntoView({ block: "end" });
+    if (shouldStickToTimelineBottomRef.current) {
+      timelineEndRef.current?.scrollIntoView({ block: "end" });
+    }
   }, [latestEventId, streamingEventId]);
+
+  function handleTimelineScroll() {
+    const timeline = timelineScrollRef.current;
+    if (!timeline) {
+      return;
+    }
+    const distanceFromBottom =
+      timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight;
+    shouldStickToTimelineBottomRef.current = distanceFromBottom < 36;
+  }
 
   useLayoutEffect(() => {
     const input = promptInputRef.current;
@@ -688,9 +708,20 @@ export function App() {
     if (!selectedFiles.length) {
       return;
     }
+    await addPromptAttachments(selectedFiles);
+  }
+
+  async function addPromptAttachments(files: File[]) {
+    if (!files.length) {
+      return;
+    }
+    if (!selectedProviderId || !canUploadAttachments) {
+      setNotice({ tone: "error", text: "当前模型不支持附件上传" });
+      return;
+    }
     try {
       const nextAttachments = await Promise.all(
-        selectedFiles.map((file) => readPromptAttachment(file, allowedAttachmentKinds))
+        files.map((file) => readPromptAttachment(file, allowedAttachmentKinds))
       );
       setPromptAttachments((current) => [...current, ...nextAttachments]);
       setNotice({
@@ -700,6 +731,18 @@ export function App() {
     } catch (error) {
       reportError(error);
     }
+  }
+
+  function handlePromptPaste(event: ReactClipboardEvent<HTMLTextAreaElement>) {
+    if (isPromptLocked) {
+      return;
+    }
+    const files = clipboardFiles(event.clipboardData);
+    if (!files.length) {
+      return;
+    }
+    event.preventDefault();
+    void addPromptAttachments(files);
   }
 
   function removePromptAttachment(id: string) {
@@ -712,6 +755,7 @@ export function App() {
     if ((!prompt.trim() && !promptAttachments.length) || isPromptLocked) {
       return;
     }
+    shouldStickToTimelineBottomRef.current = true;
     const runId = activeRunIdRef.current + 1;
     activeRunIdRef.current = runId;
     setIsSubmitting(true);
@@ -769,6 +813,7 @@ export function App() {
     if (!selectedSession || isPromptLocked) {
       return;
     }
+    shouldStickToTimelineBottomRef.current = true;
 
     const planText = valueAsString(planEvent.data.text).trim();
     if (!planText) {
@@ -855,6 +900,7 @@ export function App() {
   }
 
   async function handleApprove(eventId: string) {
+    shouldStickToTimelineBottomRef.current = true;
     const runId = activeRunIdRef.current + 1;
     activeRunIdRef.current = runId;
     setIsMutating(true);
@@ -1032,6 +1078,61 @@ export function App() {
     }
   }
 
+  async function handleRecoverAgent(actionId: string) {
+    if (actionId === "settings") {
+      setIsSettingsOpen(true);
+      return;
+    }
+    if (!selectedSessionId || isPromptLocked) {
+      return;
+    }
+    shouldStickToTimelineBottomRef.current = true;
+    const runId = activeRunIdRef.current + 1;
+    activeRunIdRef.current = runId;
+    setIsContinuing(true);
+    setIsMutating(true);
+    setNotice({
+      tone: "info",
+      text: actionId === "retry" ? "正在重试" : "Agent 正在继续"
+    });
+    try {
+      if (actionId === "compact") {
+        const summary = await compactSession(selectedSessionId);
+        applyRealtimeEvent({
+          version: 1,
+          kind: "context.summary.created",
+          sessionId: summary.sessionId,
+          seq: summary.recentEventSeq,
+          summary
+        });
+        scheduleRealtimeTailRefresh(selectedSessionId);
+      }
+      const response = await continueSession(selectedSessionId);
+      if (activeRunIdRef.current !== runId) {
+        return;
+      }
+      setEventsResponse(response);
+      await refreshSessions();
+      setNotice({
+        tone: "success",
+        text: hasUnresolvedPendingTools(response.events)
+          ? "等待命令确认"
+          : "Agent 已结束"
+      });
+    } catch (error) {
+      if (activeRunIdRef.current !== runId) {
+        return;
+      }
+      reportError(error);
+      await loadEvents(selectedSessionId).catch(() => undefined);
+    } finally {
+      if (activeRunIdRef.current === runId) {
+        setIsContinuing(false);
+        setIsMutating(false);
+      }
+    }
+  }
+
   function scrollToPrompt(direction: "previous" | "next") {
     const container = timelineScrollRef.current;
     if (!container) {
@@ -1170,6 +1271,95 @@ export function App() {
     window.addEventListener("pointerup", onUp);
   }
 
+  function renderSessionManager() {
+    return (
+      <>
+        <button
+          className="commandButton"
+          disabled={
+            isCreatingSession ||
+            isAgentWorking ||
+            !selectedProviderId ||
+            !projectRoot.trim()
+          }
+          onClick={() =>
+            void createCurrentSession()
+              .then(() => setIsSessionsOpen(false))
+              .catch(() => undefined)
+          }
+        >
+          {isCreatingSession ? <Loader2 className="spin" size={16} /> : <Play size={16} />}
+          新建会话
+        </button>
+        <div className="stackList sessionManagerList">
+          {orderedSessions.map((session) => (
+            <div
+              key={session.id}
+              className={`listRow ${
+                session.id === selectedSessionId ? "active" : ""
+              } ${session.parentSessionId ? "childSession" : ""}`}
+            >
+              {session.parentSessionId ? <Bot size={15} /> : <Clock3 size={15} />}
+              {editingSessionId === session.id ? (
+                <input
+                  className="sessionTitleInput"
+                  value={editingSessionTitle}
+                  autoFocus
+                  onChange={(event) => setEditingSessionTitle(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      void saveSessionTitle(session.id);
+                    }
+                    if (event.key === "Escape") {
+                      cancelEditingSession();
+                    }
+                  }}
+                  onBlur={() => void saveSessionTitle(session.id)}
+                />
+              ) : (
+                <button
+                  type="button"
+                  className="sessionSelectButton"
+                  disabled={isAgentWorking}
+                  onClick={() =>
+                    void selectSession(session).then(() => setIsSessionsOpen(false))
+                  }
+                  onDoubleClick={() => startEditingSession(session)}
+                >
+                  <strong>{session.title}</strong>
+                  <small>
+                    {session.parentSessionId ? "子 Agent" : modeLabel(session.mode)} /{" "}
+                    {shellModeLabel(session.shellMode)}
+                  </small>
+                </button>
+              )}
+              <button
+                type="button"
+                className="rowIconAction"
+                aria-label={`重命名会话 ${session.title}`}
+                disabled={editingSessionId === session.id || isMutating || isAgentWorking}
+                onClick={() => startEditingSession(session)}
+              >
+                <Pencil size={14} />
+              </button>
+              <button
+                type="button"
+                className="rowIconAction danger"
+                aria-label={`删除会话 ${session.title}`}
+                disabled={isMutating || isAgentWorking}
+                onClick={() => void handleDeleteSession(session.id)}
+              >
+                <Trash2 size={14} />
+              </button>
+            </div>
+          ))}
+          {!availableSessions.length && <EmptyLine text="暂无可用会话" />}
+        </div>
+      </>
+    );
+  }
+
   return (
     <div
       className="appShell"
@@ -1191,13 +1381,24 @@ export function App() {
         <section className="leftSection providerConfigSection">
           <div className="sectionTitleRow">
             <SectionTitle icon={<KeyRound size={16} />} title="AI 服务" />
-            <button
-              className="iconButton ghost"
-              aria-label="打开 AI 服务设置"
-              onClick={() => setIsSettingsOpen(true)}
-            >
-              <Settings size={16} />
-            </button>
+            <div className="sectionActions">
+              <button
+                className="iconButton ghost"
+                aria-label="管理会话"
+                title="管理会话"
+                onClick={() => setIsSessionsOpen(true)}
+              >
+                <MessageSquare size={16} />
+              </button>
+              <button
+                className="iconButton ghost"
+                aria-label="打开 AI 服务设置"
+                title="打开 AI 服务设置"
+                onClick={() => setIsSettingsOpen(true)}
+              >
+                <Settings size={16} />
+              </button>
+            </div>
           </div>
         </section>
 
@@ -1245,85 +1446,6 @@ export function App() {
           </div>
         </section>
 
-        <section className="leftSection sessionsSection">
-          <SectionTitle icon={<History size={16} />} title="会话" />
-          <button
-            className="commandButton"
-            disabled={
-              isCreatingSession ||
-              isAgentWorking ||
-              !selectedProviderId ||
-              !projectRoot.trim()
-            }
-            onClick={() => void createCurrentSession().catch(() => undefined)}
-          >
-            {isCreatingSession ? <Loader2 className="spin" size={16} /> : <Play size={16} />}
-            新建会话
-          </button>
-          <div className="stackList">
-            {orderedSessions.map((session) => (
-              <div
-                key={session.id}
-                className={`listRow ${
-                  session.id === selectedSessionId ? "active" : ""
-                } ${session.parentSessionId ? "childSession" : ""}`}
-              >
-                {session.parentSessionId ? <Bot size={15} /> : <Clock3 size={15} />}
-                {editingSessionId === session.id ? (
-                  <input
-                    className="sessionTitleInput"
-                    value={editingSessionTitle}
-                    autoFocus
-                    onChange={(event) => setEditingSessionTitle(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") {
-                        event.preventDefault();
-                        void saveSessionTitle(session.id);
-                      }
-                      if (event.key === "Escape") {
-                        cancelEditingSession();
-                      }
-                    }}
-                    onBlur={() => void saveSessionTitle(session.id)}
-                  />
-                ) : (
-                  <button
-                    type="button"
-                    className="sessionSelectButton"
-                    disabled={isAgentWorking}
-                    onClick={() => void selectSession(session)}
-                    onDoubleClick={() => startEditingSession(session)}
-                  >
-                    <strong>{session.title}</strong>
-                    <small>
-                      {session.parentSessionId ? "子 Agent" : modeLabel(session.mode)} /{" "}
-                      {shellModeLabel(session.shellMode)}
-                    </small>
-                  </button>
-                )}
-                <button
-                  type="button"
-                  className="rowIconAction"
-                  aria-label={`重命名会话 ${session.title}`}
-                  disabled={editingSessionId === session.id || isMutating || isAgentWorking}
-                  onClick={() => startEditingSession(session)}
-                >
-                  <Pencil size={14} />
-                </button>
-                <button
-                  type="button"
-                  className="rowIconAction danger"
-                  aria-label={`删除会话 ${session.title}`}
-                  disabled={isMutating || isAgentWorking}
-                  onClick={() => void handleDeleteSession(session.id)}
-                >
-                  <Trash2 size={14} />
-                </button>
-              </div>
-            ))}
-            {!availableSessions.length && <EmptyLine text="暂无可用会话" />}
-          </div>
-        </section>
       </aside>
 
       <div
@@ -1391,7 +1513,7 @@ export function App() {
             </button>
           </div>
 
-          <div className="timeline" ref={timelineScrollRef}>
+          <div className="timeline" ref={timelineScrollRef} onScroll={handleTimelineScroll}>
             <ConversationTimeline
               events={eventsResponse.events}
               snapshots={eventsResponse.snapshots}
@@ -1404,6 +1526,7 @@ export function App() {
               onRollbackSnapshots={(snapshotIds, successText) =>
                 void handleRollbackMany(snapshotIds, successText ?? "已回滚到提示词发送前")
               }
+              onRecoverAgent={handleRecoverAgent}
             />
             {!eventsResponse.events.length && (
               <div className="emptyTimeline">
@@ -1438,6 +1561,7 @@ export function App() {
                 value={prompt}
                 disabled={isPromptLocked}
                 onChange={(event) => setPrompt(event.target.value)}
+                onPaste={handlePromptPaste}
                 placeholder={
                   isAgentWorking
                     ? "Agent 正在工作，结束后才能继续发送。"
@@ -1756,6 +1880,44 @@ export function App() {
           onSave={saveSettings}
         />
       )}
+      {isSessionsOpen && (
+        <SessionsModal
+          sessionCount={availableSessions.length}
+          onClose={() => {
+            cancelEditingSession();
+            setIsSessionsOpen(false);
+          }}
+        >
+          {renderSessionManager()}
+        </SessionsModal>
+      )}
+    </div>
+  );
+}
+
+function SessionsModal({
+  children,
+  sessionCount,
+  onClose
+}: {
+  children: ReactNode;
+  sessionCount: number;
+  onClose: () => void;
+}) {
+  return (
+    <div className="modalBackdrop" role="presentation">
+      <section className="settingsModal sessionsModal" role="dialog" aria-modal="true">
+        <header className="modalHeader">
+          <div>
+            <strong>会话管理</strong>
+            <small>{sessionCount ? `${sessionCount} 个可用会话` : "暂无可用会话"}</small>
+          </div>
+          <button className="iconButton ghost" onClick={onClose} aria-label="关闭会话管理">
+            <X size={16} />
+          </button>
+        </header>
+        <div className="sessionsModalBody">{children}</div>
+      </section>
     </div>
   );
 }
@@ -2067,6 +2229,22 @@ type TimelineCodeChangeGroup = {
   rollbackSnapshotIds: string[];
 };
 
+type RecoveryAction = {
+  id: string;
+  label: string;
+  description?: string;
+};
+
+type TimelineErrorInfo = {
+  id?: string;
+  kind: string;
+  message: string;
+  causes: string[];
+  retryable: boolean;
+  recoverable: boolean;
+  suggestedActions: RecoveryAction[];
+};
+
 type TimelineItem = {
   id: string;
   kind: TimelineItemKind;
@@ -2077,6 +2255,7 @@ type TimelineItem = {
   event?: EventRecord;
   details: EventRecord[];
   hiddenSummary?: string;
+  errorInfo?: TimelineErrorInfo;
   codeChange?: TimelineCodeChange;
   codeChangeGroup?: TimelineCodeChangeGroup;
   rollbackSnapshotIds?: string[];
@@ -2152,7 +2331,8 @@ function ConversationTimeline({
   onExecutePlan,
   rollbackDisabled,
   onRollbackSnapshot,
-  onRollbackSnapshots
+  onRollbackSnapshots,
+  onRecoverAgent
 }: {
   events: EventRecord[];
   snapshots: SnapshotRecord[];
@@ -2163,6 +2343,7 @@ function ConversationTimeline({
   rollbackDisabled: boolean;
   onRollbackSnapshot: (snapshotId: string) => void;
   onRollbackSnapshots: (snapshotIds: string[], successText?: string) => void;
+  onRecoverAgent: (actionId: string) => Promise<void>;
 }) {
   const items = useMemo(
     () => buildTimelineItems(events, snapshots),
@@ -2185,6 +2366,7 @@ function ConversationTimeline({
           rollbackDisabled={rollbackDisabled}
           onRollbackSnapshot={onRollbackSnapshot}
           onRollbackSnapshots={onRollbackSnapshots}
+          onRecoverAgent={onRecoverAgent}
         />
       ))}
     </>
@@ -2198,7 +2380,8 @@ function TimelineItemView({
   onExecutePlan,
   rollbackDisabled,
   onRollbackSnapshot,
-  onRollbackSnapshots
+  onRollbackSnapshots,
+  onRecoverAgent
 }: {
   item: TimelineItem;
   stream: boolean;
@@ -2207,23 +2390,29 @@ function TimelineItemView({
   rollbackDisabled: boolean;
   onRollbackSnapshot: (snapshotId: string) => void;
   onRollbackSnapshots: (snapshotIds: string[], successText?: string) => void;
+  onRecoverAgent: (actionId: string) => Promise<void>;
 }) {
   const hiddenDetails = item.details.filter((event) => event.id !== item.event?.id);
   const icon = timelineItemIcon(item);
+  const isReasoningItem = item.kind === "reasoning";
 
   return (
     <article
       className={`timelineItem ${item.kind} ${item.status}`}
       data-prompt-block={item.kind === "userPrompt" ? "true" : undefined}
     >
-      <div className="timelineItemRail">
-        <div className="timelineItemIcon">{icon}</div>
-      </div>
+      {!isReasoningItem && (
+        <div className="timelineItemRail">
+          <div className="timelineItemIcon">{icon}</div>
+        </div>
+      )}
       <div className="timelineItemBody">
-        <header className="timelineItemHeader">
-          <strong>{item.title}</strong>
-          {item.event && <span>#{item.event.seq}</span>}
-        </header>
+        {!isReasoningItem && (
+          <header className="timelineItemHeader">
+            <strong>{item.title}</strong>
+            {item.event && <span>#{item.event.seq}</span>}
+          </header>
+        )}
 
         {item.kind === "userPrompt" && (
           <>
@@ -2272,9 +2461,15 @@ function TimelineItemView({
         )}
 
         {item.kind === "reasoning" && (
-          <div className="reasoningBlock">
+          <details className="reasoningBlock">
+            <summary>
+              <BrainCircuit size={15} />
+              <span>思考...</span>
+              <ChevronRight size={13} className="reasoningClosedIcon" />
+              <ChevronDown size={13} className="reasoningOpenIcon" />
+            </summary>
             <MarkdownText text={item.text ?? ""} />
-          </div>
+          </details>
         )}
 
         {item.kind === "codeChange" && item.codeChange && (
@@ -2298,15 +2493,86 @@ function TimelineItemView({
           <p className="statusText">{item.text}</p>
         )}
 
-        {item.hiddenSummary && (
+        {item.errorInfo && (
+          <ErrorRecoveryCard
+            error={item.errorInfo}
+            disabled={rollbackDisabled}
+            onRecover={onRecoverAgent}
+          />
+        )}
+
+        {!isReasoningItem && item.hiddenSummary && (
           <div className="hiddenSummary">
             <Wrench size={13} />
             <span>{item.hiddenSummary}</span>
           </div>
         )}
-        <HiddenDetails events={hiddenDetails} />
+        {!isReasoningItem && <HiddenDetails events={hiddenDetails} />}
       </div>
     </article>
+  );
+}
+
+function ErrorRecoveryCard({
+  error,
+  disabled,
+  onRecover
+}: {
+  error: TimelineErrorInfo;
+  disabled: boolean;
+  onRecover: (actionId: string) => Promise<void>;
+}) {
+  const actions = error.suggestedActions.length
+    ? error.suggestedActions
+    : [
+        {
+          id: "continue",
+          label: "继续",
+          description: "保留当前上下文，让 Agent 根据最近错误继续修复。"
+        }
+      ];
+  return (
+    <div className="errorRecoveryCard">
+      <div className="errorRecoveryMeta">
+        <span>{errorKindLabel(error.kind)}</span>
+        <span>{error.retryable ? "可重试" : "需处理后继续"}</span>
+        <span>{error.recoverable ? "可恢复" : "不可自动恢复"}</span>
+      </div>
+      {error.causes.length > 0 && (
+        <details className="errorCauseChain">
+          <summary>
+            <ChevronRight size={13} />
+            错误链
+          </summary>
+          <ol>
+            {error.causes.map((cause, index) => (
+              <li key={`${error.id ?? error.message}-${index}`}>{cause}</li>
+            ))}
+          </ol>
+        </details>
+      )}
+      <div className="errorRecoveryActions">
+        {actions.map((action) => (
+          <button
+            type="button"
+            className="iconTextButton"
+            key={action.id}
+            disabled={disabled}
+            title={action.description}
+            onClick={() => void onRecover(action.id)}
+          >
+            {action.id === "settings" ? (
+              <Settings size={15} />
+            ) : action.id === "compact" ? (
+              <Database size={15} />
+            ) : (
+              <RefreshCw size={15} />
+            )}
+            {action.label}
+          </button>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -3248,6 +3514,19 @@ function statusItemForEvent(event: EventRecord): TimelineItem | null {
       details: [event]
     };
   }
+  if (event.type === "agent.failed") {
+    const errorInfo = timelineErrorInfo(event);
+    return {
+      id: event.id,
+      kind: "statusSummary",
+      title: "运行失败",
+      text: errorInfo.message || valueAsString(event.data.message) || eventLabel(event),
+      status: "failed",
+      event,
+      details: [event],
+      errorInfo
+    };
+  }
   if (event.type === "agent.cancelRequested" || event.type === "agent.stopped") {
     return {
       id: event.id,
@@ -3273,6 +3552,64 @@ function eventFailureText(event: EventRecord) {
     valueAsString(result.stdout) ||
     "工具执行失败"
   );
+}
+
+function timelineErrorInfo(event: EventRecord): TimelineErrorInfo {
+  const error = asRecord(event.data.error);
+  const actions = Array.isArray(error.suggestedActions)
+    ? error.suggestedActions
+        .map(recoveryActionFromValue)
+        .filter((action): action is RecoveryAction => Boolean(action))
+    : [];
+  return {
+    id: valueAsString(error.id),
+    kind: valueAsString(error.kind) || "unknown",
+    message:
+      valueAsString(error.message) ||
+      valueAsString(event.data.message) ||
+      eventFailureText(event),
+    causes: stringArray(error.causes),
+    retryable: Boolean(error.retryable),
+    recoverable: Boolean(error.recoverable),
+    suggestedActions: actions
+  };
+}
+
+function recoveryActionFromValue(value: unknown): RecoveryAction | null {
+  const record = asRecord(value);
+  const id = valueAsString(record.id);
+  const label = valueAsString(record.label);
+  if (!id || !label) {
+    return null;
+  }
+  return {
+    id,
+    label,
+    description: valueAsString(record.description)
+  };
+}
+
+function stringArray(value: unknown) {
+  return Array.isArray(value)
+    ? value.map((item) => valueAsString(item)).filter(Boolean)
+    : [];
+}
+
+function errorKindLabel(kind: string) {
+  const labels: Record<string, string> = {
+    network: "网络错误",
+    provider: "服务错误",
+    authentication: "鉴权错误",
+    rateLimit: "限流错误",
+    contextLimit: "上下文超限",
+    modelResponse: "模型响应错误",
+    toolExecution: "工具执行错误",
+    permission: "权限错误",
+    storage: "存储错误",
+    cancelled: "已中断",
+    unknown: "未知错误"
+  };
+  return labels[kind] ?? kind;
 }
 
 function summarizeHiddenEvents(events: EventRecord[], primaryEventId = "") {
@@ -3608,6 +3945,7 @@ function eventLabel(event: EventRecord) {
     "step.started": "步骤开始",
     "step.ended": "步骤结束",
     "step.failed": "步骤失败",
+    "llm.retry": "模型请求重试",
     "llm.stream.started": "模型流开始",
     "llm.stream.finished": "模型流结束",
     "reasoning.summary": "过程摘要",
@@ -3625,6 +3963,7 @@ function eventLabel(event: EventRecord) {
     "policy.blocked": "策略拦截",
     "agent.cancelRequested": "请求停止",
     "agent.stopped": "Agent 已停止",
+    "agent.failed": "Agent 失败",
     "rollback.applied": "已回滚",
     "context.compacted": "上下文压缩"
   };
@@ -4256,6 +4595,24 @@ function attachmentUploadTitle(kinds: PromptAttachmentKind[]) {
   }
   const labels = kinds.map((kind) => (kind === "image" ? "图片" : "文本文件"));
   return `上传附件，可选类型：${labels.join("、")}`;
+}
+
+function clipboardFiles(data: DataTransfer): File[] {
+  const byKey = new Map<string, File>();
+  for (const file of Array.from(data.files)) {
+    byKey.set(`${file.name}:${file.size}:${file.type}`, file);
+  }
+  for (const item of Array.from(data.items)) {
+    if (item.kind !== "file") {
+      continue;
+    }
+    const file = item.getAsFile();
+    if (!file) {
+      continue;
+    }
+    byKey.set(`${file.name}:${file.size}:${file.type}`, file);
+  }
+  return Array.from(byKey.values());
 }
 
 async function readPromptAttachment(

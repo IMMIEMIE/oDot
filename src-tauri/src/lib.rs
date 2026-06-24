@@ -1,4 +1,5 @@
 mod config_file;
+mod error_model;
 mod event_bus;
 mod llm_runtime;
 mod mutation;

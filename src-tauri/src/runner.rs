@@ -1,5 +1,6 @@
 use crate::{
     config_file,
+    error_model::AppErrorInfo,
     llm_runtime::{sanitize_assistant_content, LlmStreamEvent},
     provider, storage, tools,
     types::{
@@ -18,6 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::AppHandle;
+use tokio::time::sleep;
 
 const MAX_STEPS: usize = 25;
 const MAX_CONTEXT_EVENT_LIMIT: usize = 2_000;
@@ -29,6 +31,8 @@ const DEFAULT_OUTPUT_TOKEN_LIMIT: u64 = 4_096;
 const TOOL_RESULT_REPLAY_CHAR_LIMIT: usize = 40_000;
 const STREAM_DELTA_FLUSH_CHARS: usize = 96;
 const STREAM_DELTA_FLUSH_MS: u64 = 120;
+const LLM_RETRY_ATTEMPTS: usize = 3;
+const LLM_RETRY_BASE_DELAY_MS: u64 = 350;
 const COMPACTION_PROMPT: &str = r#"请对以下对话历史生成结构化摘要，包含以下部分：
 - Goal: 用户的核心目标
 - Constraints: 已确认的约束和限制
@@ -103,13 +107,17 @@ pub async fn continue_session(
 ) -> Result<SessionEventsResponse, String> {
     let session = storage::get_session(conn, &session_id)?;
     storage::set_session_status(conn, &session.id, "active")?;
-    run_session_steps(
+    let result = run_session_steps(
         app,
         conn,
         &session,
         "Continue from the latest tool result. Inspect recent tool success/failure output, then either call the next needed tool or provide the final user-facing answer.",
     )
-    .await
+    .await;
+    if let Err(error) = &result {
+        let _ = record_agent_failure(conn, &session.id, None, error);
+    }
+    result
 }
 
 pub async fn resume_session(
@@ -125,6 +133,9 @@ pub async fn resume_session(
         "failed"
     };
     let _ = storage::end_session_run(conn, &run.id, status);
+    if let Err(error) = &result {
+        let _ = record_agent_failure(conn, &session_id, Some(&run.id), error);
+    }
     result
 }
 
@@ -283,25 +294,33 @@ async fn run_session_steps(
         } else {
             let user_prompt =
                 build_user_prompt(conn, &session.id, current_prompt, &request_config)?;
-            let completion =
-                match provider::complete(&request_config, &system_prompt, &user_prompt).await {
-                    Ok(value) => value,
-                    Err(error) => {
-                        if stop_if_cancelled(conn, &session.id, step_index)? {
-                            break;
-                        }
-                        storage::append_event(
-                            conn,
-                            &session.id,
-                            "step.failed",
-                            json!({
-                                "step": step_index,
-                                "error": error
-                            }),
-                        )?;
-                        return Err(error);
+            let completion = match complete_with_retry(
+                conn,
+                &session.id,
+                step_index,
+                &request_config,
+                &system_prompt,
+                &user_prompt,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    if stop_if_cancelled(conn, &session.id, step_index)? {
+                        break;
                     }
-                };
+                    storage::append_event(
+                        conn,
+                        &session.id,
+                        "step.failed",
+                        json!({
+                            "step": step_index,
+                            "error": error
+                        }),
+                    )?;
+                    return Err(error);
+                }
+            };
             if let Some(turn) = completion.turn {
                 turn
             } else {
@@ -489,6 +508,70 @@ async fn run_session_steps(
     }
 
     Ok(storage::session_events_response(conn, &session.id)?)
+}
+
+async fn complete_with_retry(
+    conn: &Connection,
+    session_id: &str,
+    step_index: usize,
+    request_config: &ProviderRequestConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<provider::ProviderCompletion, String> {
+    let mut last_error = None;
+    for attempt in 1..=LLM_RETRY_ATTEMPTS {
+        match provider::complete(request_config, system_prompt, user_prompt).await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let info = AppErrorInfo::from_message(&error);
+                let can_retry = info.retryable && attempt < LLM_RETRY_ATTEMPTS;
+                storage::append_event(
+                    conn,
+                    session_id,
+                    "llm.retry",
+                    json!({
+                        "step": step_index,
+                        "attempt": attempt,
+                        "maxAttempts": LLM_RETRY_ATTEMPTS,
+                        "retrying": can_retry,
+                        "error": info.to_value()
+                    }),
+                )?;
+                if !can_retry {
+                    return Err(error);
+                }
+                last_error = Some(error);
+                let delay_ms = LLM_RETRY_BASE_DELAY_MS * 2_u64.pow((attempt - 1) as u32);
+                sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "AI 服务请求失败。".to_string()))
+}
+
+fn record_agent_failure(
+    conn: &Connection,
+    session_id: &str,
+    run_id: Option<&str>,
+    error: &str,
+) -> Result<EventRecord, String> {
+    let info = AppErrorInfo::from_message(error);
+    storage::set_session_status(conn, session_id, "failed")?;
+    storage::append_event(
+        conn,
+        session_id,
+        "agent.failed",
+        json!({
+            "runId": run_id,
+            "message": info.message,
+            "error": info.to_value(),
+            "recovery": {
+                "canRetry": info.retryable,
+                "canContinue": info.recoverable,
+                "actions": info.suggested_actions
+            }
+        }),
+    )
 }
 
 async fn execute_turn_tool(
@@ -1206,6 +1289,7 @@ fn build_stream_messages(
         "content": system_prompt
     })];
     let mut included_current_prompt = false;
+    let mut emitted_tool_call_ids = Vec::new();
 
     for event in &events {
         match event.event_type.as_str() {
@@ -1238,27 +1322,22 @@ fn build_stream_messages(
                 }));
             }
             "tool.called" => {
-                let name = event.data.get("name").and_then(Value::as_str).unwrap_or("");
-                if name.trim().is_empty() {
-                    continue;
+                if let Some((tool_call_id, message)) =
+                    assistant_tool_call_message(event, &tool_call_ids)
+                {
+                    emitted_tool_call_ids.push(tool_call_id);
+                    messages.push(message);
                 }
-                let input = event.data.get("input").cloned().unwrap_or(Value::Null);
-                let tool_call_id = tool_call_ids
-                    .get(&event.id)
-                    .cloned()
-                    .unwrap_or_else(|| event.id.clone());
-                messages.push(json!({
-                    "role": "assistant",
-                    "content": null,
-                    "tool_calls": [{
-                        "id": tool_call_id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string())
-                        }
-                    }]
-                }));
+            }
+            "tool.pending" => {
+                if let Some((tool_call_id, message)) =
+                    assistant_tool_call_message(event, &tool_call_ids)
+                {
+                    if !emitted_tool_call_ids.iter().any(|id| id == &tool_call_id) {
+                        emitted_tool_call_ids.push(tool_call_id);
+                        messages.push(message);
+                    }
+                }
             }
             "tool.success" | "tool.failed" | "tool.rejected" => {
                 let local_call_id = event
@@ -1369,18 +1448,61 @@ fn attachment_summaries(attachments: &[PromptAttachment]) -> Vec<Value> {
 fn provider_tool_call_ids(events: &[EventRecord]) -> HashMap<String, String> {
     let mut result = HashMap::new();
     for event in events {
-        if event.event_type != "tool.called" {
-            continue;
+        match event.event_type.as_str() {
+            "tool.called" => {
+                let tool_call_id = event
+                    .data
+                    .get("toolCallId")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(event.id.as_str());
+                result.insert(event.id.clone(), tool_call_id.to_string());
+            }
+            "tool.pending" => {
+                let Some(local_call_id) = event.data.get("toolCallEventId").and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let tool_call_id = result
+                    .get(local_call_id)
+                    .cloned()
+                    .unwrap_or_else(|| local_call_id.to_string());
+                result.insert(event.id.clone(), tool_call_id);
+            }
+            _ => {}
         }
-        let tool_call_id = event
-            .data
-            .get("toolCallId")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(event.id.as_str());
-        result.insert(event.id.clone(), tool_call_id.to_string());
     }
     result
+}
+
+fn assistant_tool_call_message(
+    event: &EventRecord,
+    tool_call_ids: &HashMap<String, String>,
+) -> Option<(String, Value)> {
+    let name = event.data.get("name").and_then(Value::as_str).unwrap_or("");
+    if name.trim().is_empty() {
+        return None;
+    }
+    let input = event.data.get("input").cloned().unwrap_or(Value::Null);
+    let tool_call_id = tool_call_ids
+        .get(&event.id)
+        .cloned()
+        .unwrap_or_else(|| event.id.clone());
+    Some((
+        tool_call_id.clone(),
+        json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": tool_call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string())
+                }
+            }]
+        }),
+    ))
 }
 
 fn tool_result_content(event: &EventRecord) -> String {
@@ -2435,13 +2557,26 @@ mod tests {
                 created_at: "now".to_string(),
             },
             crate::types::EventRecord {
-                id: "result".to_string(),
+                id: "pending-call".to_string(),
                 session_id: "s1".to_string(),
                 seq: 2,
-                event_type: "tool.success".to_string(),
+                event_type: "tool.pending".to_string(),
                 data: json!({
                     "toolCallEventId": "local-call",
-                    "name": "read",
+                    "name": "shell",
+                    "input": { "command": "npm run build" },
+                    "pending": { "command": "npm run build" }
+                }),
+                created_at: "now".to_string(),
+            },
+            crate::types::EventRecord {
+                id: "result".to_string(),
+                session_id: "s1".to_string(),
+                seq: 3,
+                event_type: "tool.success".to_string(),
+                data: json!({
+                    "pendingEventId": "pending-call",
+                    "name": "shell",
                     "result": { "content": "ok" }
                 }),
                 created_at: "now".to_string(),
@@ -2454,7 +2589,36 @@ mod tests {
             ids.get("local-call").map(String::as_str),
             Some("provider-call")
         );
-        assert!(tool_result_content(&events[1]).contains("ok"));
+        assert_eq!(
+            ids.get("pending-call").map(String::as_str),
+            Some("provider-call")
+        );
+        assert!(tool_result_content(&events[2]).contains("ok"));
+    }
+
+    #[test]
+    fn pending_tool_can_replay_assistant_call_when_original_call_was_pruned() {
+        let event = EventRecord {
+            id: "pending-call".to_string(),
+            session_id: "s1".to_string(),
+            seq: 1,
+            event_type: "tool.pending".to_string(),
+            data: json!({
+                "toolCallEventId": "local-call",
+                "name": "shell",
+                "input": { "command": "npm run build" },
+                "pending": { "command": "npm run build" }
+            }),
+            created_at: "now".to_string(),
+        };
+        let events = vec![event.clone()];
+        let ids = provider_tool_call_ids(&events);
+        let (tool_call_id, message) =
+            assistant_tool_call_message(&event, &ids).expect("assistant tool call");
+
+        assert_eq!(tool_call_id, "local-call");
+        assert_eq!(message["tool_calls"][0]["id"], json!("local-call"));
+        assert_eq!(message["tool_calls"][0]["function"]["name"], json!("shell"));
     }
 
     #[test]
