@@ -106,16 +106,35 @@ pub async fn continue_session(
     session_id: String,
 ) -> Result<SessionEventsResponse, String> {
     let session = storage::get_session(conn, &session_id)?;
+    let run = storage::begin_session_run(conn, &session.id)?;
+    storage::save_session_checkpoint(
+        conn,
+        &session.id,
+        Some(&run.id),
+        "run.continued",
+        None,
+        "running",
+        json!({
+            "reason": "continue_session"
+        }),
+    )?;
     storage::set_session_status(conn, &session.id, "active")?;
     let result = run_session_steps(
         app,
         conn,
         &session,
         "Continue from the latest tool result. Inspect recent tool success/failure output, then either call the next needed tool or provide the final user-facing answer.",
+        Some(&run.id),
     )
     .await;
+    let status = if result.is_ok() {
+        "completed"
+    } else {
+        "failed"
+    };
+    let _ = storage::end_session_run(conn, &run.id, status);
     if let Err(error) = &result {
-        let _ = record_agent_failure(conn, &session.id, None, error);
+        let _ = record_agent_failure(conn, &session.id, Some(&run.id), error);
     }
     result
 }
@@ -126,7 +145,78 @@ pub async fn resume_session(
     session_id: String,
 ) -> Result<SessionEventsResponse, String> {
     let run = storage::begin_session_run(conn, &session_id)?;
-    let result = resume_session_inner(app, conn, &session_id).await;
+    storage::save_session_checkpoint(
+        conn,
+        &session_id,
+        Some(&run.id),
+        "run.started",
+        None,
+        "running",
+        json!({
+            "reason": "resume_session"
+        }),
+    )?;
+    let result = resume_session_inner(app, conn, &session_id, Some(&run.id)).await;
+    let status = if result.is_ok() {
+        "completed"
+    } else {
+        "failed"
+    };
+    let _ = storage::end_session_run(conn, &run.id, status);
+    if let Err(error) = &result {
+        let _ = record_agent_failure(conn, &session_id, Some(&run.id), error);
+    }
+    result
+}
+
+pub async fn recover_session_from_checkpoint(
+    app: &AppHandle,
+    conn: &Connection,
+    session_id: String,
+    checkpoint_id: Option<String>,
+) -> Result<SessionEventsResponse, String> {
+    let checkpoint = if let Some(id) = checkpoint_id {
+        storage::get_session_checkpoint(conn, &id)?
+    } else {
+        storage::latest_recoverable_checkpoint(conn, &session_id)?
+            .ok_or_else(|| "没有可恢复的检查点。".to_string())?
+    };
+    if checkpoint.session_id != session_id {
+        return Err("检查点不属于当前会话。".to_string());
+    }
+
+    let run = storage::begin_session_run(conn, &session_id)?;
+    storage::append_event(
+        conn,
+        &session_id,
+        "session.checkpoint.restored",
+        json!({
+            "checkpointId": checkpoint.id,
+            "sourceRunId": checkpoint.run_id,
+            "runId": run.id,
+            "label": checkpoint.label,
+            "step": checkpoint.step_index,
+            "status": checkpoint.status
+        }),
+    )?;
+    storage::save_session_checkpoint(
+        conn,
+        &session_id,
+        Some(&run.id),
+        "checkpoint.restored",
+        checkpoint.step_index,
+        "running",
+        json!({
+            "checkpointId": checkpoint.id,
+            "label": checkpoint.label,
+            "step": checkpoint.step_index
+        }),
+    )?;
+
+    let session = storage::get_session(conn, &session_id)?;
+    storage::set_session_status(conn, &session.id, "active")?;
+    let prompt = recovery_prompt(&checkpoint);
+    let result = run_session_steps(app, conn, &session, &prompt, Some(&run.id)).await;
     let status = if result.is_ok() {
         "completed"
     } else {
@@ -143,6 +233,7 @@ async fn resume_session_inner(
     app: &AppHandle,
     conn: &Connection,
     session_id: &str,
+    run_id: Option<&str>,
 ) -> Result<SessionEventsResponse, String> {
     let session = storage::get_session(conn, session_id)?;
     storage::set_session_status(conn, &session.id, "active")?;
@@ -180,7 +271,7 @@ async fn resume_session_inner(
         output_limit,
     )
     .await?;
-    run_session_steps(app, conn, &session, &prompt).await
+    run_session_steps(app, conn, &session, &prompt, run_id).await
 }
 
 async fn run_session_steps(
@@ -188,6 +279,7 @@ async fn run_session_steps(
     conn: &Connection,
     session: &crate::types::SessionRecord,
     current_prompt: &str,
+    run_id: Option<&str>,
 ) -> Result<SessionEventsResponse, String> {
     for step_index in 1..=MAX_STEPS {
         storage::append_event(
@@ -391,6 +483,7 @@ async fn run_session_steps(
                             "done": true
                         }),
                     )?;
+                    save_step_checkpoint(conn, &session.id, run_id, step_index, true)?;
                     break;
                 }
 
@@ -419,6 +512,7 @@ async fn run_session_steps(
                         "done": turn.done
                     }),
                 )?;
+                save_step_checkpoint(conn, &session.id, run_id, step_index, turn.done)?;
 
                 if has_pending {
                     break;
@@ -435,6 +529,7 @@ async fn run_session_steps(
                             "done": true
                         }),
                     )?;
+                    save_step_checkpoint(conn, &session.id, run_id, step_index, true)?;
                     break;
                 }
 
@@ -464,6 +559,7 @@ async fn run_session_steps(
                         "pending": has_pending
                     }),
                 )?;
+                save_step_checkpoint(conn, &session.id, run_id, step_index, has_pending)?;
 
                 if has_pending {
                     break;
@@ -480,6 +576,7 @@ async fn run_session_steps(
                             "done": true
                         }),
                     )?;
+                    save_step_checkpoint(conn, &session.id, run_id, step_index, true)?;
                     break;
                 }
 
@@ -499,6 +596,7 @@ async fn run_session_steps(
                         "pending": has_pending
                     }),
                 )?;
+                save_step_checkpoint(conn, &session.id, run_id, step_index, has_pending)?;
 
                 if has_pending {
                     break;
@@ -508,6 +606,28 @@ async fn run_session_steps(
     }
 
     Ok(storage::session_events_response(conn, &session.id)?)
+}
+
+fn save_step_checkpoint(
+    conn: &Connection,
+    session_id: &str,
+    run_id: Option<&str>,
+    step_index: usize,
+    done: bool,
+) -> Result<(), String> {
+    storage::save_session_checkpoint(
+        conn,
+        session_id,
+        run_id,
+        "step.completed",
+        Some(step_index as i64),
+        "ready",
+        json!({
+            "step": step_index,
+            "done": done
+        }),
+    )?;
+    Ok(())
 }
 
 async fn complete_with_retry(
@@ -556,6 +676,18 @@ fn record_agent_failure(
     error: &str,
 ) -> Result<EventRecord, String> {
     let info = AppErrorInfo::from_message(error);
+    let checkpoint = storage::save_session_checkpoint(
+        conn,
+        session_id,
+        run_id,
+        "agent.failed",
+        None,
+        "failed",
+        json!({
+            "message": info.message,
+            "error": info.to_value()
+        }),
+    )?;
     storage::set_session_status(conn, session_id, "failed")?;
     storage::append_event(
         conn,
@@ -563,6 +695,7 @@ fn record_agent_failure(
         "agent.failed",
         json!({
             "runId": run_id,
+            "checkpointId": checkpoint.id,
             "message": info.message,
             "error": info.to_value(),
             "recovery": {
@@ -571,6 +704,28 @@ fn record_agent_failure(
                 "actions": info.suggested_actions
             }
         }),
+    )
+}
+
+fn recovery_prompt(checkpoint: &crate::types::SessionCheckpointRecord) -> String {
+    let step_text = checkpoint
+        .step_index
+        .map(|step| format!("step {step}"))
+        .unwrap_or_else(|| "最近的安全边界".to_string());
+    format!(
+        "从会话检查点恢复执行。\n\
+         checkpointId: {}\n\
+         label: {}\n\
+         status: {}\n\
+         boundary: {}\n\
+         checkpointData: {}\n\n\
+         请把该检查点之后的失败事件仅作为诊断信息，不要重复已经成功完成的工作。\
+         先检查最近事件和工作区状态，然后从该安全边界继续完成用户目标。",
+        checkpoint.id,
+        checkpoint.label,
+        checkpoint.status,
+        step_text,
+        compact_json(&checkpoint.data)
     )
 }
 

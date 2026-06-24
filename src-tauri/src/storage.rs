@@ -3,13 +3,14 @@ use crate::{
     types::{
         AgentMode, BackgroundJobRecord, ContextSummaryRecord, CreateSessionInput, EventRecord,
         PermissionReply, PermissionRequestRecord, PromptAttachment, ProviderInput, ProviderKind,
-        ProviderRecord, SessionEventsResponse, SessionInputDelivery, SessionInputRecord,
-        SessionRecord, SessionRunRecord, ShellMode, ShellPolicy, SnapshotRecord,
+        ProviderRecord, SessionCheckpointRecord, SessionEventsResponse, SessionInputDelivery,
+        SessionInputRecord, SessionRecord, SessionRunRecord, ShellMode, ShellPolicy,
+        SnapshotRecord,
     },
     util,
 };
 use rusqlite::{params, Connection};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::{fs, path::PathBuf};
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
@@ -122,6 +123,18 @@ fn init_db(conn: &Connection) -> Result<(), String> {
           status TEXT NOT NULL,
           started_at TEXT NOT NULL,
           ended_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS session_checkpoint (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          run_id TEXT,
+          event_id TEXT,
+          label TEXT NOT NULL,
+          step_index INTEGER,
+          status TEXT NOT NULL,
+          data_json TEXT NOT NULL,
+          created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS permission_request (
@@ -514,6 +527,11 @@ pub fn delete_session(conn: &Connection, id: &str) -> Result<(), String> {
     .map_err(|error| error.to_string())?;
     tx.execute("DELETE FROM session_run WHERE session_id = ?1", params![id])
         .map_err(|error| error.to_string())?;
+    tx.execute(
+        "DELETE FROM session_checkpoint WHERE session_id = ?1",
+        params![id],
+    )
+    .map_err(|error| error.to_string())?;
     tx.execute(
         "DELETE FROM permission_request WHERE session_id = ?1",
         params![id],
@@ -936,6 +954,106 @@ pub fn list_session_runs(
     collect_rows(rows)
 }
 
+pub fn save_session_checkpoint(
+    conn: &Connection,
+    session_id: &str,
+    run_id: Option<&str>,
+    label: &str,
+    step_index: Option<i64>,
+    status: &str,
+    data: Value,
+) -> Result<SessionCheckpointRecord, String> {
+    get_session(conn, session_id)?;
+    let id = Uuid::new_v4().to_string();
+    let created_at = util::now_string();
+    let data_json = serde_json::to_string(&data).map_err(|error| error.to_string())?;
+    conn.execute(
+        r#"
+        INSERT INTO session_checkpoint
+          (id, session_id, run_id, event_id, label, step_index, status, data_json, created_at)
+        VALUES
+          (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8)
+        "#,
+        params![
+            &id,
+            session_id,
+            run_id,
+            label,
+            step_index,
+            status,
+            &data_json,
+            &created_at
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+
+    let event = append_event(
+        conn,
+        session_id,
+        "session.checkpoint.saved",
+        json!({
+            "checkpointId": id,
+            "runId": run_id,
+            "label": label,
+            "step": step_index,
+            "status": status
+        }),
+    )?;
+    conn.execute(
+        "UPDATE session_checkpoint SET event_id = ?1 WHERE id = ?2",
+        params![&event.id, &id],
+    )
+    .map_err(|error| error.to_string())?;
+    get_session_checkpoint(conn, &id)
+}
+
+pub fn get_session_checkpoint(
+    conn: &Connection,
+    id: &str,
+) -> Result<SessionCheckpointRecord, String> {
+    conn.query_row(
+        "SELECT id, session_id, run_id, event_id, label, step_index, status, data_json, created_at
+         FROM session_checkpoint WHERE id = ?1",
+        params![id],
+        session_checkpoint_from_row,
+    )
+    .map_err(|error| not_found_error(error, "session_checkpoint", id))
+}
+
+pub fn latest_recoverable_checkpoint(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<SessionCheckpointRecord>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, run_id, event_id, label, step_index, status, data_json, created_at
+             FROM session_checkpoint
+             WHERE session_id = ?1 AND status IN ('ready', 'failed')
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut rows = stmt
+        .query_map(params![session_id], session_checkpoint_from_row)
+        .map_err(|error| error.to_string())?;
+    rows.next().transpose().map_err(|error| error.to_string())
+}
+
+pub fn list_session_checkpoints(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<SessionCheckpointRecord>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, run_id, event_id, label, step_index, status, data_json, created_at
+             FROM session_checkpoint WHERE session_id = ?1 ORDER BY created_at DESC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map(params![session_id], session_checkpoint_from_row)
+        .map_err(|error| error.to_string())?;
+    collect_rows(rows)
+}
+
 pub fn create_permission_request(
     conn: &Connection,
     session_id: &str,
@@ -1128,6 +1246,7 @@ pub fn session_events_response(
         summaries: list_context_summaries(conn, session_id)?,
         inputs: list_public_session_inputs(conn, session_id)?,
         runs: list_session_runs(conn, session_id)?,
+        checkpoints: list_session_checkpoints(conn, session_id)?,
         permissions: list_permission_requests(conn, session_id)?,
         jobs: list_background_jobs(conn, session_id)?,
     })
@@ -1300,6 +1419,23 @@ fn session_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRunR
     })
 }
 
+fn session_checkpoint_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<SessionCheckpointRecord> {
+    let data_json: String = row.get(7)?;
+    Ok(SessionCheckpointRecord {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        run_id: row.get(2)?,
+        event_id: row.get(3)?,
+        label: row.get(4)?,
+        step_index: row.get(5)?,
+        status: row.get(6)?,
+        data: serde_json::from_str(&data_json).unwrap_or(Value::Null),
+        created_at: row.get(8)?,
+    })
+}
+
 fn permission_request_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<PermissionRequestRecord> {
@@ -1410,6 +1546,16 @@ mod tests {
         )
         .unwrap();
         insert_context_summary(&conn, &session.id, "summary".to_string(), 1).unwrap();
+        save_session_checkpoint(
+            &conn,
+            &session.id,
+            None,
+            "step.completed",
+            Some(1),
+            "ready",
+            json!({ "step": 1 }),
+        )
+        .unwrap();
         insert_snapshot(
             &conn,
             SnapshotRecord {
@@ -1434,6 +1580,9 @@ mod tests {
         assert!(list_events(&conn, &session.id).unwrap().is_empty());
         assert!(list_snapshots(&conn, &session.id).unwrap().is_empty());
         assert!(list_context_summaries(&conn, &session.id)
+            .unwrap()
+            .is_empty());
+        assert!(list_session_checkpoints(&conn, &session.id)
             .unwrap()
             .is_empty());
     }
@@ -1498,6 +1647,39 @@ mod tests {
 
         assert_eq!(first.id, second.id);
         assert_eq!(list_session_inputs(&conn, "s1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn session_checkpoints_are_listed_and_returned_with_events() {
+        let conn = memory_db();
+        conn.execute(
+            "INSERT INTO session (id, project_root, mode, provider_id, title, status, shell_mode, created_at, updated_at)
+             VALUES ('s1', 'E:/oDot', 'agent', 'p1', 'Test', 'active', 'auto', '1', '1')",
+            [],
+        )
+        .unwrap();
+
+        let checkpoint = save_session_checkpoint(
+            &conn,
+            "s1",
+            Some("run-1"),
+            "step.completed",
+            Some(2),
+            "ready",
+            json!({ "step": 2, "done": false }),
+        )
+        .unwrap();
+
+        let latest = latest_recoverable_checkpoint(&conn, "s1").unwrap().unwrap();
+        let response = session_events_response(&conn, "s1").unwrap();
+
+        assert_eq!(latest.id, checkpoint.id);
+        assert_eq!(response.checkpoints.len(), 1);
+        assert_eq!(response.checkpoints[0].event_id, checkpoint.event_id);
+        assert!(response
+            .events
+            .iter()
+            .any(|event| event.event_type == "session.checkpoint.saved"));
     }
 
     #[test]

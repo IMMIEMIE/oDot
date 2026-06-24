@@ -14,9 +14,9 @@ mod workspace;
 use tauri::{AppHandle, Emitter};
 use types::{
     ContextSummaryRecord, CreateSessionInput, EventRecord, ProjectFile, PromptSessionInput,
-    ProviderConfigFileResponse, ProviderInput, ProviderRecord, ReplyPermissionInput,
-    SessionEventsResponse, SessionRecord, ShellPolicy, SnapshotRecord, SubmitPromptInput,
-    TailSessionEventsInput, UpdateSessionModeInput, UpdateSessionTitleInput,
+    ProviderConfigFileResponse, ProviderInput, ProviderRecord, RecoverSessionInput,
+    ReplyPermissionInput, SessionEventsResponse, SessionRecord, ShellPolicy, SnapshotRecord,
+    SubmitPromptInput, TailSessionEventsInput, UpdateSessionModeInput, UpdateSessionTitleInput,
 };
 
 #[tauri::command]
@@ -114,6 +114,7 @@ fn tail_session_events(
         summaries: storage::list_context_summaries(&conn, &input.session_id)?,
         inputs: storage::list_public_session_inputs(&conn, &input.session_id)?,
         runs: storage::list_session_runs(&conn, &input.session_id)?,
+        checkpoints: storage::list_session_checkpoints(&conn, &input.session_id)?,
         permissions: storage::list_permission_requests(&conn, &input.session_id)?,
         jobs: storage::list_background_jobs(&conn, &input.session_id)?,
     })
@@ -169,6 +170,24 @@ async fn continue_session(
     tauri::async_runtime::spawn_blocking(move || {
         let conn = storage::open_db(&app)?;
         tauri::async_runtime::block_on(runner::continue_session(&app, &conn, session_id))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn recover_session_from_checkpoint(
+    app: AppHandle,
+    input: RecoverSessionInput,
+) -> Result<SessionEventsResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = storage::open_db(&app)?;
+        tauri::async_runtime::block_on(runner::recover_session_from_checkpoint(
+            &app,
+            &conn,
+            input.session_id,
+            input.checkpoint_id,
+        ))
     })
     .await
     .map_err(|error| error.to_string())?
@@ -314,6 +333,7 @@ pub fn run() {
             prompt_session,
             wait_session,
             continue_session,
+            recover_session_from_checkpoint,
             approve_tool_call,
             reject_tool_call,
             reply_permission,

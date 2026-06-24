@@ -12,6 +12,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "oDot",
         "width": 1180,
         "height": 760,
@@ -19,6 +20,18 @@
         "minHeight": 640,
         "resizable": true,
         "fullscreen": false
+      },
+      {
+        "label": "float",
+        "title": "",
+        "width": 64,
+        "height": 64,
+        "visible": false,
+        "decorations": false,
+        "transparent": true,
+        "resizable": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true
       }
     ],
     "security": {

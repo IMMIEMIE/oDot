@@ -124,6 +124,18 @@ export type SessionRunRecord = {
   endedAt?: string | null;
 };
 
+export type SessionCheckpointRecord = {
+  id: string;
+  sessionId: string;
+  runId?: string | null;
+  eventId?: string | null;
+  label: string;
+  stepIndex?: number | null;
+  status: string;
+  data: Record<string, unknown>;
+  createdAt: string;
+};
+
 export type PermissionRequestRecord = {
   id: string;
   sessionId: string;
@@ -155,6 +167,7 @@ export type SessionEventsResponse = {
   summaries: ContextSummaryRecord[];
   inputs: SessionInputRecord[];
   runs: SessionRunRecord[];
+  checkpoints: SessionCheckpointRecord[];
   permissions: PermissionRequestRecord[];
   jobs: BackgroundJobRecord[];
 };
@@ -295,6 +308,16 @@ export async function continueSession(
 ): Promise<SessionEventsResponse> {
   assertTauri();
   return invoke<SessionEventsResponse>("continue_session", { sessionId });
+}
+
+export async function recoverSessionFromCheckpoint(input: {
+  sessionId: string;
+  checkpointId?: string | null;
+}): Promise<SessionEventsResponse> {
+  assertTauri();
+  return invoke<SessionEventsResponse>("recover_session_from_checkpoint", {
+    input
+  });
 }
 
 export async function approveToolCall(eventId: string): Promise<EventRecord> {

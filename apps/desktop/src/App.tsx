@@ -31,6 +31,8 @@ import {
   X
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type {
   ChangeEvent,
@@ -56,6 +58,7 @@ import {
   pickProjectDirectory,
   rejectToolCall,
   replyPermission,
+  recoverSessionFromCheckpoint,
   rollbackSnapshot,
   saveProviderConfig,
   saveShellPolicy,
@@ -113,6 +116,27 @@ type TreeNode = {
   file?: ProjectFile;
   children: TreeNode[];
 };
+
+function FloatModeIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <rect x="3" y="3" width="14" height="14" rx="2.5" />
+      <path d="M13 10 L8 15" />
+      <path d="M8 15 L8 11.5" />
+      <path d="M8 15 L11.5 15" />
+      <rect x="17" y="17" width="4.5" height="4.5" rx="1" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
 
 export function App() {
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
@@ -1091,9 +1115,14 @@ export function App() {
     activeRunIdRef.current = runId;
     setIsContinuing(true);
     setIsMutating(true);
+    const checkpointId = checkpointIdFromAction(actionId);
     setNotice({
       tone: "info",
-      text: actionId === "retry" ? "正在重试" : "Agent 正在继续"
+      text: checkpointId
+        ? "正在从检查点恢复"
+        : actionId === "retry"
+          ? "正在重试"
+          : "Agent 正在继续"
     });
     try {
       if (actionId === "compact") {
@@ -1107,7 +1136,12 @@ export function App() {
         });
         scheduleRealtimeTailRefresh(selectedSessionId);
       }
-      const response = await continueSession(selectedSessionId);
+      const response = checkpointId
+        ? await recoverSessionFromCheckpoint({
+            sessionId: selectedSessionId,
+            checkpointId
+          })
+        : await continueSession(selectedSessionId);
       if (activeRunIdRef.current !== runId) {
         return;
       }
@@ -1397,6 +1431,19 @@ export function App() {
                 onClick={() => setIsSettingsOpen(true)}
               >
                 <Settings size={16} />
+              </button>
+              <button
+                className="iconButton ghost"
+                aria-label="进入悬浮球模式"
+                title="进入悬浮球模式"
+                onClick={async () => {
+                  const mainWin = getCurrentWindow();
+                  const floatWin = await WebviewWindow.getByLabel("float");
+                  await floatWin?.show();
+                  await mainWin.hide();
+                }}
+              >
+                <FloatModeIcon size={16} />
               </button>
             </div>
           </div>
@@ -2239,6 +2286,7 @@ type TimelineErrorInfo = {
   id?: string;
   kind: string;
   message: string;
+  checkpointId?: string;
   causes: string[];
   retryable: boolean;
   recoverable: boolean;
@@ -2464,7 +2512,7 @@ function TimelineItemView({
           <details className="reasoningBlock">
             <summary>
               <BrainCircuit size={15} />
-              <span>思考...</span>
+              <span>思考过程</span>
               <ChevronRight size={13} className="reasoningClosedIcon" />
               <ChevronDown size={13} className="reasoningOpenIcon" />
             </summary>
@@ -2565,6 +2613,8 @@ function ErrorRecoveryCard({
               <Settings size={15} />
             ) : action.id === "compact" ? (
               <Database size={15} />
+            ) : checkpointIdFromAction(action.id) ? (
+              <History size={15} />
             ) : (
               <RefreshCw size={15} />
             )}
@@ -3538,6 +3588,17 @@ function statusItemForEvent(event: EventRecord): TimelineItem | null {
       details: [event]
     };
   }
+  if (event.type === "session.checkpoint.restored") {
+    return {
+      id: event.id,
+      kind: "statusSummary",
+      title: "已恢复检查点",
+      text: valueAsString(event.data.label) || eventLabel(event),
+      status: "waiting",
+      event,
+      details: [event]
+    };
+  }
   if (event.type === "rollback.applied") {
     return null;
   }
@@ -3556,10 +3617,20 @@ function eventFailureText(event: EventRecord) {
 
 function timelineErrorInfo(event: EventRecord): TimelineErrorInfo {
   const error = asRecord(event.data.error);
+  const checkpointId = valueAsString(event.data.checkpointId);
   const actions = Array.isArray(error.suggestedActions)
     ? error.suggestedActions
         .map(recoveryActionFromValue)
         .filter((action): action is RecoveryAction => Boolean(action))
+    : [];
+  const checkpointActions = checkpointId
+    ? [
+        {
+          id: checkpointActionId(checkpointId),
+          label: "恢复到检查点",
+          description: "从最近保存的安全边界恢复执行。"
+        }
+      ]
     : [];
   return {
     id: valueAsString(error.id),
@@ -3568,11 +3639,20 @@ function timelineErrorInfo(event: EventRecord): TimelineErrorInfo {
       valueAsString(error.message) ||
       valueAsString(event.data.message) ||
       eventFailureText(event),
+    checkpointId,
     causes: stringArray(error.causes),
     retryable: Boolean(error.retryable),
     recoverable: Boolean(error.recoverable),
-    suggestedActions: actions
+    suggestedActions: [...checkpointActions, ...actions]
   };
+}
+
+function checkpointActionId(checkpointId: string) {
+  return `checkpoint:${checkpointId}`;
+}
+
+function checkpointIdFromAction(actionId: string) {
+  return actionId.startsWith("checkpoint:") ? actionId.slice("checkpoint:".length) : "";
 }
 
 function recoveryActionFromValue(value: unknown): RecoveryAction | null {
@@ -3964,6 +4044,8 @@ function eventLabel(event: EventRecord) {
     "agent.cancelRequested": "请求停止",
     "agent.stopped": "Agent 已停止",
     "agent.failed": "Agent 失败",
+    "session.checkpoint.saved": "检查点已保存",
+    "session.checkpoint.restored": "检查点已恢复",
     "rollback.applied": "已回滚",
     "context.compacted": "上下文压缩"
   };

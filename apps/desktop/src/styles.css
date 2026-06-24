@@ -960,6 +960,7 @@ textarea:focus {
   position: relative;
   display: grid;
   gap: 8px;
+  --markdown-fade-bg: var(--surface);
 }
 
 .assistantDetail {
@@ -997,10 +998,10 @@ textarea:focus {
   position: absolute;
   left: 0;
   right: 0;
-  bottom: 45px;
+  bottom: 38px;
   height: 42px;
   pointer-events: none;
-  background: linear-gradient(rgba(20, 27, 35, 0), var(--surface));
+  background: linear-gradient(to bottom, transparent, var(--markdown-fade-bg));
 }
 
 .collapseToggle {
@@ -1085,8 +1086,13 @@ textarea:focus {
 .reasoningBlock .markdownFrame {
   margin-top: 6px;
   padding: 8px 0 0 21px;
+  --markdown-fade-bg: var(--surface-soft);
   color: #52606d;
   font-size: 12px;
+}
+
+.reasoningBlock .markdownFrame.collapsed::after {
+  left: 21px;
 }
 
 .reasoningBlock .markdownBody {
@@ -2323,5 +2329,80 @@ pre {
 
   .codeChangeHeader small {
     display: none;
+  }
+}
+
+/* ===== 悬浮球模式 ===== */
+
+html:has(.floatBallContainer),
+:root:has(.floatBallContainer) {
+  background: transparent !important;
+}
+
+body:has(.floatBallContainer) {
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+  background: transparent !important;
+  overflow: hidden;
+}
+
+.floatBallContainer {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.floatBall {
+  width: 56px;
+  height: 56px;
+  padding: 0;
+  border: none;
+  outline: none;
+  border-radius: 50%;
+  background: var(--blue);
+  color: #ffffff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+  box-shadow: 0 4px 16px rgba(37, 99, 235, 0.4);
+  transition:
+    transform 0.28s cubic-bezier(0.34, 1.56, 0.64, 1),
+    box-shadow 0.28s ease;
+  user-select: none;
+  -webkit-user-select: none;
+  pointer-events: auto;
+  -webkit-app-region: no-drag;
+}
+
+.floatBall:hover:not(.floatBall--dragging) {
+  transform: scale(1.08);
+  box-shadow: 0 6px 22px rgba(37, 99, 235, 0.5);
+}
+
+.floatBall--dragging {
+  cursor: grabbing;
+  transform: scale(1.14);
+  box-shadow: 0 8px 28px rgba(37, 99, 235, 0.55);
+  transition:
+    transform 0.12s ease-out,
+    box-shadow 0.12s ease-out;
+  animation: floatBallDragPulse 1.2s ease-in-out infinite;
+}
+
+@keyframes floatBallDragPulse {
+  0%,
+  100% {
+    box-shadow: 0 8px 28px rgba(37, 99, 235, 0.55);
+  }
+  50% {
+    box-shadow: 0 10px 32px rgba(37, 99, 235, 0.65);
   }
 }

@@ -328,6 +328,20 @@ pub struct SessionRunRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SessionCheckpointRecord {
+    pub id: String,
+    pub session_id: String,
+    pub run_id: Option<String>,
+    pub event_id: Option<String>,
+    pub label: String,
+    pub step_index: Option<i64>,
+    pub status: String,
+    pub data: Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PermissionRequestRecord {
     pub id: String,
     pub session_id: String,
@@ -365,6 +379,8 @@ pub struct SessionEventsResponse {
     pub inputs: Vec<SessionInputRecord>,
     #[serde(default)]
     pub runs: Vec<SessionRunRecord>,
+    #[serde(default)]
+    pub checkpoints: Vec<SessionCheckpointRecord>,
     #[serde(default)]
     pub permissions: Vec<PermissionRequestRecord>,
     #[serde(default)]
@@ -406,6 +422,13 @@ pub struct PromptSessionInput {
     pub delivery: Option<SessionInputDelivery>,
     #[serde(default = "default_resume")]
     pub resume: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoverSessionInput {
+    pub session_id: String,
+    pub checkpoint_id: Option<String>,
 }
 
 fn default_resume() -> bool {

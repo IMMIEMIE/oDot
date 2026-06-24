@@ -14,6 +14,7 @@ export const EMPTY_SESSION_EVENTS: SessionEventsResponse = {
   summaries: [],
   inputs: [],
   runs: [],
+  checkpoints: [],
   permissions: [],
   jobs: []
 };
@@ -78,6 +79,7 @@ export function mergeSessionEvents(
     summaries: incoming.summaries.length ? incoming.summaries : current.summaries,
     inputs: incoming.inputs ?? current.inputs,
     runs: incoming.runs ?? current.runs,
+    checkpoints: incoming.checkpoints ?? current.checkpoints,
     permissions: incoming.permissions ?? current.permissions,
     jobs: incoming.jobs ?? current.jobs
   };
