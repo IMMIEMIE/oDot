@@ -29,6 +29,7 @@
         "visible": false,
         "decorations": false,
         "transparent": true,
+        "shadow": false,
         "resizable": false,
         "alwaysOnTop": true,
         "skipTaskbar": true

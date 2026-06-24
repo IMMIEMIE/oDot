@@ -11,6 +11,9 @@ mod types;
 mod util;
 mod workspace;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "windows")]
+use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use types::{
     ContextSummaryRecord, CreateSessionInput, EventRecord, ProjectFile, PromptSessionInput,
@@ -18,6 +21,83 @@ use types::{
     ReplyPermissionInput, SessionEventsResponse, SessionRecord, ShellPolicy, SnapshotRecord,
     SubmitPromptInput, TailSessionEventsInput, UpdateSessionModeInput, UpdateSessionTitleInput,
 };
+
+const FLOAT_WINDOW_LABEL: &str = "float";
+#[cfg(target_os = "windows")]
+const FLOAT_DRAG_FRAME_MS: u64 = 8;
+static FLOAT_DRAG_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct FloatDragGuard;
+
+impl Drop for FloatDragGuard {
+    fn drop(&mut self) {
+        FLOAT_DRAG_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+fn acquire_float_drag() -> Result<FloatDragGuard, String> {
+    if FLOAT_DRAG_ACTIVE.swap(true, Ordering::AcqRel) {
+        return Err("悬浮球正在拖动".to_string());
+    }
+    Ok(FloatDragGuard)
+}
+
+#[cfg(target_os = "windows")]
+fn left_mouse_button_is_down() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+
+    (unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } as u16 & 0x8000) != 0
+}
+
+#[cfg(target_os = "windows")]
+fn physical_i32(value: f64) -> i32 {
+    value
+        .round()
+        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+#[cfg(target_os = "windows")]
+async fn drag_float_window_windows(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    let cursor = app.cursor_position().map_err(|error| error.to_string())?;
+    let origin = window.outer_position().map_err(|error| error.to_string())?;
+    let offset_x = cursor.x - f64::from(origin.x);
+    let offset_y = cursor.y - f64::from(origin.y);
+
+    while left_mouse_button_is_down() {
+        let cursor = app.cursor_position().map_err(|error| error.to_string())?;
+        window
+            .set_position(tauri::PhysicalPosition::new(
+                physical_i32(cursor.x - offset_x),
+                physical_i32(cursor.y - offset_y),
+            ))
+            .map_err(|error| error.to_string())?;
+        tokio::time::sleep(Duration::from_millis(FLOAT_DRAG_FRAME_MS)).await;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn start_float_drag(app: AppHandle, window: tauri::WebviewWindow) -> Result<(), String> {
+    if window.label() != FLOAT_WINDOW_LABEL {
+        return Err("只能拖动悬浮球窗口".to_string());
+    }
+    let _guard = acquire_float_drag()?;
+
+    #[cfg(target_os = "windows")]
+    {
+        drag_float_window_windows(app, window).await
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        window.start_dragging().map_err(|error| error.to_string())
+    }
+}
 
 #[tauri::command]
 fn save_provider(app: AppHandle, input: ProviderInput) -> Result<ProviderRecord, String> {
@@ -315,6 +395,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            start_float_drag,
             save_provider,
             list_providers,
             delete_provider,

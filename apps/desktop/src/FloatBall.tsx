@@ -1,4 +1,4 @@
-import { PhysicalPosition } from "@tauri-apps/api/dpi";
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { Bot } from "lucide-react";
@@ -10,10 +10,8 @@ const DRAG_THRESHOLD = 4;
 
 export function FloatBall() {
   const [isDragging, setIsDragging] = useState(false);
-  const [listening, setListening] = useState(false);
-  const downScreen = useRef<{ x: number; y: number } | null>(null);
-  const winStart = useRef<{ x: number; y: number } | null>(null);
-  const moved = useRef(false);
+  const pointerStart = useRef<{ id: number; x: number; y: number } | null>(null);
+  const didDrag = useRef(false);
 
   useEffect(() => {
     const stored = localStorage.getItem("odot.themeMode");
@@ -28,60 +26,64 @@ export function FloatBall() {
     document.documentElement.style.colorScheme = resolved;
   }, []);
 
-  useEffect(() => {
-    if (!listening) return;
+  async function restoreMainWindow() {
+    const floatWin = getCurrentWindow();
+    const mainWin = await WebviewWindow.getByLabel("main");
+    await mainWin?.show();
+    await mainWin?.setFocus();
+    await floatWin.hide();
+  }
 
-    const onMove = (e: MouseEvent) => {
-      if (!downScreen.current || !winStart.current) return;
-      const dx = e.screenX - downScreen.current.x;
-      const dy = e.screenY - downScreen.current.y;
-      if (!moved.current) {
-        if (Math.abs(dx) <= DRAG_THRESHOLD && Math.abs(dy) <= DRAG_THRESHOLD) {
-          return;
-        }
-        moved.current = true;
-        setIsDragging(true);
-      }
-      void getCurrentWindow().setPosition(
-        new PhysicalPosition(winStart.current.x + dx, winStart.current.y + dy),
-      );
-    };
-
-    const onUp = async () => {
-      setListening(false);
-      if (moved.current) {
-        setIsDragging(false);
-      } else {
-        const floatWin = getCurrentWindow();
-        const mainWin = await WebviewWindow.getByLabel("main");
-        await mainWin?.show();
-        await mainWin?.setFocus();
-        await floatWin.hide();
-      }
-      downScreen.current = null;
-      winStart.current = null;
-      moved.current = false;
-    };
-
-    document.addEventListener("mousemove", onMove);
-    document.addEventListener("mouseup", onUp);
-    return () => {
-      document.removeEventListener("mousemove", onMove);
-      document.removeEventListener("mouseup", onUp);
-    };
-  }, [listening]);
-
-  const handleMouseDown = async (e: React.MouseEvent) => {
-    if (e.button !== 0) return;
-    downScreen.current = { x: e.screenX, y: e.screenY };
-    moved.current = false;
-    try {
-      const pos = await getCurrentWindow().outerPosition();
-      winStart.current = { x: pos.x, y: pos.y };
-      setListening(true);
-    } catch {
-      downScreen.current = null;
+  function resetPointer(target: Element, pointerId: number) {
+    if (target.hasPointerCapture?.(pointerId)) {
+      target.releasePointerCapture(pointerId);
     }
+    pointerStart.current = null;
+    setIsDragging(false);
+  }
+
+  const handlePointerDown = (event: React.PointerEvent<HTMLButtonElement>) => {
+    if (event.button !== 0) {
+      return;
+    }
+    pointerStart.current = {
+      id: event.pointerId,
+      x: event.screenX,
+      y: event.screenY
+    };
+    didDrag.current = false;
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const handlePointerMove = (event: React.PointerEvent<HTMLButtonElement>) => {
+    const start = pointerStart.current;
+    if (!start || start.id !== event.pointerId || didDrag.current) {
+      return;
+    }
+    const dx = event.screenX - start.x;
+    const dy = event.screenY - start.y;
+    if (Math.abs(dx) <= DRAG_THRESHOLD && Math.abs(dy) <= DRAG_THRESHOLD) {
+      return;
+    }
+    didDrag.current = true;
+    setIsDragging(true);
+    resetPointer(event.currentTarget, event.pointerId);
+    void invoke("start_float_drag")
+      .finally(() => setIsDragging(false));
+  };
+
+  const handlePointerUp = (event: React.PointerEvent<HTMLButtonElement>) => {
+    const dragged = didDrag.current;
+    resetPointer(event.currentTarget, event.pointerId);
+    didDrag.current = false;
+    if (!dragged) {
+      void restoreMainWindow();
+    }
+  };
+
+  const handlePointerCancel = (event: React.PointerEvent<HTMLButtonElement>) => {
+    resetPointer(event.currentTarget, event.pointerId);
+    didDrag.current = false;
   };
 
   return (
@@ -89,8 +91,11 @@ export function FloatBall() {
       <button
         type="button"
         className={`floatBall${isDragging ? " floatBall--dragging" : ""}`}
-        onMouseDown={(e) => void handleMouseDown(e)}
-        title="点击恢复 oDot 窗口，拖动移动位置"
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerCancel}
+        title="Click to restore oDot, drag to move"
       >
         <Bot size={28} />
       </button>

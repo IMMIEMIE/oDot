@@ -41,6 +41,7 @@ import type {
   ReactNode
 } from "react";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   approveToolCall,
   cancelJob,
@@ -2809,12 +2810,13 @@ function MarkdownText({
   text: string;
   stream?: boolean;
 }) {
-  const isLong = isLongMarkdown(text);
+  const normalizedText = useMemo(() => normalizeInlineMarkdownTables(text), [text]);
+  const isLong = isLongMarkdown(normalizedText);
   const [expanded, setExpanded] = useState(!isLong);
   const [visibleLength, setVisibleLength] = useState(stream ? 0 : text.length);
 
   useEffect(() => {
-    setExpanded(!isLongMarkdown(text));
+    setExpanded(!isLongMarkdown(normalizedText));
     if (!stream) {
       setVisibleLength(text.length);
       return undefined;
@@ -2834,16 +2836,17 @@ function MarkdownText({
     }, 18);
 
     return () => window.clearInterval(timer);
-  }, [stream, text]);
+  }, [normalizedText, stream, text]);
 
   const displayText = stream
     ? Array.from(text).slice(0, visibleLength).join("")
-    : text;
+    : normalizedText;
+  const markdownText = stream ? normalizeInlineMarkdownTables(displayText) : displayText;
 
   return (
     <div className={`markdownFrame ${isLong && !expanded ? "collapsed" : ""}`}>
       <div className="markdownBody">
-        <ReactMarkdown>{displayText}</ReactMarkdown>
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{markdownText}</ReactMarkdown>
       </div>
       {isLong && (
         <button
@@ -2863,6 +2866,50 @@ function isLongMarkdown(text: string) {
     text.length > LONG_MARKDOWN_CHARS ||
     text.split(/\r?\n/).length > LONG_MARKDOWN_LINES
   );
+}
+
+function normalizeInlineMarkdownTables(text: string) {
+  return text
+    .split(/\r?\n/)
+    .map((line) => normalizeInlineMarkdownTableLine(line))
+    .join("\n");
+}
+
+function normalizeInlineMarkdownTableLine(line: string) {
+  if (!line.includes("|")) {
+    return line;
+  }
+
+  const rows = line
+    .replace(/\|\s+(?=\|)/g, "|\n")
+    .split("\n")
+    .map((row) => row.trim())
+    .filter(Boolean);
+
+  if (rows.length < 2 || !rows.every(isMarkdownTableRow)) {
+    return line;
+  }
+
+  const separatorIndex = rows.findIndex(isMarkdownTableSeparatorRow);
+  if (separatorIndex !== 1) {
+    return line;
+  }
+
+  return rows.join("\n");
+}
+
+function isMarkdownTableRow(row: string) {
+  return row.startsWith("|") && row.endsWith("|") && row.slice(1, -1).includes("|");
+}
+
+function isMarkdownTableSeparatorRow(row: string) {
+  if (!isMarkdownTableRow(row)) {
+    return false;
+  }
+  return row
+    .slice(1, -1)
+    .split("|")
+    .every((cell) => /^:?-{3,}:?$/.test(cell.trim()));
 }
 
 type ExecutionSummary = {

@@ -6,9 +6,15 @@ import { FloatBall } from "./FloatBall";
 import "./styles.css";
 
 const win = getCurrentWindow();
+const isFloatWindow = win.label === "float";
+const root = document.getElementById("root")!;
 
-ReactDOM.createRoot(document.getElementById("root")!).render(
+document.documentElement.classList.toggle("float-window", isFloatWindow);
+document.body.classList.toggle("float-window-body", isFloatWindow);
+root.classList.toggle("floatRoot", isFloatWindow);
+
+ReactDOM.createRoot(root).render(
   <React.StrictMode>
-    {win.label === "float" ? <FloatBall /> : <App />}
+    {isFloatWindow ? <FloatBall /> : <App />}
   </React.StrictMode>
 );
