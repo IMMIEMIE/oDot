@@ -1,6 +1,6 @@
 中文 | **[English](README.md)**
 
-# ![128x128](E:\oDot\src-tauri\icons\128x128.png)    **oDot**
+# ![image](https://github.com/IMMIEMIE/oDot/blob/master/src-tauri/icons/128x128.png)  **oDot**
 
 跨 IDE的 AI 编程助手，创新的悬浮球模式。不再需要在各个IDE之间切换各种编程插件，也不会被各种对话框界面占用大量的屏幕空间，配置任意兼容 OpenAI格式的模型服务，打开项目目录，即可开始编码会话。
 

@@ -1,6 +1,6 @@
 **[中文](README.zh-CN.md)** | English
 
-# ![128x128](E:\oDot\src-tauri\icons\128x128.png)    **oDot**
+# ![image](https://github.com/IMMIEMIE/oDot/blob/master/src-tauri/icons/128x128.png)   **oDot**
 
 An IDE-agnostic AI programming assistant with an innovative floating ball mode. No more juggling different coding plugins across IDEs, and no more losing precious screen real estate to dialog windows. Simply configure any OpenAI-compatible model provider, open your project directory, and start coding.
 
