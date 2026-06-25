@@ -1,6 +1,7 @@
 mod config_file;
 mod error_model;
 mod event_bus;
+mod i18n;
 mod llm_runtime;
 mod mutation;
 mod provider;
@@ -150,6 +151,11 @@ fn save_provider_config(
     project_root: Option<String>,
 ) -> Result<ProviderConfigFileResponse, String> {
     config_file::save_provider_config(&app, content, project_root)
+}
+
+#[tauri::command]
+fn find_opencode_config(project_root: Option<String>) -> Result<Option<String>, String> {
+    config_file::find_opencode_config(project_root.as_deref())
 }
 
 #[tauri::command]
@@ -380,6 +386,11 @@ fn save_shell_policy(app: AppHandle, policy: ShellPolicy) -> Result<ShellPolicy,
 }
 
 #[tauri::command]
+fn set_app_locale(locale: String) {
+    i18n::set_app_locale(&locale);
+}
+
+#[tauri::command]
 fn list_project_files(root: String) -> Result<Vec<ProjectFile>, String> {
     workspace::list_project_files(root)
 }
@@ -414,11 +425,13 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             start_float_drag,
+            set_app_locale,
             save_provider,
             list_providers,
             delete_provider,
             load_provider_config,
             save_provider_config,
+            find_opencode_config,
             create_session,
             list_sessions,
             delete_session,

@@ -135,10 +135,12 @@ textarea:focus {
 }
 
 .appShell {
+  position: relative;
   height: 100vh;
   display: grid;
   color: var(--ink);
   overflow: hidden;
+  overflow-x: hidden;
 }
 
 .leftPane,
@@ -158,10 +160,6 @@ textarea:focus {
   border-left: 1px solid var(--border);
 }
 
-.rightPane.collapsed {
-  align-items: center;
-}
-
 .rightPaneToggle {
   position: absolute;
   top: 10px;
@@ -175,12 +173,6 @@ textarea:focus {
   display: grid;
   place-items: center;
   z-index: 2;
-}
-
-.rightPane.collapsed .rightPaneToggle {
-  right: auto;
-  left: 50%;
-  transform: translateX(-50%);
 }
 
 .resizeHandle {
@@ -597,7 +589,7 @@ textarea:focus {
   display: inline-flex;
   align-items: center;
   gap: 2px;
-  margin-left: auto;
+  flex-shrink: 0;
 }
 
 .promptNavIconButton {
@@ -1485,10 +1477,10 @@ pre {
 .inlineRollbackButton {
   min-height: 30px;
   padding: 0 10px;
-  border: 1px solid rgba(169, 111, 22, 0.38);
+  border: 1px solid var(--accent-border);
   border-radius: 6px;
-  color: var(--warning-text);
-  background: var(--warning-soft);
+  color: var(--accent);
+  background: var(--accent-soft);
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -1760,6 +1752,7 @@ pre {
   padding: 2px;
   border: 0;
   background: transparent;
+  flex-shrink: 0;
 }
 
 .composerShellMode.segmented button {
@@ -1770,8 +1763,8 @@ pre {
 }
 
 .composerShellMode.segmented button.active {
-  color: var(--warning-text);
-  background: var(--warning-soft);
+  color: var(--accent-contrast);
+  background: var(--accent);
 }
 
 .composerSendButton {
@@ -2204,6 +2197,68 @@ pre {
   padding: 0 10px;
 }
 
+.setupDialog {
+  width: min(520px, calc(100vw - 44px));
+}
+
+.setupSubtitle {
+  color: var(--text-soft);
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.setupPresets {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.presetButton {
+  height: 30px;
+  padding: 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-soft);
+  color: var(--text-soft);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.presetButton:hover {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.presetButton.presetHighlight {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.presetButton.presetHighlight:hover {
+  background: var(--accent);
+  color: #fff;
+}
+
+.presetButton svg {
+  flex-shrink: 0;
+}
+
+.setupTextEditor {
+  min-height: 260px;
+  max-height: 420px;
+  font-family: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  resize: vertical;
+}
+
 :root[data-theme="dark"] .brandIcon {
   background: var(--accent-soft);
 }
@@ -2297,11 +2352,6 @@ pre {
 
 :root[data-theme="dark"] .composerModelEmpty {
   color: var(--muted);
-}
-
-:root[data-theme="dark"] .composerShellMode.segmented button.active {
-  color: var(--warning-text);
-  background: var(--warning-soft);
 }
 
 :root[data-theme="dark"] .promptNavIconButton {
@@ -2413,10 +2463,6 @@ pre {
 @media (max-width: 1180px) {
   body {
     min-width: 0;
-  }
-
-  .appShell {
-    overflow-x: auto;
   }
 }
 

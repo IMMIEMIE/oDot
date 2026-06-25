@@ -1,5 +1,6 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { appT } from "./i18n";
 
 export type ProviderKind =
   | "openai"
@@ -216,6 +217,15 @@ export async function saveProviderConfig(
   });
 }
 
+export async function findOpencodeConfig(
+  projectRoot?: string
+): Promise<string | null> {
+  assertTauri();
+  return invoke<string | null>("find_opencode_config", {
+    projectRoot: projectRoot?.trim() || null
+  });
+}
+
 export async function createSession(
   input: CreateSessionInput
 ): Promise<SessionRecord> {
@@ -389,7 +399,7 @@ export async function pickProjectDirectory(): Promise<string | null> {
   const selected = await open({
     directory: true,
     multiple: false,
-    title: "选择 oDot 项目目录"
+    title: appT("api.pickProjectTitle")
   });
 
   return typeof selected === "string" ? selected : null;
@@ -397,6 +407,6 @@ export async function pickProjectDirectory(): Promise<string | null> {
 
 function assertTauri() {
   if (!isTauri()) {
-    throw new Error("oDot 桌面 API 只能在 Tauri 应用内使用。");
+    throw new Error(appT("api.tauriOnly"));
   }
 }

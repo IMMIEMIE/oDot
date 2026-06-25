@@ -4,6 +4,7 @@ import type {
   SessionEventsResponse,
   SessionRecord
 } from "./api";
+import { appT } from "./i18n";
 import type { PromptAttachmentKind } from "./promptAttachments";
 
 export const FLOAT_AGENT_STATUS_STORAGE_KEY = "odot.floatAgentStatus";
@@ -26,7 +27,7 @@ export type FloatPendingApproval = {
 
 export const DEFAULT_FLOAT_AGENT_STATUS: FloatAgentStatusRecord = {
   kind: "idle",
-  label: "Agent 空闲",
+  label: appT("floatStatus.idle"),
   sessionId: "",
   allowedAttachmentKinds: [],
   pendingApproval: null,
@@ -48,7 +49,7 @@ export function deriveFloatAgentStatus({
 }: FloatAgentStatusInput): FloatAgentStatusRecord {
   const sessionId = session?.id ?? "";
   if (!session) {
-    return floatAgentStatus("idle", "Agent 空闲", sessionId, allowedAttachmentKinds);
+    return floatAgentStatus("idle", appT("floatStatus.idle"), sessionId, allowedAttachmentKinds);
   }
 
   const latestStatus = latestStatusEvent(eventsResponse.events);
@@ -60,21 +61,21 @@ export function deriveFloatAgentStatus({
   const hasPendingPermissionRequest = hasPendingPermission(eventsResponse.permissions);
 
   if (session.status === "failed" || statusEventIsFailure(latestStatus)) {
-    return floatAgentStatus("error", "Agent 报错", sessionId, allowedAttachmentKinds);
+    return floatAgentStatus("error", appT("floatStatus.error"), sessionId, allowedAttachmentKinds);
   }
 
   if (isWorking) {
-    return floatAgentStatus("idle", "Agent 工作中", sessionId, allowedAttachmentKinds);
+    return floatAgentStatus("idle", appT("floatStatus.working"), sessionId, allowedAttachmentKinds);
   }
 
   if (statusEventIsComplete(latestStatus)) {
-    return floatAgentStatus("complete", "任务完成", sessionId, allowedAttachmentKinds);
+    return floatAgentStatus("complete", appT("floatStatus.complete"), sessionId, allowedAttachmentKinds);
   }
 
   if (currentPendingApproval || hasPendingPermissionRequest) {
     return floatAgentStatus(
       "approval",
-      "等待批准",
+      appT("floatStatus.waitingApproval"),
       sessionId,
       allowedAttachmentKinds,
       currentPendingApproval
@@ -82,10 +83,10 @@ export function deriveFloatAgentStatus({
   }
 
   if (session.status === "completed") {
-    return floatAgentStatus("complete", "任务完成", sessionId, allowedAttachmentKinds);
+    return floatAgentStatus("complete", appT("floatStatus.complete"), sessionId, allowedAttachmentKinds);
   }
 
-  return floatAgentStatus("idle", "Agent 空闲", sessionId, allowedAttachmentKinds);
+  return floatAgentStatus("idle", appT("floatStatus.idle"), sessionId, allowedAttachmentKinds);
 }
 
 export function saveFloatAgentStatus(status: FloatAgentStatusRecord) {
@@ -224,7 +225,7 @@ function pendingCommand(event: EventRecord) {
   return (
     valueAsString(pending.command) ||
     valueAsString(event.data.command) ||
-    "待确认命令"
+    appT("event.pendingCommand")
   );
 }
 
@@ -247,7 +248,7 @@ function normalizePendingApproval(value: unknown): FloatPendingApproval | null {
   }
   return {
     eventId,
-    command: valueAsString(record.command) || "待确认命令"
+    command: valueAsString(record.command) || appT("event.pendingCommand")
   };
 }
 

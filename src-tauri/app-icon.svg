@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <circle cx="512" cy="512" r="512" fill="#d34947" />
+  <g
+    fill="none"
+    stroke="#ffffff"
+    stroke-width="2.4"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    transform="translate(512 512) scale(32) translate(-12 -12)"
+  >
+    <line x1="12" y1="6.5" x2="12" y2="2.5" />
+    <circle cx="12" cy="1.5" r="1" fill="#ffffff" stroke="none" />
+    <circle cx="12" cy="13.5" r="7" />
+    <line x1="9.75" y1="12.5" x2="9.75" y2="15.5" />
+    <line x1="14.25" y1="12.5" x2="14.25" y2="15.5" />
+  </g>
+</svg>

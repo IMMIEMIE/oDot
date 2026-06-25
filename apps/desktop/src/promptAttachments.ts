@@ -1,4 +1,5 @@
 import type { PromptAttachmentInput } from "./api";
+import { appT } from "./i18n";
 
 export const MAX_TEXT_ATTACHMENT_BYTES = 250_000;
 export const MAX_IMAGE_ATTACHMENT_BYTES = 5 * 1024 * 1024;
@@ -38,13 +39,23 @@ export async function readPromptAttachment(
 ): Promise<PromptAttachment> {
   const kind = promptAttachmentKindForFile(file, allowedKinds);
   if (!kind) {
-    throw new Error(`当前模型不支持该附件类型：${file.name}`);
+    throw new Error(appT("attachmentError.unsupportedType", { name: file.name }));
   }
   if (kind === "text" && file.size > MAX_TEXT_ATTACHMENT_BYTES) {
-    throw new Error(`文本附件过大：${file.name}，最大 ${formatBytes(MAX_TEXT_ATTACHMENT_BYTES)}。`);
+    throw new Error(
+      appT("attachmentError.textTooLarge", {
+        name: file.name,
+        limit: formatBytes(MAX_TEXT_ATTACHMENT_BYTES)
+      })
+    );
   }
   if (kind === "image" && file.size > MAX_IMAGE_ATTACHMENT_BYTES) {
-    throw new Error(`图片附件过大：${file.name}，最大 ${formatBytes(MAX_IMAGE_ATTACHMENT_BYTES)}。`);
+    throw new Error(
+      appT("attachmentError.imageTooLarge", {
+        name: file.name,
+        limit: formatBytes(MAX_IMAGE_ATTACHMENT_BYTES)
+      })
+    );
   }
 
   const mime = attachmentMimeForFile(file, kind);
@@ -156,7 +167,8 @@ function readFileAsText(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(String(reader.result ?? ""));
-    reader.onerror = () => reject(reader.error ?? new Error(`无法读取附件：${file.name}`));
+    reader.onerror = () =>
+      reject(reader.error ?? new Error(appT("attachmentError.readFailed", { name: file.name })));
     reader.readAsText(file);
   });
 }
@@ -168,7 +180,8 @@ function readFileAsDataUrl(file: File, mime: string): Promise<string> {
       const value = String(reader.result ?? "");
       resolve(value.replace(/^data:[^;,]*/, `data:${mime}`));
     };
-    reader.onerror = () => reject(reader.error ?? new Error(`无法读取附件：${file.name}`));
+    reader.onerror = () =>
+      reject(reader.error ?? new Error(appT("attachmentError.readFailed", { name: file.name })));
     reader.readAsDataURL(file);
   });
 }

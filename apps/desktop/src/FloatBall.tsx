@@ -8,14 +8,15 @@ import {
   ArrowLeft,
   ArrowRight,
   ArrowUp,
-  CheckCircle2,
   KeyRound,
   Send,
   X
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import type { ClipboardEvent as ReactClipboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import { OdodBotIcon } from "./OdodBotIcon";
+import { appT } from "./i18n";
 import {
   approveToolCall,
   continueSession,
@@ -45,6 +46,7 @@ type PromptPanelDirection = "up" | "right" | "down" | "left";
 const DRAG_THRESHOLD = 4;
 
 export function FloatBall() {
+  const { t } = useTranslation();
   const [isDragging, setIsDragging] = useState(false);
   const [agentStatus, setAgentStatus] = useState(loadFloatAgentStatus);
   const [promptDirection, setPromptDirection] = useState<PromptPanelDirection | null>(null);
@@ -162,7 +164,7 @@ export function FloatBall() {
     }
     event.preventDefault();
     if (!agentStatus.allowedAttachmentKinds.length) {
-      setPanelError("当前模型不支持附件");
+      setPanelError(t("error.attachmentsUnsupported"));
       return;
     }
     try {
@@ -182,7 +184,7 @@ export function FloatBall() {
       return;
     }
     if (!agentStatus.sessionId) {
-      setPanelError("没有当前会话");
+      setPanelError(t("error.noCurrentSession"));
       return;
     }
     setIsSubmittingPrompt(true);
@@ -190,13 +192,13 @@ export function FloatBall() {
     setAgentStatus((current) => syncLocalStatus({
       ...current,
       kind: "idle",
-      label: "Agent 工作中",
+      label: t("float.agentWorking"),
       pendingApproval: null
     }));
     try {
       await promptSession({
         sessionId: agentStatus.sessionId,
-        prompt: prompt || "请根据附件内容继续。",
+        prompt: prompt || t("prompt.continueFromAttachment"),
         attachments: attachments.map(toPromptAttachmentInput),
         delivery: "queue",
         resume: true
@@ -211,7 +213,7 @@ export function FloatBall() {
       setAgentStatus((current) => syncLocalStatus({
         ...current,
         kind: "error",
-        label: "Agent 报错"
+        label: t("float.agentError")
       }));
     } finally {
       setIsSubmittingPrompt(false);
@@ -249,7 +251,7 @@ export function FloatBall() {
       setAgentStatus((current) => syncLocalStatus({
         ...current,
         kind: "idle",
-        label: action === "reject" ? "命令已拒绝" : "Agent 工作中",
+        label: action === "reject" ? t("float.commandRejected") : t("float.agentWorking"),
         pendingApproval: null
       }));
     } catch (error) {
@@ -257,7 +259,7 @@ export function FloatBall() {
       setAgentStatus((current) => syncLocalStatus({
         ...current,
         kind: "error",
-        label: "Agent 报错"
+        label: t("float.agentError")
       }));
     } finally {
       setIsResolvingApproval(false);
@@ -280,7 +282,7 @@ export function FloatBall() {
           <button
             type="button"
             className="floatArrow floatArrow--up"
-            aria-label="向上打开输入框"
+            aria-label={t("prompt.openUp")}
             onPointerDown={(event) => event.stopPropagation()}
             onClick={(event) => {
               event.stopPropagation();
@@ -292,7 +294,7 @@ export function FloatBall() {
           <button
             type="button"
             className="floatArrow floatArrow--right"
-            aria-label="向右打开输入框"
+            aria-label={t("prompt.openRight")}
             onPointerDown={(event) => event.stopPropagation()}
             onClick={(event) => {
               event.stopPropagation();
@@ -304,7 +306,7 @@ export function FloatBall() {
           <button
             type="button"
             className="floatArrow floatArrow--down"
-            aria-label="向下打开输入框"
+            aria-label={t("prompt.openDown")}
             onPointerDown={(event) => event.stopPropagation()}
             onClick={(event) => {
               event.stopPropagation();
@@ -316,7 +318,7 @@ export function FloatBall() {
           <button
             type="button"
             className="floatArrow floatArrow--left"
-            aria-label="向左打开输入框"
+            aria-label={t("prompt.openLeft")}
             onPointerDown={(event) => event.stopPropagation()}
             onClick={(event) => {
               event.stopPropagation();
@@ -350,11 +352,11 @@ export function FloatBall() {
           }}
         >
           <div className="floatPanelHeader">
-            <span>继续当前会话</span>
+            <span>{t("prompt.continueSession")}</span>
             <button
               type="button"
               className="floatPanelIconButton"
-              aria-label="关闭输入框"
+              aria-label={t("prompt.closePanel")}
               onClick={closePromptPanel}
             >
               <X size={13} />
@@ -363,7 +365,7 @@ export function FloatBall() {
           <textarea
             className="floatPromptInput"
             value={promptText}
-            placeholder="输入 prompt，Enter 发送"
+            placeholder={t("prompt.placeholder")}
             disabled={isSubmittingPrompt}
             onChange={(event) => setPromptText(event.target.value)}
             onPaste={(event) => void handlePaste(event)}
@@ -378,10 +380,10 @@ export function FloatBall() {
             <div className="floatAttachmentList">
               {attachments.map((attachment) => (
                 <span className="floatAttachmentChip" key={attachment.id}>
-                  {attachment.kind === "image" ? "图片" : "文本"} · {formatBytes(attachment.size)}
+                  {attachment.kind === "image" ? t("common.image") : t("common.text")} · {formatBytes(attachment.size)}
                   <button
                     type="button"
-                    aria-label={`移除 ${attachment.name}`}
+                    aria-label={t("nav.removeAttachment", { name: attachment.name })}
                     onClick={() =>
                       setAttachments((current) =>
                         current.filter((item) => item.id !== attachment.id)
@@ -396,14 +398,14 @@ export function FloatBall() {
           )}
           {panelError && <div className="floatPanelError">{panelError}</div>}
           <div className="floatPromptFooter">
-            <span>{isSubmittingPrompt ? "发送中..." : "可粘贴附件"}</span>
+            <span>{isSubmittingPrompt ? t("common.sending") : t("prompt.pasteAttachments")}</span>
             <button
               type="submit"
               className="floatPrimaryButton"
               disabled={!canSendPrompt}
             >
               <Send size={13} />
-              发送
+              {t("common.send")}
             </button>
           </div>
         </form>
@@ -415,7 +417,7 @@ export function FloatBall() {
           onPointerDown={(event) => event.stopPropagation()}
         >
           <div className="floatPanelHeader">
-            <span>等待批准</span>
+            <span>{t("prompt.waitingApproval")}</span>
           </div>
           <code className="floatCommandPreview">
             {agentStatus.pendingApproval.command}
@@ -428,7 +430,7 @@ export function FloatBall() {
               disabled={isResolvingApproval}
               onClick={() => void resolveApproval("approve")}
             >
-              批准
+              {t("common.approve")}
             </button>
             <button
               type="button"
@@ -436,7 +438,7 @@ export function FloatBall() {
               disabled={isResolvingApproval}
               onClick={() => void resolveApproval("allow")}
             >
-              加白
+              {t("common.addToAllowlist")}
             </button>
             <button
               type="button"
@@ -444,7 +446,7 @@ export function FloatBall() {
               disabled={isResolvingApproval}
               onClick={() => void resolveApproval("reject")}
             >
-              拒绝
+              {t("common.reject")}
             </button>
           </div>
         </section>
@@ -486,7 +488,7 @@ function errorSummary(error: unknown) {
   if (typeof error === "string") {
     return error;
   }
-  return "操作失败";
+  return appT("error.operationFailed");
 }
 
 function formatBytes(value: number) {

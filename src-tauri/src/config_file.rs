@@ -99,7 +99,9 @@ pub fn load_provider_config_for_project(
     project_root: Option<String>,
 ) -> Result<ProviderConfigFileResponse, String> {
     let path = config_path(app, project_root.as_deref())?;
-    ensure_config_file(&path)?;
+    if !path.exists() {
+        return Err("CONFIG_NOT_FOUND".to_string());
+    }
 
     let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
     let (providers, selected_provider_id) = sync_provider_config(app, &content)?;
@@ -382,6 +384,51 @@ fn ensure_config_file(path: &Path) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     fs::write(path, default_config()).map_err(|error| error.to_string())
+}
+
+pub fn find_opencode_config(project_root: Option<&str>) -> Result<Option<String>, String> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Some(root) = project_root.map(str::trim).filter(|v| !v.is_empty()) {
+        candidates.push(PathBuf::from(root).join("opencode.json"));
+    }
+
+    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME"));
+    if let Ok(home) = home {
+        let h = PathBuf::from(&home);
+        candidates.push(h.join(".config").join("opencode").join("opencode.json"));
+        candidates.push(h.join("opencode.json"));
+        candidates.push(h.join(".opencode.json"));
+        candidates.push(
+            h.join("AppData")
+                .join("Roaming")
+                .join("opencode")
+                .join("opencode.json"),
+        );
+        candidates.push(
+            h.join("AppData")
+                .join("Local")
+                .join("opencode")
+                .join("opencode.json"),
+        );
+    }
+
+    if let Ok(appdata) = env::var("APPDATA") {
+        candidates.push(PathBuf::from(appdata).join("opencode").join("opencode.json"));
+    }
+
+    for candidate in candidates {
+        if candidate.exists() {
+            let content = fs::read_to_string(&candidate).map_err(|e| e.to_string())?;
+            if let Ok(config) = serde_json::from_str::<Value>(&content) {
+                if config.get("provider").is_some() {
+                    return Ok(Some(content));
+                }
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 fn model_entries(provider: &ConfigProvider) -> Vec<(String, ConfigModel)> {

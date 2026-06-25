@@ -34,6 +34,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import type {
   ChangeEvent,
   ClipboardEvent as ReactClipboardEvent,
@@ -51,6 +52,7 @@ import {
   createSession,
   deleteSession,
   fetchProjectFiles,
+  findOpencodeConfig,
   getSessionEvents,
   tailSessionEvents,
   listSessions,
@@ -98,6 +100,16 @@ import {
   type PromptAttachment,
   type PromptAttachmentKind
 } from "./promptAttachments";
+import {
+  appT,
+  buildPlanExecutionPrompt,
+  type AppLocale,
+  PLAN_EXECUTION_MARKER,
+  recoveryActionDescription,
+  recoveryActionLabel,
+  setAppLocale
+} from "./i18n";
+import i18n from "./i18n";
 
 type Notice = {
   tone: "info" | "success" | "error";
@@ -117,6 +129,7 @@ type TreeNode = {
 };
 
 export function App() {
+  const { t } = useTranslation();
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
   const [configPath, setConfigPath] = useState("");
   const [configContent, setConfigContent] = useState("");
@@ -146,7 +159,7 @@ export function App() {
   const [lastError, setLastError] = useState<string | null>(null);
   const [notice, setNotice] = useState<Notice>({
     tone: "info",
-    text: "准备就绪"
+    text: i18n.t("notice.ready")
   });
   const [isBooting, setIsBooting] = useState(true);
   const [isSavingConfig, setIsSavingConfig] = useState(false);
@@ -157,6 +170,9 @@ export function App() {
   const [isStopping, setIsStopping] = useState(false);
   const [isMutating, setIsMutating] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [needsSetup, setNeedsSetup] = useState(false);
+  const [setupError, setSetupError] = useState("");
+  const [isSetupSaving, setIsSetupSaving] = useState(false);
   const [isSessionsOpen, setIsSessionsOpen] = useState(false);
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
   const [editingSessionTitle, setEditingSessionTitle] = useState("");
@@ -180,7 +196,7 @@ export function App() {
     const stored = Number(localStorage.getItem("odot.leftWidth"));
     return Number.isFinite(stored) && stored >= 300 ? stored : 420;
   });
-  const [isRightPaneCollapsed, setIsRightPaneCollapsed] = useState(false);
+  const [isRightPaneCollapsed, setIsRightPaneCollapsed] = useState(true);
 
   useEffect(() => {
     void bootstrap();
@@ -242,7 +258,7 @@ export function App() {
         payload.event.seq > stopBaselineSeqRef.current
       ) {
         setIsStopping(false);
-        setNotice({ tone: "success", text: "Agent 已停止" });
+        setNotice({ tone: "success", text: i18n.t("notice.agentStopped") });
       }
       if (
         payload.kind === "session.start" ||
@@ -293,7 +309,7 @@ export function App() {
   );
   const selectedModelLabel = selectedProvider
     ? providerModelLabel(selectedProvider)
-    : "未选择模型";
+    : t("session.noModelSelected");
   const allowedAttachmentKinds = useMemo(
     () => attachmentKindsFromConfig(configContent, selectedProviderId),
     [configContent, selectedProviderId]
@@ -396,6 +412,21 @@ export function App() {
       ),
     [dismissedJobIds, eventsResponse.jobs]
   );
+
+  // Auto-expand right pane when agent needs user approval
+  useEffect(() => {
+    if (
+      isRightPaneCollapsed &&
+      (pendingToolEvents.length > 0 ||
+        visiblePermissionRequests(eventsResponse.permissions).length > 0)
+    ) {
+      setIsRightPaneCollapsed(false);
+    }
+  }, [
+    pendingToolEvents,
+    eventsResponse.permissions,
+    isRightPaneCollapsed,
+  ]);
 
   const contextUsage = useMemo(
     () =>
@@ -518,8 +549,21 @@ export function App() {
   async function bootstrap() {
     setIsBooting(true);
     try {
-      const [config, nextSessions, policy] = await Promise.all([
-        loadProviderConfig(projectRoot),
+      const configResult = await loadProviderConfig(projectRoot).catch((configError: unknown) => {
+        const msg = errorMessage(configError);
+        setSetupError(
+          msg.includes("CONFIG_NOT_FOUND")
+            ? t("setup.configNotFound")
+            : t("setup.configParseError")
+        );
+        setNeedsSetup(true);
+        return null;
+      });
+      if (!configResult) {
+        return;
+      }
+      const config = configResult;
+      const [nextSessions, policy] = await Promise.all([
         listSessions(),
         loadShellPolicy()
       ]);
@@ -542,7 +586,7 @@ export function App() {
         setEventsResponse(EMPTY_EVENTS);
         setStreamingEventId(null);
       }
-      setNotice({ tone: "success", text: "工作区已加载" });
+      setNotice({ tone: "success", text: t("notice.workspaceLoaded") });
     } catch (error) {
       reportError(error);
     } finally {
@@ -571,12 +615,42 @@ export function App() {
         setEventsResponse(EMPTY_EVENTS);
       }
       setIsSettingsOpen(false);
-      setNotice({ tone: "success", text: "设置已保存" });
+      setNotice({ tone: "success", text: t("notice.settingsSaved") });
     } catch (error) {
       reportError(error);
       throw error;
     } finally {
       setIsSavingConfig(false);
+    }
+  }
+
+  async function handleSetupComplete(content: string) {
+    setIsSetupSaving(true);
+    try {
+      const config = await saveProviderConfig(content, projectRoot);
+      setConfigPath(config.path);
+      setConfigContent(config.content);
+      setProviders(config.providers);
+      const preferredProviderId = preferredConfigProviderId(config);
+      if (preferredProviderId) {
+        setSelectedProviderId(preferredProviderId);
+      }
+      setNeedsSetup(false);
+      setSetupError("");
+      const [nextSessions, policy] = await Promise.all([
+        listSessions(),
+        loadShellPolicy()
+      ]);
+      setSessions(nextSessions);
+      setShellPolicy(policy);
+      setSelectedSessionId("");
+      setEventsResponse(EMPTY_EVENTS);
+      setStreamingEventId(null);
+      setNotice({ tone: "success", text: t("notice.configCreated") });
+    } catch (error) {
+      setSetupError(errorMessage(error));
+    } finally {
+      setIsSetupSaving(false);
     }
   }
 
@@ -598,7 +672,7 @@ export function App() {
     );
     await Promise.all([loadEvents(session.id), loadFiles(session.projectRoot)]);
     if (!sessionProviderExists) {
-      setNotice({ tone: "error", text: "该会话引用的 AI 服务配置已不存在" });
+      setNotice({ tone: "error", text: t("notice.sessionProviderMissing") });
     }
   }
 
@@ -658,7 +732,10 @@ export function App() {
       setFiles(nextFiles);
       setSelectedPaths(new Set());
       setExpandedDirs(new Set(initialExpandedDirs(nextFiles)));
-      setNotice({ tone: "success", text: `已索引 ${nextFiles.length} 个文件` });
+      setNotice({
+        tone: "success",
+        text: t("notice.filesIndexed", { count: nextFiles.length })
+      });
     } catch (error) {
       setFiles([]);
       reportError(error);
@@ -692,10 +769,10 @@ export function App() {
       (provider) => provider.id === selectedProviderId
     );
     if (!selectedProviderId || !providerExists) {
-      throw new Error("当前 AI 服务配置不存在，请先在 JSON 中保存并选择一个服务。");
+      throw new Error(t("error.providerMissing"));
     }
     if (!projectRoot.trim()) {
-      throw new Error("请先选择项目目录。");
+      throw new Error(t("error.selectProject"));
     }
     if (selectedSession) {
       if (selectedSession.mode !== mode || selectedSession.shellMode !== shellMode) {
@@ -729,7 +806,7 @@ export function App() {
       });
       await refreshSessions();
       setSelectedSessionId(session.id);
-      setNotice({ tone: "success", text: "会话已创建" });
+      setNotice({ tone: "success", text: t("notice.sessionCreated") });
       setEventsResponse(EMPTY_EVENTS);
       return session;
     } catch (error) {
@@ -754,7 +831,7 @@ export function App() {
       return;
     }
     if (!selectedProviderId || !canUploadAttachments) {
-      setNotice({ tone: "error", text: "当前模型不支持附件上传" });
+      setNotice({ tone: "error", text: t("notice.attachmentsUnsupported") });
       return;
     }
     try {
@@ -764,7 +841,7 @@ export function App() {
       setPromptAttachments((current) => [...current, ...nextAttachments]);
       setNotice({
         tone: "success",
-        text: `已添加 ${nextAttachments.length} 个附件`
+        text: t("notice.attachmentsAdded", { count: nextAttachments.length })
       });
     } catch (error) {
       reportError(error);
@@ -797,13 +874,13 @@ export function App() {
     const runId = activeRunIdRef.current + 1;
     activeRunIdRef.current = runId;
     setIsSubmitting(true);
-    setNotice({ tone: "info", text: "Agent 正在工作" });
+    setNotice({ tone: "info", text: t("notice.agentWorking") });
     try {
       const session = await ensureSession();
       const previousMaxSeq = eventsResponse.events.at(-1)?.seq ?? 0;
       const selectedFileText = Array.from(selectedPaths).sort().join("\n");
       const finalPrompt = selectedFileText
-        ? `${prompt.trim() || "请根据附件内容继续。"}\n\n已选择文件:\n${selectedFileText}`
+        ? `${prompt.trim() || t("prompt.continueFromAttachment")}\n\n${t("prompt.selectedFiles")}\n${selectedFileText}`
         : prompt;
       const response = await promptSession({
         sessionId: session.id,
@@ -829,8 +906,8 @@ export function App() {
       setNotice({
         tone: "success",
         text: hasUnresolvedPendingTools(response.events)
-          ? "等待命令确认"
-          : "Agent 已结束"
+          ? t("notice.waitingCommand")
+          : t("notice.agentEnded")
       });
     } catch (error) {
       if (activeRunIdRef.current !== runId) {
@@ -855,14 +932,14 @@ export function App() {
 
     const planText = valueAsString(planEvent.data.text).trim();
     if (!planText) {
-      setNotice({ tone: "error", text: "没有可执行的计划内容" });
+      setNotice({ tone: "error", text: t("notice.noPlanContent") });
       return;
     }
 
     const runId = activeRunIdRef.current + 1;
     activeRunIdRef.current = runId;
     setIsSubmitting(true);
-    setNotice({ tone: "info", text: "正在执行计划" });
+    setNotice({ tone: "info", text: t("notice.executingPlan") });
     try {
       const executionSession = await updateSessionMode({
         sessionId: selectedSession.id,
@@ -893,8 +970,8 @@ export function App() {
       setNotice({
         tone: "success",
         text: hasUnresolvedPendingTools(response.events)
-          ? "等待命令确认"
-          : "计划执行已结束"
+          ? t("notice.waitingCommand")
+          : t("notice.planExecutionEnded")
       });
     } catch (error) {
       if (activeRunIdRef.current !== runId) {
@@ -916,7 +993,7 @@ export function App() {
     setIsSubmitting(false);
     setIsContinuing(false);
     setIsStopping(true);
-    setNotice({ tone: "info", text: "正在停止 Agent" });
+    setNotice({ tone: "info", text: t("notice.stoppingAgent") });
     if (!sessionId) {
       setIsStopping(false);
       return;
@@ -929,7 +1006,7 @@ export function App() {
         event.seq > stopBaselineSeqRef.current
       ) {
         setIsStopping(false);
-        setNotice({ tone: "success", text: "Agent 已停止" });
+        setNotice({ tone: "success", text: i18n.t("notice.agentStopped") });
       }
     } catch (error) {
       setIsStopping(false);
@@ -943,7 +1020,7 @@ export function App() {
     activeRunIdRef.current = runId;
     setIsMutating(true);
     setIsContinuing(true);
-    setNotice({ tone: "info", text: "Agent 正在继续" });
+    setNotice({ tone: "info", text: t("notice.agentContinuing") });
     try {
       const sessionId = selectedSessionId;
       const approvedEvent = await approveToolCall(eventId);
@@ -956,12 +1033,12 @@ export function App() {
         setNotice({
           tone: "success",
           text: hasUnresolvedPendingTools(response.events)
-            ? "等待命令确认"
-            : "Agent 已结束"
+            ? t("notice.waitingCommand")
+            : t("notice.agentEnded")
         });
       } else {
         applyEventRecord(approvedEvent);
-        setNotice({ tone: "success", text: "命令已批准" });
+        setNotice({ tone: "success", text: t("notice.commandApproved") });
       }
     } catch (error) {
       if (activeRunIdRef.current !== runId) {
@@ -1004,7 +1081,7 @@ export function App() {
     try {
       const event = await rejectToolCall(eventId);
       applyEventRecord(event);
-      setNotice({ tone: "success", text: "命令已拒绝" });
+      setNotice({ tone: "success", text: t("notice.commandRejected") });
     } catch (error) {
       reportError(error);
     } finally {
@@ -1023,7 +1100,10 @@ export function App() {
         seq: 0,
         permission
       });
-      setNotice({ tone: reply === "reject" ? "error" : "success", text: "权限已处理" });
+      setNotice({
+        tone: reply === "reject" ? "error" : "success",
+        text: t("notice.permissionHandled")
+      });
     } catch (error) {
       reportError(error);
     } finally {
@@ -1041,7 +1121,7 @@ export function App() {
     }));
     try {
       await cancelJob(jobId);
-      setNotice({ tone: "success", text: "后台任务已停止" });
+      setNotice({ tone: "success", text: t("notice.jobStopped") });
     } catch (error) {
       setDismissedJobIds((current) => {
         const next = new Set(current);
@@ -1063,7 +1143,7 @@ export function App() {
   }
 
   async function handleRollback(snapshotId: string) {
-    await handleRollbackMany([snapshotId], "快照已回滚");
+    await handleRollbackMany([snapshotId], t("notice.snapshotRolledBack"));
   }
 
   async function handleRollbackMany(snapshotIds: string[], successText: string) {
@@ -1071,7 +1151,7 @@ export function App() {
       return;
     }
     if (!snapshotIds.length) {
-      setNotice({ tone: "info", text: "没有可回滚的代码变更" });
+      setNotice({ tone: "info", text: t("notice.noRollbackChanges") });
       return;
     }
     rollbackInFlightRef.current = true;
@@ -1108,7 +1188,7 @@ export function App() {
         summary
       });
       scheduleRealtimeTailRefresh(selectedSessionId);
-      setNotice({ tone: "success", text: "上下文已压缩" });
+      setNotice({ tone: "success", text: t("notice.contextCompacted") });
     } catch (error) {
       reportError(error);
     } finally {
@@ -1133,10 +1213,10 @@ export function App() {
     setNotice({
       tone: "info",
       text: checkpointId
-        ? "正在从检查点恢复"
+        ? t("notice.recoveringCheckpoint")
         : actionId === "retry"
-          ? "正在重试"
-          : "Agent 正在继续"
+          ? t("notice.retrying")
+          : t("notice.agentContinuing")
     });
     try {
       if (actionId === "compact") {
@@ -1164,8 +1244,8 @@ export function App() {
       setNotice({
         tone: "success",
         text: hasUnresolvedPendingTools(response.events)
-          ? "等待命令确认"
-          : "Agent 已结束"
+          ? t("notice.waitingCommand")
+          : t("notice.agentEnded")
       });
     } catch (error) {
       if (activeRunIdRef.current !== runId) {
@@ -1215,7 +1295,9 @@ export function App() {
 
   async function handleDeleteSession(sessionId: string) {
     const session = sessions.find((item) => item.id === sessionId);
-    const confirmed = window.confirm(`删除会话「${session?.title ?? sessionId}」？`);
+    const confirmed = window.confirm(
+      t("notice.deleteSessionConfirm", { title: session?.title ?? sessionId })
+    );
     if (!confirmed) {
       return;
     }
@@ -1236,7 +1318,7 @@ export function App() {
           setEventsResponse(EMPTY_EVENTS);
         }
       }
-      setNotice({ tone: "success", text: "会话已删除" });
+      setNotice({ tone: "success", text: t("notice.sessionDeleted") });
     } catch (error) {
       reportError(error);
     } finally {
@@ -1257,7 +1339,7 @@ export function App() {
   async function saveSessionTitle(sessionId: string) {
     const title = editingSessionTitle.trim();
     if (!title) {
-      setNotice({ tone: "error", text: "会话标题不能为空" });
+      setNotice({ tone: "error", text: t("notice.sessionTitleEmpty") });
       return;
     }
 
@@ -1266,7 +1348,7 @@ export function App() {
       await updateSessionTitle({ sessionId, title });
       await refreshSessions();
       cancelEditingSession();
-      setNotice({ tone: "success", text: "会话标题已更新" });
+      setNotice({ tone: "success", text: t("notice.sessionTitleUpdated") });
     } catch (error) {
       reportError(error);
     } finally {
@@ -1337,7 +1419,7 @@ export function App() {
           }
         >
           {isCreatingSession ? <Loader2 className="spin" size={16} /> : <Play size={16} />}
-          新建会话
+          {t("session.new")}
         </button>
         <div className="stackList sessionManagerList">
           {orderedSessions.map((session) => (
@@ -1377,7 +1459,7 @@ export function App() {
                 >
                   <strong>{session.title}</strong>
                   <small>
-                    {session.parentSessionId ? "子 Agent" : modeLabel(session.mode)} /{" "}
+                    {session.parentSessionId ? t("common.subAgent") : modeLabel(session.mode)} /{" "}
                     {shellModeLabel(session.shellMode)}
                   </small>
                 </button>
@@ -1385,7 +1467,7 @@ export function App() {
               <button
                 type="button"
                 className="rowIconAction"
-                aria-label={`重命名会话 ${session.title}`}
+                aria-label={t("nav.renameSession", { title: session.title })}
                 disabled={editingSessionId === session.id || isMutating || isAgentWorking}
                 onClick={() => startEditingSession(session)}
               >
@@ -1394,7 +1476,7 @@ export function App() {
               <button
                 type="button"
                 className="rowIconAction danger"
-                aria-label={`删除会话 ${session.title}`}
+                aria-label={t("nav.deleteSession", { title: session.title })}
                 disabled={isMutating || isAgentWorking}
                 onClick={() => void handleDeleteSession(session.id)}
               >
@@ -1402,7 +1484,7 @@ export function App() {
               </button>
             </div>
           ))}
-          {!availableSessions.length && <EmptyLine text="暂无可用会话" />}
+          {!availableSessions.length && <EmptyLine text={t("empty.noAvailableSessions")} />}
         </div>
       </>
     );
@@ -1412,7 +1494,7 @@ export function App() {
     <div
       className="appShell"
       style={{
-        gridTemplateColumns: `${leftWidth}px 6px minmax(0, 1fr) ${isRightPaneCollapsed ? 44 : 344}px`
+        gridTemplateColumns: `${leftWidth}px 6px minmax(0, 1fr) ${isRightPaneCollapsed ? 0 : 344}px`
       }}
     >
       <aside className="leftPane">
@@ -1427,26 +1509,26 @@ export function App() {
           </span>
           <span>
             <strong>oDot</strong>
-            <small>本地编程 Agent</small>
+            <small>{t("brand.tagline")}</small>
           </span>
         </header>
 
         <section className="leftSection providerConfigSection">
           <div className="sectionTitleRow">
-            <SectionTitle icon={<KeyRound size={16} />} title="AI 服务" />
+            <SectionTitle icon={<KeyRound size={16} />} title={t("nav.aiService")} />
             <div className="sectionActions">
               <button
                 className="iconButton ghost"
-                aria-label="管理会话"
-                title="管理会话"
+                aria-label={t("nav.manageSessions")}
+                title={t("nav.manageSessions")}
                 onClick={() => setIsSessionsOpen(true)}
               >
                 <MessageSquare size={16} />
               </button>
               <button
                 className="iconButton ghost"
-                aria-label="打开 AI 服务设置"
-                title="打开 AI 服务设置"
+                aria-label={t("nav.openSettings")}
+                title={t("nav.openSettings")}
                 onClick={() => setIsSettingsOpen(true)}
               >
                 <Settings size={16} />
@@ -1456,12 +1538,12 @@ export function App() {
         </section>
 
         <section className="leftSection projectSection">
-          <SectionTitle icon={<FolderOpen size={16} />} title="项目文件" />
+          <SectionTitle icon={<FolderOpen size={16} />} title={t("nav.projectFiles")} />
           <div className="pathRow">
             <input
               value={projectRoot}
               onChange={(event) => setProjectRoot(event.target.value)}
-              placeholder="项目目录"
+              placeholder={t("nav.projectRoot")}
             />
             <button className="iconButton" onClick={chooseProjectDirectory}>
               <FolderOpen size={17} />
@@ -1479,10 +1561,10 @@ export function App() {
             <input
               value={fileFilter}
               onChange={(event) => setFileFilter(event.target.value)}
-              placeholder="筛选文件"
+              placeholder={t("nav.filterFiles")}
             />
           </div>
-          <div className="fileTree" aria-label="项目文件树">
+          <div className="fileTree" aria-label={t("nav.fileTree")}>
             {fileTree.map((node) => (
               <FileTreeNode
                 key={node.path}
@@ -1495,7 +1577,7 @@ export function App() {
                 onToggleFile={toggleFile}
               />
             ))}
-            {!files.length && <EmptyLine text="尚未索引文件" />}
+            {!files.length && <EmptyLine text={t("empty.noIndexedFiles")} />}
           </div>
         </section>
 
@@ -1505,7 +1587,7 @@ export function App() {
         className="resizeHandle"
         onPointerDown={startLeftResize}
         role="separator"
-        aria-label="拖动调整侧边栏宽度"
+        aria-label={t("nav.resizeSidebar")}
       />
 
       <main className="mainPane">
@@ -1514,9 +1596,9 @@ export function App() {
             <Segmented
               value={mode}
               options={[
-                ["ask", "问答"],
-                ["plan", "计划"],
-                ["agent", "执行"]
+                ["ask", t("mode.ask")],
+                ["plan", t("mode.plan")],
+                ["agent", t("mode.agent")]
               ]}
               onChange={(value) => {
                 const nextMode = value as AgentMode;
@@ -1545,14 +1627,18 @@ export function App() {
           <div className="paneHeader">
             <div>
               <ContextUsageMeter usage={contextUsage} />
-              <strong>{selectedSession?.title ?? "暂无活动会话"}</strong>
+              <strong>{selectedSession?.title ?? t("empty.noActiveSession")}</strong>
               <small>
-                {selectedProvider ? selectedModelLabel : "未选择服务"} / 已选 {selectedPaths.size} 个文件
+                {selectedProvider ? selectedModelLabel : t("session.noServiceSelected")} /{" "}
+                {t("session.selectedFiles", { count: selectedPaths.size })}
               </small>
               {selectedChildSessions.length > 0 && (
                 <small className="subagentStatus">
-                  子 Agent {selectedChildSessions.length} 个 /{" "}
-                  {selectedChildSessions.filter((session) => session.status === "active").length} 活跃
+                  {t("session.subAgentStatus", {
+                    total: selectedChildSessions.length,
+                    active: selectedChildSessions.filter((session) => session.status === "active")
+                      .length
+                  })}
                 </small>
               )}
             </div>
@@ -1562,7 +1648,7 @@ export function App() {
               onClick={() => void handleCompact()}
             >
               <Database size={16} />
-              压缩上下文
+              {t("nav.compactContext")}
             </button>
           </div>
 
@@ -1577,14 +1663,14 @@ export function App() {
               rollbackDisabled={isMutating}
               onRollbackSnapshot={(snapshotId) => void handleRollback(snapshotId)}
               onRollbackSnapshots={(snapshotIds, successText) =>
-                void handleRollbackMany(snapshotIds, successText ?? "已回滚到提示词发送前")
+                void handleRollbackMany(snapshotIds, successText ?? t("notice.rolledBackBeforePrompt"))
               }
               onRecoverAgent={handleRecoverAgent}
             />
             {!eventsResponse.events.length && (
               <div className="emptyTimeline">
                 <BrainCircuit size={28} />
-                <span>输入提示词开始</span>
+                <span>{t("empty.startPrompt")}</span>
               </div>
             )}
             <div ref={timelineEndRef} />
@@ -1617,12 +1703,12 @@ export function App() {
                 onPaste={handlePromptPaste}
                 placeholder={
                   isAgentWorking
-                    ? "Agent 正在工作，结束后才能继续发送。"
+                    ? t("prompt.agentWorking")
                     : isStopping
-                      ? "Agent 正在停止，确认截断后才能继续发送。"
-                    : pendingToolEvents.length
-                      ? "请先处理待确认命令。"
-                      : "要求后续变更"
+                      ? t("prompt.agentStopping")
+                      : pendingToolEvents.length
+                        ? t("prompt.pendingCommands")
+                        : t("prompt.followUp")
                 }
                 onKeyDown={(event) => {
                   if (
@@ -1636,17 +1722,17 @@ export function App() {
                 }}
               />
               {promptAttachments.length > 0 && (
-                <div className="promptAttachmentList" aria-label="已上传附件">
+                <div className="promptAttachmentList" aria-label={t("nav.uploadedAttachments")}>
                   {promptAttachments.map((attachment) => (
                     <span className="promptAttachmentChip" key={attachment.id}>
                       <span>{attachment.name}</span>
                       <small>
-                        {attachment.kind === "image" ? "图片" : "文本"} ·{" "}
+                        {attachment.kind === "image" ? t("common.image") : t("common.text")} ·{" "}
                         {formatBytes(attachment.size)}
                       </small>
                       <button
                         type="button"
-                        aria-label={`移除附件 ${attachment.name}`}
+                        aria-label={t("nav.removeAttachment", { name: attachment.name })}
                         disabled={isPromptLocked}
                         onClick={() => removePromptAttachment(attachment.id)}
                       >
@@ -1664,9 +1750,9 @@ export function App() {
                     title={
                       selectedProviderId
                         ? attachmentUploadTitle(allowedAttachmentKinds)
-                        : "请先选择模型"
+                        : t("session.selectModelFirst")
                     }
-                    aria-label="上传附件"
+                    aria-label={t("nav.uploadAttachment")}
                     disabled={isPromptLocked || !selectedProviderId || !canUploadAttachments}
                     onClick={() => attachmentInputRef.current?.click()}
                   >
@@ -1677,8 +1763,8 @@ export function App() {
                     className="composerModelSelect"
                     title={
                       selectedSessionId
-                        ? "当前会话已绑定模型，新会话前可切换"
-                        : "选择模型"
+                        ? t("session.sessionBoundModel")
+                        : t("nav.selectModel")
                     }
                   >
                     <button
@@ -1687,16 +1773,16 @@ export function App() {
                       disabled={isPromptLocked || Boolean(selectedSessionId)}
                       aria-haspopup="listbox"
                       aria-expanded={isModelMenuOpen}
-                      aria-label="选择模型"
+                      aria-label={t("nav.selectModel")}
                       onClick={() => setIsModelMenuOpen((open) => !open)}
                     >
-                      <span>{selectedProvider ? selectedModelLabel : "未配置模型"}</span>
+                      <span>{selectedProvider ? selectedModelLabel : t("empty.noModelConfigured")}</span>
                       <ChevronDown size={15} />
                     </button>
                     {isModelMenuOpen && !isPromptLocked && !selectedSessionId && (
-                      <div className="composerModelMenu" role="listbox" aria-label="选择模型">
+                      <div className="composerModelMenu" role="listbox" aria-label={t("nav.selectModel")}>
                         {!providers.length && (
-                          <div className="composerModelEmpty">未配置模型</div>
+                          <div className="composerModelEmpty">{t("empty.noModelConfigured")}</div>
                         )}
                         {providers.map((provider) => {
                           const isSelected = provider.id === selectedProviderId;
@@ -1720,58 +1806,58 @@ export function App() {
                       </div>
                     )}
                   </div>
-                  <Segmented
-                    className="composerShellMode"
-                    value={shellMode}
-                    disabled={isPromptLocked}
-                    options={[
-                      ["manual", "手动"],
-                      ["auto", "自动"]
-                    ]}
-                    onChange={(value) => {
-                      const nextShellMode = value as ShellMode;
-                      setShellMode(nextShellMode);
-                      if (selectedSessionId) {
-                        void updateSessionMode({
-                          sessionId: selectedSessionId,
-                          shellMode: nextShellMode
-                        })
-                          .then((updated) =>
-                            setSessions((current) =>
-                              current.map((s) => (s.id === updated.id ? updated : s))
-                            )
+                </div>
+                <Segmented
+                  className="composerShellMode"
+                  value={shellMode}
+                  disabled={isPromptLocked}
+                  options={[
+                    ["manual", t("shellMode.manual")],
+                    ["auto", t("shellMode.auto")]
+                  ]}
+                  onChange={(value) => {
+                    const nextShellMode = value as ShellMode;
+                    setShellMode(nextShellMode);
+                    if (selectedSessionId) {
+                      void updateSessionMode({
+                        sessionId: selectedSessionId,
+                        shellMode: nextShellMode
+                      })
+                        .then((updated) =>
+                          setSessions((current) =>
+                            current.map((s) => (s.id === updated.id ? updated : s))
                           )
-                          .catch(reportError);
-                      }
-                    }}
-                  />
-                  <div className="promptNavGroup">
-                    <button
-                      type="button"
-                      className="promptNavIconButton"
-                      title="上一条提示词"
-                      aria-label="上一条提示词"
-                      disabled={!promptEventCount}
-                      onClick={() => scrollToPrompt("previous")}
-                    >
-                      <ChevronUp size={16} />
-                    </button>
-                    <button
-                      type="button"
-                      className="promptNavIconButton"
-                      title="下一条提示词"
-                      aria-label="下一条提示词"
-                      disabled={!promptEventCount}
-                      onClick={() => scrollToPrompt("next")}
-                    >
-                      <ChevronDown size={16} />
-                    </button>
-                  </div>
+                        )
+                        .catch(reportError);
+                    }
+                  }}
+                />
+                <div className="promptNavGroup">
+                  <button
+                    type="button"
+                    className="promptNavIconButton"
+                    title={t("nav.prevPrompt")}
+                    aria-label={t("nav.prevPrompt")}
+                    disabled={!promptEventCount}
+                    onClick={() => scrollToPrompt("previous")}
+                  >
+                    <ChevronUp size={16} />
+                  </button>
+                  <button
+                    type="button"
+                    className="promptNavIconButton"
+                    title={t("nav.nextPrompt")}
+                    aria-label={t("nav.nextPrompt")}
+                    disabled={!promptEventCount}
+                    onClick={() => scrollToPrompt("next")}
+                  >
+                    <ChevronDown size={16} />
+                  </button>
                 </div>
                 <button
                   type="button"
                   className={`composerSendButton ${isAgentWorking ? "stop" : ""}`}
-                  aria-label={isAgentWorking ? "停止 Agent" : "发送提示词"}
+                  aria-label={isAgentWorking ? t("nav.stopAgent") : t("nav.sendPrompt")}
                   disabled={
                     isAgentWorking
                       ? false
@@ -1793,31 +1879,32 @@ export function App() {
         </section>
       </main>
 
+      <button
+        className="rightPaneToggle"
+        type="button"
+        aria-label={isRightPaneCollapsed ? t("nav.expandRightPane") : t("nav.collapseRightPane")}
+        onClick={() => setIsRightPaneCollapsed((current) => !current)}
+      >
+        {isRightPaneCollapsed ? <ChevronLeft size={16} /> : <ChevronRight size={16} />}
+      </button>
+
       <aside className={`rightPane ${isRightPaneCollapsed ? "collapsed" : ""}`}>
-        <button
-          className="rightPaneToggle"
-          type="button"
-          aria-label={isRightPaneCollapsed ? "展开右侧面板" : "折叠右侧面板"}
-          onClick={() => setIsRightPaneCollapsed((current) => !current)}
-        >
-          {isRightPaneCollapsed ? <ChevronLeft size={16} /> : <ChevronRight size={16} />}
-        </button>
 
         {!isRightPaneCollapsed && (
           <>
             {lastError && (
               <section className="rightSection errorSection">
-                <SectionTitle icon={<AlertTriangle size={16} />} title="错误详情" />
+                <SectionTitle icon={<AlertTriangle size={16} />} title={t("nav.errorDetails")} />
                 <pre className="errorDetails">{lastError}</pre>
                 <button className="iconTextButton" onClick={() => setLastError(null)}>
                   <X size={16} />
-                  清除
+                  {t("common.clear")}
                 </button>
               </section>
             )}
 
             <section className="rightSection">
-              <SectionTitle icon={<Terminal size={16} />} title="命令确认" />
+              <SectionTitle icon={<Terminal size={16} />} title={t("nav.commandApproval")} />
               <div className="stackList">
                 {pendingToolEvents.map((event) => (
                   <div className="approvalRow" key={event.id}>
@@ -1827,7 +1914,7 @@ export function App() {
                     className="iconButton success"
                     disabled={isMutating}
                     onClick={() => void handleApprove(event.id)}
-                    title="接受"
+                    title={t("common.accept")}
                   >
                     <Check size={16} />
                   </button>
@@ -1835,7 +1922,7 @@ export function App() {
                     className="iconButton trust"
                     disabled={isMutating}
                     onClick={() => void handleApproveAndAllow(event)}
-                    title="接受并加入白名单"
+                    title={t("common.acceptAndAllowlist")}
                   >
                     <Save size={16} />
                   </button>
@@ -1843,19 +1930,19 @@ export function App() {
                     className="iconButton danger"
                     disabled={isMutating}
                     onClick={() => void handleReject(event.id)}
-                    title="拒绝"
+                    title={t("common.reject")}
                   >
                         <X size={16} />
                       </button>
                     </div>
                   </div>
                 ))}
-                {!pendingToolEvents.length && <EmptyLine text="暂无待确认命令" />}
+                {!pendingToolEvents.length && <EmptyLine text={t("empty.noPendingCommands")} />}
               </div>
             </section>
 
             <section className="rightSection">
-              <SectionTitle icon={<KeyRound size={16} />} title="权限请求" />
+              <SectionTitle icon={<KeyRound size={16} />} title={t("nav.permissionRequests")} />
               <div className="stackList">
                 {visiblePermissionRequests(eventsResponse.permissions)
                   .map((request) => (
@@ -1866,7 +1953,7 @@ export function App() {
                           className="iconButton success"
                           disabled={isMutating}
                           onClick={() => void handlePermissionReply(request.id, "once")}
-                          title="本次允许"
+                          title={t("common.allowOnce")}
                         >
                           <Check size={16} />
                         </button>
@@ -1874,7 +1961,7 @@ export function App() {
                           className="iconButton trust"
                           disabled={isMutating}
                           onClick={() => void handlePermissionReply(request.id, "always")}
-                          title="总是允许"
+                          title={t("common.allowAlways")}
                         >
                           <Save size={16} />
                         </button>
@@ -1882,7 +1969,7 @@ export function App() {
                           className="iconButton danger"
                           disabled={isMutating}
                           onClick={() => void handlePermissionReply(request.id, "reject")}
-                          title="拒绝"
+                          title={t("common.reject")}
                         >
                           <X size={16} />
                         </button>
@@ -1890,13 +1977,13 @@ export function App() {
                     </div>
                   ))}
                 {!visiblePermissionRequests(eventsResponse.permissions).length && (
-                  <EmptyLine text="暂无权限请求" />
+                  <EmptyLine text={t("empty.noPermissionRequests")} />
                 )}
               </div>
             </section>
 
             <section className="rightSection">
-              <SectionTitle icon={<Clock3 size={16} />} title="后台任务" />
+              <SectionTitle icon={<Clock3 size={16} />} title={t("nav.backgroundJobs")} />
               <div className="stackList">
                 {visibleJobs.map((job) => (
                   <div className="approvalRow" key={job.id}>
@@ -1905,13 +1992,13 @@ export function App() {
                       className="iconButton danger"
                       disabled={isMutating || job.status !== "running"}
                       onClick={() => void handleCancelJob(job.id)}
-                      title="停止任务"
+                      title={t("nav.stopJob")}
                     >
                       <X size={16} />
                     </button>
                   </div>
                 ))}
-                {!visibleJobs.length && <EmptyLine text="暂无后台任务" />}
+                {!visibleJobs.length && <EmptyLine text={t("empty.noBackgroundJobs")} />}
               </div>
             </section>
 
@@ -1919,6 +2006,14 @@ export function App() {
         )}
       </aside>
 
+      {needsSetup && (
+        <SetupDialog
+          error={setupError}
+          isSaving={isSetupSaving}
+          projectRoot={projectRoot}
+          onComplete={handleSetupComplete}
+        />
+      )}
       {isSettingsOpen && (
         <SettingsModal
           configPath={configPath}
@@ -1927,8 +2022,10 @@ export function App() {
           selectedProviderId={selectedProviderId}
           shellPolicy={shellPolicy}
           themeMode={themeMode}
+          locale={(i18n.language === "en" ? "en" : "zh") as AppLocale}
           isSaving={isSavingConfig}
           onThemeModeChange={setThemeMode}
+          onLocaleChange={(nextLocale) => void setAppLocale(nextLocale)}
           onClose={() => setIsSettingsOpen(false)}
           onSave={saveSettings}
         />
@@ -1957,15 +2054,20 @@ function SessionsModal({
   sessionCount: number;
   onClose: () => void;
 }) {
+  const { t } = useTranslation();
   return (
     <div className="modalBackdrop" role="presentation">
       <section className="settingsModal sessionsModal" role="dialog" aria-modal="true">
         <header className="modalHeader">
           <div>
-            <strong>会话管理</strong>
-            <small>{sessionCount ? `${sessionCount} 个可用会话` : "暂无可用会话"}</small>
+            <strong>{t("session.manage")}</strong>
+            <small>
+              {sessionCount
+                ? t("session.availableCount", { count: sessionCount })
+                : t("empty.noAvailableSessions")}
+            </small>
           </div>
-          <button className="iconButton ghost" onClick={onClose} aria-label="关闭会话管理">
+          <button className="iconButton ghost" onClick={onClose} aria-label={t("session.closeManager")}>
             <X size={16} />
           </button>
         </header>
@@ -1982,8 +2084,10 @@ function SettingsModal({
   selectedProviderId,
   shellPolicy,
   themeMode,
+  locale,
   isSaving,
   onThemeModeChange,
+  onLocaleChange,
   onClose,
   onSave
 }: {
@@ -1993,11 +2097,14 @@ function SettingsModal({
   selectedProviderId: string;
   shellPolicy: ShellPolicy;
   themeMode: ThemeMode;
+  locale: AppLocale;
   isSaving: boolean;
   onThemeModeChange: (mode: ThemeMode) => void;
+  onLocaleChange: (locale: AppLocale) => void;
   onClose: () => void;
   onSave: (content: string, policy: ShellPolicy) => Promise<void>;
 }) {
+  const { t } = useTranslation();
   const initial = parseProviderSettings(configContent, selectedProviderId);
   const [providerId, setProviderId] = useState(initial.providerId);
   const [modelId, setModelId] = useState(initial.modelId);
@@ -2059,10 +2166,10 @@ function SettingsModal({
       <section className="settingsModal" role="dialog" aria-modal="true">
         <header className="modalHeader">
           <div>
-            <strong>AI 服务设置</strong>
-            <small>{configPath || "配置文件尚未加载"}</small>
+            <strong>{t("settings.title")}</strong>
+            <small>{configPath || t("settings.configNotLoaded")}</small>
           </div>
-          <button className="iconButton ghost" onClick={onClose} aria-label="关闭设置">
+          <button className="iconButton ghost" onClick={onClose} aria-label={t("settings.close")}>
             <X size={16} />
           </button>
         </header>
@@ -2072,7 +2179,7 @@ function SettingsModal({
 
           <div className="settingsGrid">
             <label>
-              <span>Provider</span>
+              <span>{t("settings.provider")}</span>
               <select
                 value={providerId}
                 onChange={(event) => syncFromSelection(event.target.value)}
@@ -2085,7 +2192,7 @@ function SettingsModal({
               </select>
             </label>
             <label>
-              <span>Model</span>
+              <span>{t("settings.model")}</span>
               <select
                 value={modelId}
                 onChange={(event) => {
@@ -2101,11 +2208,11 @@ function SettingsModal({
               </select>
             </label>
             <label>
-              <span>Name</span>
+              <span>{t("settings.name")}</span>
               <input value={name} onChange={(event) => setName(event.target.value)} />
             </label>
             <label>
-              <span>Base URL</span>
+              <span>{t("settings.baseUrl")}</span>
               <input
                 value={baseUrl}
                 onChange={(event) => setBaseUrl(event.target.value)}
@@ -2113,7 +2220,7 @@ function SettingsModal({
               />
             </label>
             <label className="settingsWide">
-              <span>API Key</span>
+              <span>{t("settings.apiKey")}</span>
               <input
                 value={apiKey}
                 onChange={(event) => setApiKey(event.target.value)}
@@ -2122,19 +2229,30 @@ function SettingsModal({
               />
             </label>
             <label className="settingsWide">
-              <span>主题模式</span>
+              <span>{t("locale.label")}</span>
+              <Segmented
+                value={locale}
+                options={[
+                  ["zh", t("locale.zh")],
+                  ["en", t("locale.en")]
+                ]}
+                onChange={(value) => onLocaleChange(value as AppLocale)}
+              />
+            </label>
+            <label className="settingsWide">
+              <span>{t("theme.label")}</span>
               <Segmented
                 value={themeMode}
                 options={[
-                  ["system", "跟随系统"],
-                  ["light", "浅色"],
-                  ["dark", "深色"]
+                  ["system", t("theme.system")],
+                  ["light", t("theme.light")],
+                  ["dark", t("theme.dark")]
                 ]}
                 onChange={(value) => onThemeModeChange(value as ThemeMode)}
               />
             </label>
             <label className="settingsWide">
-              <span>自动命令白名单</span>
+              <span>{t("settings.autoAllowlist")}</span>
               <textarea
                 className="allowlistEditor"
                 value={allowlistText}
@@ -2150,7 +2268,7 @@ function SettingsModal({
             onClick={() => setShowAdvanced(!showAdvanced)}
           >
             {showAdvanced ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
-            高级 JSON
+            {t("settings.advancedJson")}
           </button>
           {showAdvanced && (
             <textarea
@@ -2172,7 +2290,7 @@ function SettingsModal({
 
         <footer className="modalFooter">
           <button className="iconTextButton" onClick={onClose}>
-            取消
+            {t("common.cancel")}
           </button>
           <button
             className="commandButton modalSaveButton"
@@ -2180,7 +2298,7 @@ function SettingsModal({
             onClick={() => void handleSave()}
           >
             {isSaving ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
-            保存设置
+            {t("common.save")}
           </button>
         </footer>
       </section>
@@ -2316,6 +2434,7 @@ type TimelineItem = {
 };
 
 function ContextUsageMeter({ usage }: { usage: ContextUsage }) {
+  const { t } = useTranslation();
   const tooltipId = "context-usage-details";
   return (
     <div
@@ -2324,7 +2443,10 @@ function ContextUsageMeter({ usage }: { usage: ContextUsage }) {
       aria-describedby={tooltipId}
     >
       <span>
-        上下文 {usage.percent}% · {usage.source === "provider" ? "实际" : "估算"}
+        {t("context.usage", {
+          percent: usage.percent,
+          source: usage.source === "provider" ? t("context.actual") : t("context.estimate")
+        })}
       </span>
       <div className="contextTrack" aria-hidden="true">
         <i style={{ width: `${usage.barPercent}%` }} />
@@ -2338,32 +2460,32 @@ function ContextUsageMeter({ usage }: { usage: ContextUsage }) {
         </header>
         <dl>
           <div>
-            <dt>输入</dt>
+            <dt>{t("context.input")}</dt>
             <dd>{formatInteger(usage.tokens.input)}</dd>
           </div>
           <div>
-            <dt>输出</dt>
+            <dt>{t("context.output")}</dt>
             <dd>{formatInteger(usage.tokens.output)}</dd>
           </div>
           <div>
-            <dt>推理</dt>
+            <dt>{t("context.reasoning")}</dt>
             <dd>{formatInteger(usage.tokens.reasoning)}</dd>
           </div>
           <div>
-            <dt>缓存读取</dt>
+            <dt>{t("context.cacheRead")}</dt>
             <dd>{formatInteger(usage.tokens.cache.read)}</dd>
           </div>
           <div>
-            <dt>缓存写入</dt>
+            <dt>{t("context.cacheWrite")}</dt>
             <dd>{formatInteger(usage.tokens.cache.write)}</dd>
           </div>
           <div>
-            <dt>总量</dt>
+            <dt>{t("context.total")}</dt>
             <dd>{formatInteger(usage.tokens.total)}</dd>
           </div>
         </dl>
         <p>
-          {usage.providerId || "未知 Provider"} / {usage.model || "未知模型"}
+          {usage.providerId || t("common.unknownProvider")} / {usage.model || t("common.unknownModel")}
           {usage.step ? ` / step ${usage.step}` : ""}
         </p>
         {usage.notes.map((note) => (
@@ -2446,6 +2568,7 @@ function TimelineItemView({
   onRollbackSnapshots: (snapshotIds: string[], successText?: string) => void;
   onRecoverAgent: (actionId: string) => Promise<void>;
 }) {
+  const { t } = useTranslation();
   const hiddenDetails = item.details.filter((event) => event.id !== item.event?.id);
   const icon = timelineItemIcon(item);
   const isReasoningItem = item.kind === "reasoning";
@@ -2472,12 +2595,13 @@ function TimelineItemView({
           <>
             {item.text && <p className="promptText">{item.text}</p>}
             {!!item.attachments?.length && (
-              <div className="timelineAttachmentList" aria-label="提示词附件">
+              <div className="timelineAttachmentList" aria-label={t("timeline.promptAttachments")}>
                 {item.attachments.map((attachment, index) => (
                   <span className="timelineAttachmentChip" key={`${item.id}-${index}-${attachment.name}`}>
                     {attachment.name}
                     <small>
-                      {attachment.kind === "image" ? "图片" : "文本"} · {formatBytes(attachment.size)}
+                      {attachment.kind === "image" ? t("common.image") : t("common.text")} ·{" "}
+                      {formatBytes(attachment.size)}
                     </small>
                   </span>
                 ))}
@@ -2489,10 +2613,10 @@ function TimelineItemView({
                 className="inlineRollbackButton"
                 disabled={rollbackDisabled || !item.rollbackSnapshotIds?.length}
                 onClick={() => onRollbackSnapshots(item.rollbackSnapshotIds ?? [])}
-                title="回滚到这条提示词发送之前"
+                title={t("timeline.rollbackBeforePromptTitle")}
               >
                 <RotateCcw size={15} />
-                回滚到发送前
+                {t("timeline.rollbackBeforePrompt")}
               </button>
             </div>
           </>
@@ -2508,7 +2632,7 @@ function TimelineItemView({
                 onClick={() => void onExecutePlan(item.event!)}
               >
                 <Play size={16} />
-                执行该计划
+                {t("timeline.executePlan")}
               </button>
             )}
           </div>
@@ -2518,7 +2642,7 @@ function TimelineItemView({
           <details className="reasoningBlock">
             <summary>
               <BrainCircuit size={15} />
-              <span>思考过程</span>
+              <span>{t("timeline.reasoning")}</span>
               <ChevronRight size={13} className="reasoningClosedIcon" />
               <ChevronDown size={13} className="reasoningOpenIcon" />
             </summary>
@@ -2576,27 +2700,28 @@ function ErrorRecoveryCard({
   disabled: boolean;
   onRecover: (actionId: string) => Promise<void>;
 }) {
+  const { t } = useTranslation();
   const actions = error.suggestedActions.length
     ? error.suggestedActions
     : [
         {
           id: "continue",
-          label: "继续",
-          description: "保留当前上下文，让 Agent 根据最近错误继续修复。"
+          label: t("common.continue"),
+          description: t("timeline.continueDesc")
         }
       ];
   return (
     <div className="errorRecoveryCard">
       <div className="errorRecoveryMeta">
         <span>{errorKindLabel(error.kind)}</span>
-        <span>{error.retryable ? "可重试" : "需处理后继续"}</span>
-        <span>{error.recoverable ? "可恢复" : "不可自动恢复"}</span>
+        <span>{error.retryable ? t("timeline.retryable") : t("timeline.notRetryable")}</span>
+        <span>{error.recoverable ? t("timeline.recoverable") : t("timeline.notRecoverable")}</span>
       </div>
       {error.causes.length > 0 && (
         <details className="errorCauseChain">
           <summary>
             <ChevronRight size={13} />
-            错误链
+            {t("timeline.errorChain")}
           </summary>
           <ol>
             {error.causes.map((cause, index) => (
@@ -2612,7 +2737,11 @@ function ErrorRecoveryCard({
             className="iconTextButton"
             key={action.id}
             disabled={disabled}
-            title={action.description}
+            title={
+              checkpointIdFromAction(action.id)
+                ? appT("recover.checkpointDesc")
+                : recoveryActionDescription(action.id, action.description ?? "")
+            }
             onClick={() => void onRecover(action.id)}
           >
             {action.id === "settings" ? (
@@ -2624,7 +2753,9 @@ function ErrorRecoveryCard({
             ) : (
               <RefreshCw size={15} />
             )}
-            {action.label}
+            {checkpointIdFromAction(action.id)
+              ? appT("recover.checkpoint")
+              : recoveryActionLabel(action.id, action.label)}
           </button>
         ))}
       </div>
@@ -2643,6 +2774,7 @@ function CodeChangeCard({
   onRollbackSnapshot: (snapshotId: string) => void;
   onRollbackSnapshots?: (snapshotIds: string[], successText?: string) => void;
 }) {
+  const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const rollbackSnapshotIds = change.snapshotIds ?? (change.snapshotId ? [change.snapshotId] : []);
   const rollbackDisabledState = rollbackDisabled || rollbackSnapshotIds.length === 0;
@@ -2671,15 +2803,17 @@ function CodeChangeCard({
               return;
             }
             if (onRollbackSnapshots && rollbackSnapshotIds.length > 1) {
-              onRollbackSnapshots(rollbackSnapshotIds, "已回滚该文件修改");
+              onRollbackSnapshots(rollbackSnapshotIds, t("notice.rolledBackFileChange"));
               return;
             }
             onRollbackSnapshot(rollbackSnapshotIds[0]);
           }}
-          title={rollbackDisabledState ? "缺少快照，不能回滚" : "回滚这次代码修改"}
+          title={
+            rollbackDisabledState ? t("timeline.noSnapshot") : t("timeline.rollbackChangeTitle")
+          }
         >
           <RotateCcw size={15} />
-          回滚修改
+          {t("timeline.rollbackChange")}
         </button>
       </div>
     </div>
@@ -2697,6 +2831,7 @@ function CodeChangeSummaryCard({
   onRollbackSnapshot: (snapshotId: string) => void;
   onRollbackSnapshots: (snapshotIds: string[], successText?: string) => void;
 }) {
+  const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const previewChanges = group.changes.slice(0, 3);
   const overflowCount = Math.max(0, group.changes.length - previewChanges.length);
@@ -2712,7 +2847,7 @@ function CodeChangeSummaryCard({
         >
           {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
           <FileCode2 size={16} />
-          <span>修改 {group.stats.files} 个文件</span>
+          <span>{t("timeline.modifiedFiles", { count: group.stats.files })}</span>
           <b className="patchStat add">+{group.stats.added}</b>
           <b className="patchStat del">-{group.stats.deleted}</b>
         </button>
@@ -2720,11 +2855,13 @@ function CodeChangeSummaryCard({
           type="button"
           className="inlineRollbackButton"
           disabled={rollbackDisabledState}
-          onClick={() => onRollbackSnapshots(group.rollbackSnapshotIds, "已回滚本轮修改")}
-          title={rollbackDisabledState ? "没有可回滚的快照" : "回滚本轮代码修改"}
+          onClick={() => onRollbackSnapshots(group.rollbackSnapshotIds, t("notice.rolledBackRound"))}
+          title={
+            rollbackDisabledState ? t("timeline.noRoundSnapshot") : t("timeline.rollbackRoundTitle")
+          }
         >
           <RotateCcw size={15} />
-          回滚本轮修改
+          {t("timeline.rollbackRound")}
         </button>
       </div>
       <div className="codeChangeSummaryMeta">
@@ -2732,7 +2869,7 @@ function CodeChangeSummaryCard({
         {previewChanges.map((change) => (
           <code key={change.id}>{change.path}</code>
         ))}
-        {overflowCount > 0 && <span>另有 {overflowCount} 个文件</span>}
+        {overflowCount > 0 && <span>{t("timeline.moreFiles", { count: overflowCount })}</span>}
       </div>
       {expanded && (
         <CodeChangeList
@@ -2773,6 +2910,7 @@ function CodeChangeList({
 }
 
 function HiddenDetails({ events }: { events: EventRecord[] }) {
+  const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   if (!events.length) {
     return null;
@@ -2785,7 +2923,7 @@ function HiddenDetails({ events }: { events: EventRecord[] }) {
         onClick={() => setExpanded(!expanded)}
       >
         {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-        查看细节
+        {t("common.viewDetails")}
         <span>{events.length}</span>
       </button>
       {expanded && (
@@ -2815,6 +2953,7 @@ function MarkdownText({
   text: string;
   stream?: boolean;
 }) {
+  const { t } = useTranslation();
   const normalizedText = useMemo(() => normalizeInlineMarkdownTables(text), [text]);
   const isLong = isLongMarkdown(normalizedText);
   const [expanded, setExpanded] = useState(!isLong);
@@ -2870,7 +3009,7 @@ function MarkdownText({
           className="collapseToggle"
           onClick={() => setExpanded(!expanded)}
         >
-          {expanded ? "收起" : "展开内容"}
+          {expanded ? t("common.collapse") : t("common.expand")}
         </button>
       )}
     </div>
@@ -2979,7 +3118,7 @@ function buildToolAction(
       errorText =
         valueAsString(result.data.error) ||
         valueAsString(asRecord(result.data.result).stderr) ||
-        "执行失败";
+        appT("execution.execFailed");
     } else if (result.type === "tool.pending") {
       status = "pending";
     }
@@ -3023,6 +3162,7 @@ function PlanExecutionDock({
   events: EventRecord[];
   snapshots: SnapshotRecord[];
 }) {
+  const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const summary = buildExecutionSummary(events, snapshots);
   const details = useMemo(() => buildDockDetails(events), [events]);
@@ -3037,7 +3177,7 @@ function PlanExecutionDock({
         <div className="planExecutionTitle">
           {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
           <History size={16} />
-          <strong>执行状态</strong>
+          <strong>{t("execution.title")}</strong>
           <span className={summary.status}>{summary.statusText}</span>
         </div>
         <small>{summary.detail}</small>
@@ -3045,12 +3185,12 @@ function PlanExecutionDock({
       <div className="executionSummary">
         <span>
           <Wrench size={14} />
-          工具 {summary.toolCount}
+          {t("execution.tools")} {summary.toolCount}
         </span>
-        <span>读取 {summary.readCount}</span>
-        <span>搜索 {summary.searchCount}</span>
-        <span>命令 {summary.commandCount}</span>
-        <span>修改 {summary.changeCount}</span>
+        <span>{t("execution.reads")} {summary.readCount}</span>
+        <span>{t("execution.searches")} {summary.searchCount}</span>
+        <span>{t("execution.commands")} {summary.commandCount}</span>
+        <span>{t("execution.changes")} {summary.changeCount}</span>
       </div>
       {expanded && (
         <div className="dockDetailList">
@@ -3067,7 +3207,7 @@ function PlanExecutionDock({
               {detail.errorText && <span className="dockError">{detail.errorText}</span>}
             </div>
           ))}
-          {!details.length && <div className="dockDetailItem empty">暂无工具调用记录</div>}
+          {!details.length && <div className="dockDetailItem empty">{t("empty.noToolCalls")}</div>}
         </div>
       )}
     </section>
@@ -3199,7 +3339,7 @@ function buildTimelineItems(
     const item: TimelineItem = {
       id: group.id,
       kind: "codeChangeSummary",
-      title: "代码修改",
+      title: appT("timeline.codeChange"),
       status: "done",
       event,
       details: [],
@@ -3247,7 +3387,7 @@ function buildTimelineItems(
       pushItem({
         id: event.id,
         kind: "userPrompt",
-        title: "用户提示词",
+        title: appT("event.prompt.submitted"),
         text: valueAsString(event.data.prompt),
         attachments: promptAttachmentSummaries(event.data.attachments),
         status: "done",
@@ -3271,7 +3411,7 @@ function buildTimelineItems(
         pushItem({
           id: `assistant-stream-${step}`,
           kind: "assistantReply",
-          title: "助手回复",
+          title: appT("event.assistant.message"),
           text: stripReasoningControlTags(group.text),
           status: "running",
           event,
@@ -3288,7 +3428,7 @@ function buildTimelineItems(
         pushItem({
           id: `reasoning-stream-${step}`,
           kind: "reasoning",
-          title: "思考过程",
+          title: appT("timeline.reasoning"),
           text: group.text,
           status: "running",
           event,
@@ -3303,7 +3443,7 @@ function buildTimelineItems(
       pushItem({
         id: event.id,
         kind: "assistantReply",
-        title: "助手回复",
+        title: appT("event.assistant.message"),
         text: stripReasoningControlTags(valueAsString(event.data.text)),
         status: "done",
         event,
@@ -3317,7 +3457,7 @@ function buildTimelineItems(
       pushItem({
         id: event.id,
         kind: "reasoning",
-        title: "思考过程",
+        title: appT("timeline.reasoning"),
         text: valueAsString(event.data.text),
         status: "done",
         event,
@@ -3368,8 +3508,8 @@ function buildTimelineItems(
     pushItem({
       id: `hidden-${hiddenBuffer[0].id}`,
       kind: "hiddenDetail",
-      title: "运行细节",
-      text: summarizeHiddenEvents(hiddenBuffer) || "低优先级事件",
+      title: appT("timeline.runDetails"),
+      text: summarizeHiddenEvents(hiddenBuffer) || appT("timeline.lowPriorityEvents"),
       status: "neutral",
       details: hiddenBuffer.splice(0)
     });
@@ -3404,7 +3544,7 @@ function codeChangesForToolResult(
   if (!patch) {
     return [];
   }
-  const path = valueAsString(result.path) || "未知文件";
+  const path = valueAsString(result.path) || appT("timeline.unknownFile");
   return [
     {
       id: `patch-${event.id}`,
@@ -3486,10 +3626,10 @@ function mergeFileCodeChanges(changes: TimelineCodeChange[]): TimelineCodeChange
     : sorted.map((change) => change.patch).join("\n");
   const operation =
     first.beforeContent === null
-      ? "新增"
+      ? appT("operation.add")
       : last.afterContent === null
-        ? "删除"
-        : `修改 ${sorted.length} 次`;
+        ? appT("operation.delete")
+        : appT("operation.modifyTimes", { count: sorted.length });
 
   return {
     ...last,
@@ -3548,17 +3688,14 @@ function promptRollbackSnapshotIds(
 
 function operationLabel(toolName: string, snapshot: SnapshotRecord | null) {
   if (snapshot?.afterContent === null) {
-    return "删除";
+    return appT("operation.delete");
   }
   if (snapshot?.beforeContent === null) {
-    return "新增";
+    return appT("operation.add");
   }
-  const labels: Record<string, string> = {
-    edit: "编辑",
-    write: "写入",
-    delete: "删除"
-  };
-  return labels[toolName] ?? "修改";
+  const key = `tool.${toolName}`;
+  const translated = appT(key);
+  return translated === key ? appT("operation.modify") : translated;
 }
 
 function operationSummary(changes: TimelineCodeChange[]) {
@@ -3576,7 +3713,7 @@ function statusItemForEvent(event: EventRecord): TimelineItem | null {
     return {
       id: event.id,
       kind: "statusSummary",
-      title: "等待确认",
+      title: appT("event.waitingApproval"),
       text: pendingCommand(event),
       status: "waiting",
       event,
@@ -3587,7 +3724,7 @@ function statusItemForEvent(event: EventRecord): TimelineItem | null {
     return {
       id: event.id,
       kind: "statusSummary",
-      title: "工具失败",
+      title: appT("event.toolFailed"),
       text: eventFailureText(event),
       status: "failed",
       event,
@@ -3598,7 +3735,7 @@ function statusItemForEvent(event: EventRecord): TimelineItem | null {
     return {
       id: event.id,
       kind: "statusSummary",
-      title: "已拒绝工具",
+      title: appT("event.toolRejected"),
       text: toolLabel(valueAsString(event.data.name)),
       status: "failed",
       event,
@@ -3609,8 +3746,8 @@ function statusItemForEvent(event: EventRecord): TimelineItem | null {
     return {
       id: event.id,
       kind: "statusSummary",
-      title: "策略拦截",
-      text: valueAsString(event.data.reason) || "请求被策略拦截",
+      title: appT("event.policy.blocked"),
+      text: valueAsString(event.data.reason) || appT("status.policyBlockedDefault"),
       status: "failed",
       event,
       details: [event]
@@ -3620,7 +3757,7 @@ function statusItemForEvent(event: EventRecord): TimelineItem | null {
     return {
       id: event.id,
       kind: "statusSummary",
-      title: "执行失败",
+      title: appT("status.executionFailed"),
       text: valueAsString(event.data.error),
       status: "failed",
       event,
@@ -3632,7 +3769,7 @@ function statusItemForEvent(event: EventRecord): TimelineItem | null {
     return {
       id: event.id,
       kind: "statusSummary",
-      title: "运行失败",
+      title: appT("status.runFailed"),
       text: errorInfo.message || valueAsString(event.data.message) || eventLabel(event),
       status: "failed",
       event,
@@ -3644,7 +3781,7 @@ function statusItemForEvent(event: EventRecord): TimelineItem | null {
     return {
       id: event.id,
       kind: "statusSummary",
-      title: event.type === "agent.stopped" ? "已停止" : "请求停止",
+      title: event.type === "agent.stopped" ? appT("status.stopped") : appT("event.agent.cancelRequested"),
       text: valueAsString(event.data.reason) || eventLabel(event),
       status: event.type === "agent.stopped" ? "done" : "waiting",
       event,
@@ -3655,7 +3792,7 @@ function statusItemForEvent(event: EventRecord): TimelineItem | null {
     return {
       id: event.id,
       kind: "statusSummary",
-      title: "已恢复检查点",
+      title: appT("status.checkpointRestored"),
       text: valueAsString(event.data.label) || eventLabel(event),
       status: "waiting",
       event,
@@ -3674,7 +3811,7 @@ function eventFailureText(event: EventRecord) {
     valueAsString(event.data.error) ||
     valueAsString(result.stderr) ||
     valueAsString(result.stdout) ||
-    "工具执行失败"
+    appT("status.toolExecutionFailed")
   );
 }
 
@@ -3690,8 +3827,8 @@ function timelineErrorInfo(event: EventRecord): TimelineErrorInfo {
     ? [
         {
           id: checkpointActionId(checkpointId),
-          label: "恢复到检查点",
-          description: "从最近保存的安全边界恢复执行。"
+          label: appT("recover.checkpoint"),
+          description: appT("recover.checkpointDesc")
         }
       ]
     : [];
@@ -3739,20 +3876,9 @@ function stringArray(value: unknown) {
 }
 
 function errorKindLabel(kind: string) {
-  const labels: Record<string, string> = {
-    network: "网络错误",
-    provider: "服务错误",
-    authentication: "鉴权错误",
-    rateLimit: "限流错误",
-    contextLimit: "上下文超限",
-    modelResponse: "模型响应错误",
-    toolExecution: "工具执行错误",
-    permission: "权限错误",
-    storage: "存储错误",
-    cancelled: "已中断",
-    unknown: "未知错误"
-  };
-  return labels[kind] ?? kind;
+  const key = `errorKind.${kind}`;
+  const translated = appT(key);
+  return translated === key ? kind : translated;
 }
 
 function summarizeHiddenEvents(events: EventRecord[], primaryEventId = "") {
@@ -3772,13 +3898,13 @@ function summarizeHiddenEvents(events: EventRecord[], primaryEventId = "") {
   }).length;
   const steps = hidden.filter((event) => event.type.startsWith("step.")).length;
   const parts = [
-    toolCalls.length ? `${toolCalls.length} 个工具调用` : "",
-    reads ? `${reads} 次读取` : "",
-    searches ? `${searches} 次搜索` : "",
-    commands ? `${commands} 条命令` : "",
-    steps ? `${steps} 个步骤事件` : ""
+    toolCalls.length ? appT("hidden.toolCalls", { count: toolCalls.length }) : "",
+    reads ? appT("hidden.reads", { count: reads }) : "",
+    searches ? appT("hidden.searches", { count: searches }) : "",
+    commands ? appT("hidden.commands", { count: commands }) : "",
+    steps ? appT("hidden.steps", { count: steps }) : ""
   ].filter(Boolean);
-  return parts.length ? parts.join(" · ") : `${hidden.length} 条细节`;
+  return parts.length ? parts.join(" · ") : appT("hidden.details", { count: hidden.length });
 }
 
 function buildExecutionSummary(
@@ -3864,12 +3990,12 @@ function buildExecutionSummary(
         : "done";
   const statusText =
     status === "failed"
-      ? "执行异常"
+      ? appT("execution.failed")
       : status === "waiting"
-        ? "等待确认"
+        ? appT("execution.waiting")
         : status === "running"
-          ? "执行中"
-          : "已完成";
+          ? appT("execution.running")
+          : appT("execution.done");
 
   return {
     status,
@@ -3879,7 +4005,7 @@ function buildExecutionSummary(
     searchCount,
     commandCount,
     changeCount,
-    detail: `${events.length} 条事件 · ${changeCount} 个文件变更`
+    detail: appT("execution.detail", { events: events.length, changes: changeCount })
   };
 }
 
@@ -4083,46 +4209,20 @@ function initialExpandedDirs(files: ProjectFile[]) {
 }
 
 function eventLabel(event: EventRecord) {
-  const labels: Record<string, string> = {
-    "prompt.submitted": "用户提示词",
-    "step.started": "步骤开始",
-    "step.ended": "步骤结束",
-    "step.failed": "步骤失败",
-    "llm.retry": "模型请求重试",
-    "llm.stream.started": "模型流开始",
-    "llm.stream.finished": "模型流结束",
-    "reasoning.summary": "过程摘要",
-    "reasoning.summary.delta": "过程摘要片段",
-    "assistant.message": "助手回复",
-    "assistant.message.delta": "助手回复片段",
-    "tool.input.delta": "工具参数片段",
-    "tool.called": "工具调用",
-    "tool.success": "工具成功",
-    "tool.failed": "工具失败",
-    "tool.pending": "等待确认",
-    "tool.approved": "已批准工具",
-    "tool.rejected": "已拒绝工具",
-    "plan.candidateTool": "候选工具",
-    "policy.blocked": "策略拦截",
-    "agent.cancelRequested": "请求停止",
-    "agent.stopped": "Agent 已停止",
-    "agent.failed": "Agent 失败",
-    "session.checkpoint.saved": "检查点已保存",
-    "session.checkpoint.restored": "检查点已恢复",
-    "rollback.applied": "已回滚",
-    "context.compacted": "上下文压缩"
-  };
+  const key = `event.${event.type}`;
+  const base = appT(key);
+  const label = base === key ? event.type : base;
   if (event.type.startsWith("tool.")) {
-    return `${labels[event.type] ?? event.type} ${toolLabel(valueAsString(event.data.name))}`.trim();
+    return `${label} ${toolLabel(valueAsString(event.data.name))}`.trim();
   }
-  return labels[event.type] ?? event.type;
+  return label;
 }
 
 function pendingCommand(event: EventRecord) {
   return (
     valueAsString((event.data.pending as Record<string, unknown> | undefined)?.command) ||
     valueAsString(event.data.command) ||
-    "待确认命令"
+    appT("event.pendingCommand")
   );
 }
 
@@ -4196,26 +4296,11 @@ function errorMessage(error: unknown) {
 }
 
 function errorSummary(error: string) {
-  return error.split("\n").find((line) => line.trim()) ?? "发生未知错误";
+  return error.split("\n").find((line) => line.trim()) ?? appT("error.unknown");
 }
 
 function preferredConfigProviderId(config: ProviderConfigFileResponse) {
   return config.selectedProviderId ?? config.providers[0]?.id ?? "";
-}
-
-const PLAN_EXECUTION_PROMPT_PREFIX = "请执行下面这份计划。";
-
-function buildPlanExecutionPrompt(planText: string) {
-  return `${PLAN_EXECUTION_PROMPT_PREFIX}
-
-执行要求：
-- 按计划逐步修改代码，不要跳过必要的读取、搜索和验证。
-- 每完成一个重要阶段，在 message 中用一句话说明当前进度。
-- 工具调用 JSON 必须严格遵守协议：toolCalls 的每个元素只能包含 name 和 input，不要在 toolCalls 元素里添加 done 字段。
-- 如果工具失败，请根据错误信息自我修正后继续。
-
-计划内容：
-${planText}`;
 }
 
 function latestPlanExecutionEvents(events: EventRecord[]) {
@@ -4223,7 +4308,7 @@ function latestPlanExecutionEvents(events: EventRecord[]) {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index];
     if (event.type === "prompt.submitted") {
-      if (valueAsString(event.data.prompt).trimStart().startsWith(PLAN_EXECUTION_PROMPT_PREFIX)) {
+      if (valueAsString(event.data.prompt).trimStart().includes(PLAN_EXECUTION_MARKER)) {
         startIndex = index;
       }
       break;
@@ -4236,32 +4321,17 @@ function latestPlanExecutionEvents(events: EventRecord[]) {
 }
 
 function modeLabel(value: AgentMode) {
-  const labels: Record<AgentMode, string> = {
-    ask: "问答",
-    plan: "计划",
-    agent: "执行"
-  };
-  return labels[value];
+  return appT(`mode.${value}`);
 }
 
 function shellModeLabel(value: ShellMode) {
-  const labels: Record<ShellMode, string> = {
-    manual: "手动命令",
-    auto: "自动命令"
-  };
-  return labels[value];
+  return appT(`shellMode.${value}Long`);
 }
 
 function toolLabel(value: string) {
-  const labels: Record<string, string> = {
-    read: "读取",
-    search: "搜索",
-    edit: "编辑",
-    write: "写入",
-    delete: "删除",
-    shell: "命令"
-  };
-  return labels[value] ?? value;
+  const key = `tool.${value}`;
+  const translated = appT(key);
+  return translated === key ? value : translated;
 }
 
 type ContextUsageSeverity = "ok" | "warning" | "danger";
@@ -4324,8 +4394,8 @@ function contextUsageFromEvents(eventsResponse: SessionEventsResponse): ContextU
   };
   const limitIsDefault = !contextLimit;
   const notes = [
-    "来源: Provider 实际 usage。",
-    limitIsDefault ? "上下文上限来自默认 128,000 tokens。" : ""
+    appT("contextNotes.providerSource"),
+    limitIsDefault ? appT("contextNotes.defaultLimit") : ""
   ].filter((note) => note.length > 0);
 
   return {
@@ -4399,9 +4469,12 @@ function estimateContextUsage({
     model: splitProviderRecordId(selectedProviderId).modelId,
     limitIsDefault,
     notes: [
-      `来源: 本地估算，最近事件 ${estimatedEvents.length} / ${eventsResponse.events.length}。`,
-      limitIsDefault ? "上下文上限来自默认 128,000 tokens。" : "",
-      "说明: 按当前发送给模型的压缩上下文估算，非供应商实际 usage。"
+      appT("contextNotes.estimateSource", {
+        recent: estimatedEvents.length,
+        total: eventsResponse.events.length
+      }),
+      limitIsDefault ? appT("contextNotes.defaultLimit") : "",
+      appT("contextNotes.estimateHint")
     ].filter((note) => note.length > 0)
   };
 }
@@ -4533,10 +4606,10 @@ function buildProviderConfigContent(
   const providerId = fields.providerId.trim();
   const modelId = fields.modelId.trim();
   if (!providerId) {
-    throw new Error("Provider 不能为空。");
+    throw new Error(appT("validation.providerRequired"));
   }
   if (!modelId) {
-    throw new Error("Model 不能为空。");
+    throw new Error(appT("validation.modelRequired"));
   }
 
   const providers = ensureRecord(config, "provider");
@@ -4552,6 +4625,309 @@ function buildProviderConfigContent(
   config.model = `${providerId}/${modelId}`;
 
   return `${JSON.stringify(config, null, 2)}\n`;
+}
+
+type SetupConfigFields = {
+  providerName: string;
+  baseUrl: string;
+  apiKey: string;
+  modelId: string;
+  modelDisplayName: string;
+};
+
+function generateSetupConfig(fields: SetupConfigFields): string {
+  const rawId = fields.providerName.trim().toLowerCase().replace(/\s+/g, "-");
+  const providerId = rawId || "openai-compatible";
+  const modelId = fields.modelId.trim();
+  const config = {
+    $schema: "https://opencode.ai/config.json",
+    model: `${providerId}/${modelId}`,
+    provider: {
+      [providerId]: {
+        name: fields.providerName.trim() || providerId,
+        npm: "@ai-sdk/openai-compatible",
+        options: {
+          baseURL: fields.baseUrl.trim() || "https://api.openai.com/v1",
+          apiKey: fields.apiKey.trim()
+        },
+        models: {
+          [modelId]: {
+            name: fields.modelDisplayName.trim() || modelId
+          }
+        }
+      }
+    }
+  };
+  return `${JSON.stringify(config, null, 2)}\n`;
+}
+
+type SetupPreset = {
+  label: string;
+  providerName: string;
+  baseUrl: string;
+  modelId: string;
+  modelDisplayName: string;
+};
+
+const SETUP_PRESETS: SetupPreset[] = [
+  {
+    label: "OpenAI",
+    providerName: "OpenAI",
+    baseUrl: "https://api.openai.com/v1",
+    modelId: "gpt-4.1-mini",
+    modelDisplayName: "GPT-4.1 Mini"
+  },
+  {
+    label: "DeepSeek",
+    providerName: "DeepSeek",
+    baseUrl: "https://api.deepseek.com/v1",
+    modelId: "deepseek-chat",
+    modelDisplayName: "DeepSeek Chat"
+  },
+  {
+    label: "SiliconFlow",
+    providerName: "SiliconFlow",
+    baseUrl: "https://api.siliconflow.cn/v1",
+    modelId: "deepseek-ai/DeepSeek-V3",
+    modelDisplayName: "DeepSeek V3"
+  },
+  {
+    label: "火山引擎",
+    providerName: "Volcengine",
+    baseUrl: "https://ark.cn-beijing.volces.com/api/coding/v3",
+    modelId: "ark-code-latest",
+    modelDisplayName: "ark-code-latest"
+  }
+];
+
+function SetupDialog({
+  error,
+  isSaving,
+  projectRoot,
+  onComplete
+}: {
+  error: string;
+  isSaving: boolean;
+  projectRoot: string;
+  onComplete: (content: string) => void;
+}) {
+  const { t } = useTranslation();
+  const [mode, setMode] = useState<"form" | "text">("form");
+  const [opencodeContent, setOpencodeContent] = useState<string | null>(null);
+  const [providerName, setProviderName] = useState("");
+  const [baseUrl, setBaseUrl] = useState("https://api.openai.com/v1");
+  const [apiKey, setApiKey] = useState("");
+  const [modelId, setModelId] = useState("");
+  const [modelDisplayName, setModelDisplayName] = useState("");
+  const [formError, setFormError] = useState("");
+  const [textImport, setTextImport] = useState("");
+  const [textError, setTextError] = useState("");
+
+  useEffect(() => {
+    findOpencodeConfig(projectRoot)
+      .then((content) => {
+        if (content) setOpencodeContent(content);
+      })
+      .catch(() => {});
+  }, [projectRoot]);
+
+  function applyPreset(preset: SetupPreset) {
+    setProviderName(preset.providerName);
+    setBaseUrl(preset.baseUrl);
+    setModelId(preset.modelId);
+    setModelDisplayName(preset.modelDisplayName);
+  }
+
+  function handleGenerate() {
+    setFormError("");
+    if (!apiKey.trim()) {
+      setFormError(t("setup.errorApiKeyRequired"));
+      return;
+    }
+    if (!modelId.trim()) {
+      setFormError(t("setup.errorModelIdRequired"));
+      return;
+    }
+    const content = generateSetupConfig({
+      providerName,
+      baseUrl,
+      apiKey,
+      modelId,
+      modelDisplayName
+    });
+    onComplete(content);
+  }
+
+  function handleOpencodeImport() {
+    if (opencodeContent) {
+      onComplete(opencodeContent);
+    }
+  }
+
+  function handleTextImport() {
+    setTextError("");
+    const trimmed = textImport.trim();
+    if (!trimmed) {
+      setTextError(t("setup.invalidJsonFormat"));
+      return;
+    }
+    try {
+      const config = JSON.parse(trimmed);
+      if (
+        typeof config !== "object" ||
+        config === null ||
+        !("provider" in config)
+      ) {
+        setTextError(t("setup.invalidJsonFormat"));
+        return;
+      }
+    } catch {
+      setTextError(t("setup.invalidJsonFormat"));
+      return;
+    }
+    onComplete(trimmed);
+  }
+
+  return (
+    <div className="modalBackdrop" role="presentation">
+      <section className="settingsModal setupDialog" role="dialog" aria-modal="true">
+        <header className="modalHeader">
+          <div>
+            <strong>{t("setup.title")}</strong>
+            <small>{t("setup.subtitle")}</small>
+          </div>
+        </header>
+
+        <div className="settingsBody">
+          {(error || formError || textError) && (
+            <pre className="modalError">{formError || textError || error}</pre>
+          )}
+
+          {mode === "form" ? (
+            <>
+              <div className="setupPresets">
+                {opencodeContent && (
+                  <button
+                    className="presetButton presetHighlight"
+                    type="button"
+                    onClick={handleOpencodeImport}
+                  >
+                    <FolderOpen size={14} />
+                    {t("setup.importFromOpencode")}
+                  </button>
+                )}
+                <button
+                  className="presetButton"
+                  type="button"
+                  onClick={() => setMode("text")}
+                >
+                  <FileCode2 size={14} />
+                  {t("setup.manualImport")}
+                </button>
+              </div>
+
+              <div className="setupPresets">
+                {SETUP_PRESETS.map((preset) => (
+                  <button
+                    key={preset.label}
+                    className="presetButton"
+                    type="button"
+                    onClick={() => applyPreset(preset)}
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+
+              <div className="settingsGrid">
+                <label>
+                  <span>{t("setup.providerName")}</span>
+                  <input
+                    value={providerName}
+                    onChange={(e) => setProviderName(e.target.value)}
+                    placeholder={t("setup.providerNamePlaceholder")}
+                  />
+                </label>
+                <label>
+                  <span>{t("setup.modelId")}</span>
+                  <input
+                    value={modelId}
+                    onChange={(e) => setModelId(e.target.value)}
+                    placeholder={t("setup.modelIdPlaceholder")}
+                  />
+                </label>
+                <label className="settingsWide">
+                  <span>{t("setup.baseUrl")}</span>
+                  <input
+                    value={baseUrl}
+                    onChange={(e) => setBaseUrl(e.target.value)}
+                    placeholder={t("setup.baseUrlPlaceholder")}
+                  />
+                </label>
+                <label className="settingsWide">
+                  <span>{t("setup.apiKey")}</span>
+                  <input
+                    type="password"
+                    value={apiKey}
+                    onChange={(e) => setApiKey(e.target.value)}
+                    placeholder={t("setup.apiKeyPlaceholder")}
+                  />
+                </label>
+                <label className="settingsWide">
+                  <span>{t("setup.modelDisplayName")}</span>
+                  <input
+                    value={modelDisplayName}
+                    onChange={(e) => setModelDisplayName(e.target.value)}
+                    placeholder={t("setup.modelDisplayNamePlaceholder")}
+                  />
+                </label>
+              </div>
+            </>
+          ) : (
+            <>
+              <button
+                className="presetButton"
+                type="button"
+                onClick={() => setMode("form")}
+              >
+                <ChevronLeft size={14} />
+                {t("setup.backToForm")}
+              </button>
+              <textarea
+                className="settingsJsonEditor setupTextEditor"
+                value={textImport}
+                onChange={(e) => setTextImport(e.target.value)}
+                placeholder={t("setup.manualImportPlaceholder")}
+                spellCheck={false}
+              />
+            </>
+          )}
+        </div>
+
+        <footer className="modalFooter">
+          {mode === "form" ? (
+            <button
+              className="commandButton modalSaveButton"
+              disabled={isSaving}
+              onClick={handleGenerate}
+            >
+              {isSaving ? <Loader2 className="spin" size={16} /> : <Check size={16} />}
+              {t("setup.generate")}
+            </button>
+          ) : (
+            <button
+              className="commandButton modalSaveButton"
+              disabled={isSaving}
+              onClick={handleTextImport}
+            >
+              {isSaving ? <Loader2 className="spin" size={16} /> : <Check size={16} />}
+              {t("setup.generate")}
+            </button>
+          )}
+        </footer>
+      </section>
+    </div>
+  );
 }
 
 function providerChoices(
@@ -4713,10 +5089,13 @@ function attachmentAcceptValue(kinds: PromptAttachmentKind[]) {
 
 function attachmentUploadTitle(kinds: PromptAttachmentKind[]) {
   if (!kinds.length) {
-    return "当前模型配置不支持附件上传";
+    return appT("attachment.uploadUnsupported");
   }
-  const labels = kinds.map((kind) => (kind === "image" ? "图片" : "文本文件"));
-  return `上传附件，可选类型：${labels.join("、")}`;
+  const labels = kinds.map((kind) =>
+    kind === "image" ? appT("common.image") : appT("attachment.textFile")
+  );
+  const separator = i18n.language === "zh" ? "、" : ", ";
+  return appT("attachment.uploadTypes", { types: labels.join(separator) });
 }
 
 function promptAttachmentSummaries(value: unknown): PromptAttachmentSummary[] {

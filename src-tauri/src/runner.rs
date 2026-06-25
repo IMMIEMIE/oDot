@@ -33,20 +33,6 @@ const STREAM_DELTA_FLUSH_CHARS: usize = 96;
 const STREAM_DELTA_FLUSH_MS: u64 = 120;
 const LLM_RETRY_ATTEMPTS: usize = 3;
 const LLM_RETRY_BASE_DELAY_MS: u64 = 350;
-const COMPACTION_PROMPT: &str = r#"请对以下对话历史生成结构化摘要，包含以下部分：
-- Goal: 用户的核心目标
-- Constraints: 已确认的约束和限制
-- Progress: 已完成的工作
-- Decisions: 做出的关键决策及理由
-- Next Steps: 待完成的下一步
-
-要求：
-- 只保留后续继续任务必需的信息。
-- 保留文件路径、命令、错误、决策和未完成事项。
-- 不要编造未在历史中出现的事实。
-
-对话历史：
-{messages}"#;
 
 pub async fn submit_prompt(
     app: &AppHandle,
@@ -179,10 +165,10 @@ pub async fn recover_session_from_checkpoint(
         storage::get_session_checkpoint(conn, &id)?
     } else {
         storage::latest_recoverable_checkpoint(conn, &session_id)?
-            .ok_or_else(|| "没有可恢复的检查点。".to_string())?
+            .ok_or_else(|| crate::i18n::no_recoverable_checkpoint())?
     };
     if checkpoint.session_id != session_id {
-        return Err("检查点不属于当前会话。".to_string());
+        return Err(crate::i18n::checkpoint_wrong_session());
     }
 
     let run = storage::begin_session_run(conn, &session_id)?;
@@ -666,7 +652,7 @@ async fn complete_with_retry(
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| "AI 服务请求失败。".to_string()))
+    Err(last_error.unwrap_or_else(crate::i18n::ai_request_failed))
 }
 
 fn record_agent_failure(
@@ -711,21 +697,13 @@ fn recovery_prompt(checkpoint: &crate::types::SessionCheckpointRecord) -> String
     let step_text = checkpoint
         .step_index
         .map(|step| format!("step {step}"))
-        .unwrap_or_else(|| "最近的安全边界".to_string());
-    format!(
-        "从会话检查点恢复执行。\n\
-         checkpointId: {}\n\
-         label: {}\n\
-         status: {}\n\
-         boundary: {}\n\
-         checkpointData: {}\n\n\
-         请把该检查点之后的失败事件仅作为诊断信息，不要重复已经成功完成的工作。\
-         先检查最近事件和工作区状态，然后从该安全边界继续完成用户目标。",
-        checkpoint.id,
-        checkpoint.label,
-        checkpoint.status,
-        step_text,
-        compact_json(&checkpoint.data)
+        .unwrap_or_else(|| crate::i18n::recent_safe_boundary().to_string());
+    crate::i18n::recovery_prompt(
+        &checkpoint.id,
+        &checkpoint.label,
+        &checkpoint.status,
+        &step_text,
+        &compact_json(&checkpoint.data),
     )
 }
 
@@ -770,7 +748,7 @@ fn execute_task_blocked(
             "name": call.name,
             "result": {
                 "blocked": true,
-                "reason": "当前模式禁止执行 task，请切换到 Agent 模式。"
+                "reason": crate::i18n::task_blocked_in_current_mode()
             }
         }),
     )?;
@@ -984,7 +962,7 @@ fn task_output_text(response: &SessionEventsResponse) -> String {
         .find(|event| event.event_type == "assistant.message")
         .and_then(|event| event.data.get("text"))
         .and_then(Value::as_str)
-        .unwrap_or("子任务已完成，但没有返回文本结果。")
+        .unwrap_or(crate::i18n::subtask_completed_without_text())
         .to_string()
 }
 
@@ -1010,7 +988,7 @@ fn stop_if_cancelled(
         "agent.stopped",
         json!({
             "step": step_index,
-            "reason": "用户停止了 Agent"
+            "reason": crate::i18n::agent_stopped_by_user()
         }),
     )?;
     storage::append_event(
@@ -1036,7 +1014,7 @@ pub fn compact_session(
         return storage::insert_context_summary(
             conn,
             session_id,
-            "当前会话还没有事件。".to_string(),
+            crate::i18n::session_has_no_events(),
             0,
         );
     }
@@ -1066,7 +1044,7 @@ pub async fn compact_session_with_provider(
         return storage::insert_context_summary(
             conn,
             session_id,
-            "当前会话还没有事件。".to_string(),
+            crate::i18n::session_has_no_events(),
             0,
         );
     }
@@ -1076,7 +1054,7 @@ pub async fn compact_session_with_provider(
     let (head_events, tail_events) =
         split_events_for_compaction(&events, context_limit, max_output_tokens);
     let text = if head_events.is_empty() {
-        "较早上下文为空；最近对话已保留原文。".to_string()
+        crate::i18n::earlier_context_empty_recent_kept()
     } else {
         match compact_with_llm(&head_events, provider).await {
             Ok(summary) if !summary.trim().is_empty() => summary,
@@ -1324,7 +1302,7 @@ fn build_stream_system_prompt(
     let summary = summaries
         .first()
         .map(|summary| summary.text.as_str())
-        .unwrap_or("当前还没有压缩上下文。");
+        .unwrap_or(crate::i18n::no_compressed_context_yet());
     Ok(format!(
         "{}\n\nProject context:\n{}\n\nCompressed context:\n{}",
         build_system_prompt(mode, native_tools, model, provider_id),
@@ -1548,7 +1526,7 @@ fn user_message_content(prompt: &str, attachments: &[PromptAttachment]) -> Value
 
     let mut parts = Vec::new();
     let base_prompt = if prompt.trim().is_empty() {
-        "请根据附件内容继续。"
+        crate::i18n::continue_from_attachment_prompt()
     } else {
         prompt
     };
@@ -1562,16 +1540,22 @@ fn user_message_content(prompt: &str, attachments: &[PromptAttachment]) -> Value
             PromptAttachmentKind::Text => {
                 parts.push(json!({
                     "type": "text",
-                    "text": format!(
-                        "附件文件: {}\nMIME: {}\n大小: {} bytes\n\n{}",
-                        attachment.name, attachment.mime, attachment.size, attachment.content
+                    "text": crate::i18n::attachment_file_template(
+                        &attachment.name,
+                        &attachment.mime,
+                        attachment.size,
+                        &attachment.content,
                     )
                 }));
             }
             PromptAttachmentKind::Image => {
                 parts.push(json!({
                     "type": "text",
-                    "text": format!("附件图片: {} ({}, {} bytes)", attachment.name, attachment.mime, attachment.size)
+                    "text": crate::i18n::attachment_image_text(
+                        &attachment.name,
+                        &attachment.mime,
+                        attachment.size,
+                    )
                 }));
                 parts.push(json!({
                     "type": "image_url",
@@ -2103,7 +2087,7 @@ fn build_user_prompt(
     let summary = summaries
         .first()
         .map(|summary| summary.text.as_str())
-        .unwrap_or("当前还没有压缩上下文。");
+        .unwrap_or(crate::i18n::no_compressed_context_yet());
     let session = storage::get_session(conn, session_id)?;
     let project_context = project_context_text(&session.project_root);
 
@@ -2136,20 +2120,21 @@ fn text_runtime_prompt_with_attachments(
         return Ok(current_prompt.to_string());
     }
     let mut lines = vec![if current_prompt.trim().is_empty() {
-        "请根据附件内容继续。".to_string()
+        crate::i18n::continue_from_attachment_prompt().to_string()
     } else {
         current_prompt.to_string()
     }];
-    lines.push("用户上传附件:".to_string());
+    lines.push(crate::i18n::user_uploaded_attachments_header().to_string());
     for attachment in attachments {
         match &attachment.kind {
             PromptAttachmentKind::Text => lines.push(format!(
                 "{} ({}, {} bytes):\n{}",
                 attachment.name, attachment.mime, attachment.size, attachment.content
             )),
-            PromptAttachmentKind::Image => lines.push(format!(
-                "{} ({}, {} bytes): [图片附件已上传，当前文本协议不内联 base64]",
-                attachment.name, attachment.mime, attachment.size
+            PromptAttachmentKind::Image => lines.push(crate::i18n::attachment_image_replay_note(
+                &attachment.name,
+                &attachment.mime,
+                attachment.size,
             )),
         }
     }
@@ -2223,9 +2208,8 @@ fn parse_model_turn(raw_response: &str) -> Result<ModelTurn, String> {
         }
     }
 
-    Err(format!(
-        "模型响应不符合工具调用 JSON 协议: {}",
-        first_error.unwrap_or_else(|| "未知解析错误".to_string())
+    Err(crate::i18n::tool_call_json_protocol_error(
+        &first_error.unwrap_or_else(|| crate::i18n::unknown_parse_error().to_string()),
     ))
 }
 
@@ -2472,14 +2456,14 @@ async fn compact_with_llm(
         .collect::<Vec<_>>()
         .join("\n");
     if messages.trim().is_empty() {
-        return Ok("较早上下文没有可摘要内容。".to_string());
+        return Ok(crate::i18n::compaction_empty_history().to_string());
     }
-    let user_prompt = COMPACTION_PROMPT.replace("{messages}", &truncate(&messages, 64_000));
+    let user_prompt = crate::i18n::compaction_prompt(&truncate(&messages, 64_000));
     let mut compaction_provider = provider.clone();
     compaction_provider.tool_mode = ToolMode::Json;
     let completion = provider::complete(
         &compaction_provider,
-        "你是上下文压缩器。只输出结构化摘要，不调用工具。",
+        crate::i18n::compaction_system_prompt(),
         &user_prompt,
     )
     .await?;
@@ -2553,7 +2537,7 @@ fn prune_tool_outputs(
 }
 
 fn summarize_events(events: &[crate::types::EventRecord]) -> String {
-    let mut lines = vec!["本地上下文摘要:".to_string()];
+    let mut lines = vec![crate::i18n::local_context_summary_header().to_string()];
     for event in events.iter().rev().take(60).rev() {
         let detail = match event.event_type.as_str() {
             "prompt.submitted" => event
@@ -2607,7 +2591,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
     }
 
     let mut truncated = value.chars().take(max_chars).collect::<String>();
-    truncated.push_str("...[已截断]");
+    truncated.push_str(crate::i18n::truncated_suffix());
     truncated
 }
 
