@@ -1,7 +1,6 @@
 import {
   AlertTriangle,
   ArrowUp,
-  Bot,
   BrainCircuit,
   Check,
   ChevronLeft,
@@ -30,6 +29,7 @@ import {
   Wrench,
   X
 } from "lucide-react";
+import { OdodBotIcon } from "./OdodBotIcon";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -70,7 +70,6 @@ import {
   type EventRecord,
   type PermissionRequestRecord,
   type PermissionReply,
-  type PromptAttachmentInput,
   type ProjectFile,
   type ProviderConfigFileResponse,
   type ProviderRecord,
@@ -87,9 +86,18 @@ import {
   type ODotRealtimeEvent,
   useSessionEventStore
 } from "./sessionStore";
-
-const MAX_TEXT_ATTACHMENT_BYTES = 250_000;
-const MAX_IMAGE_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+import {
+  deriveFloatAgentStatus,
+  saveFloatAgentStatus
+} from "./floatAgentStatus";
+import {
+  clipboardFiles,
+  readPromptAttachment,
+  shellAllowlistPrefix,
+  toPromptAttachmentInput,
+  type PromptAttachment,
+  type PromptAttachmentKind
+} from "./promptAttachments";
 
 type Notice = {
   tone: "info" | "success" | "error";
@@ -97,18 +105,8 @@ type Notice = {
 };
 
 type ThemeMode = "system" | "light" | "dark";
-type PromptAttachmentKind = "text" | "image";
 
-type PromptAttachment = {
-  id: string;
-  name: string;
-  mime: string;
-  size: number;
-  kind: PromptAttachmentKind;
-  content: string;
-};
-
-type PromptAttachmentSummary = Omit<PromptAttachmentInput, "content">;
+type PromptAttachmentSummary = Omit<PromptAttachment, "id" | "content">;
 
 type TreeNode = {
   type: "dir" | "file";
@@ -117,27 +115,6 @@ type TreeNode = {
   file?: ProjectFile;
   children: TreeNode[];
 };
-
-function FloatModeIcon({ size = 16 }: { size?: number }) {
-  return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={2}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <rect x="3" y="3" width="14" height="14" rx="2.5" />
-      <path d="M13 10 L8 15" />
-      <path d="M8 15 L8 11.5" />
-      <path d="M8 15 L11.5 15" />
-      <rect x="17" y="17" width="4.5" height="4.5" rx="1" fill="currentColor" stroke="none" />
-    </svg>
-  );
-}
 
 export function App() {
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
@@ -288,6 +265,28 @@ export function App() {
     };
   }, [selectedSessionId, applyRealtimeEvent]);
 
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{ sessionId: string }>("odot:float-session-refresh", ({ payload }) => {
+      if (disposed || payload.sessionId !== selectedSessionId) {
+        return;
+      }
+      scheduleRealtimeTailRefresh(payload.sessionId);
+      void refreshSessions().catch(() => undefined);
+    }).then((dispose) => {
+      if (disposed) {
+        dispose();
+      } else {
+        unlisten = dispose;
+      }
+    }).catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [selectedSessionId]);
+
   const selectedProvider = useMemo(
     () => providers.find((provider) => provider.id === selectedProviderId),
     [providers, selectedProviderId]
@@ -436,6 +435,20 @@ export function App() {
   );
   const isAgentWorking = isSubmitting || isContinuing;
   const isPromptLocked = isAgentWorking || isStopping || pendingToolEvents.length > 0;
+  const floatAgentStatus = useMemo(
+    () =>
+      deriveFloatAgentStatus({
+        session: selectedSession,
+        eventsResponse,
+        isWorking: isAgentWorking || isStopping,
+        allowedAttachmentKinds
+      }),
+    [allowedAttachmentKinds, eventsResponse, isAgentWorking, isStopping, selectedSession]
+  );
+
+  useEffect(() => {
+    saveFloatAgentStatus(floatAgentStatus);
+  }, [floatAgentStatus]);
 
   useLayoutEffect(() => {
     if (shouldStickToTimelineBottomRef.current) {
@@ -1334,7 +1347,7 @@ export function App() {
                 session.id === selectedSessionId ? "active" : ""
               } ${session.parentSessionId ? "childSession" : ""}`}
             >
-              {session.parentSessionId ? <Bot size={15} /> : <Clock3 size={15} />}
+              {session.parentSessionId ? <OdodBotIcon size={15} /> : <Clock3 size={15} />}
               {editingSessionId === session.id ? (
                 <input
                   className="sessionTitleInput"
@@ -1403,9 +1416,14 @@ export function App() {
       }}
     >
       <aside className="leftPane">
-        <header className="brandRow">
+        <header className="brandRow" onClick={async () => {
+                  const mainWin = getCurrentWindow();
+                  const floatWin = await WebviewWindow.getByLabel("float");
+                  await floatWin?.show();
+                  await mainWin.hide();
+                }}>
           <span className="brandIcon">
-            <Bot size={22} />
+            <OdodBotIcon size={22} />
           </span>
           <span>
             <strong>oDot</strong>
@@ -1432,19 +1450,6 @@ export function App() {
                 onClick={() => setIsSettingsOpen(true)}
               >
                 <Settings size={16} />
-              </button>
-              <button
-                className="iconButton ghost"
-                aria-label="进入悬浮球模式"
-                title="进入悬浮球模式"
-                onClick={async () => {
-                  const mainWin = getCurrentWindow();
-                  const floatWin = await WebviewWindow.getByLabel("float");
-                  await floatWin?.show();
-                  await mainWin.hide();
-                }}
-              >
-                <FloatModeIcon size={16} />
               </button>
             </div>
           </div>
@@ -2846,7 +2851,18 @@ function MarkdownText({
   return (
     <div className={`markdownFrame ${isLong && !expanded ? "collapsed" : ""}`}>
       <div className="markdownBody">
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{markdownText}</ReactMarkdown>
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          components={{
+            table: ({ children, ...props }) => (
+              <div className="markdownTableScroll">
+                <table {...props}>{children}</table>
+              </div>
+            )
+          }}
+        >
+          {markdownText}
+        </ReactMarkdown>
       </div>
       {isLong && (
         <button
@@ -3872,7 +3888,7 @@ function timelineItemIcon(item: TimelineItem) {
     return <Pencil size={16} />;
   }
   if (item.kind === "assistantReply") {
-    return <Bot size={16} />;
+    return <OdodBotIcon size={16} />;
   }
   if (item.kind === "reasoning") {
     return <BrainCircuit size={16} />;
@@ -4119,29 +4135,6 @@ function visiblePermissionRequests(requests: PermissionRequestRecord[]) {
 function isToolPermissionRequest(request: PermissionRequestRecord) {
   const source = asRecord(request.sourceJson);
   return source.type === "tool";
-}
-
-function shellAllowlistPrefix(command: string) {
-  const normalized = command.trim().toLowerCase().replace(/\s+/g, " ");
-  if (!normalized) {
-    return "";
-  }
-  const first = normalized.split(" ")[0] ?? normalized;
-  if (first === "cd") {
-    return "cd";
-  }
-  if (first === "npm" || first === "pnpm" || first === "yarn") {
-    const parts = normalized.split(" ");
-    if (parts[1] === "run" && parts[2]) {
-      return `${parts[0]} run ${parts[2]}`;
-    }
-    return parts.slice(0, 2).join(" ");
-  }
-  if (first === "cargo" || first === "git") {
-    const parts = normalized.split(" ");
-    return parts.slice(0, 2).join(" ");
-  }
-  return first;
 }
 
 function hasUnresolvedPendingTools(events: EventRecord[]) {
@@ -4726,139 +4719,6 @@ function attachmentUploadTitle(kinds: PromptAttachmentKind[]) {
   return `上传附件，可选类型：${labels.join("、")}`;
 }
 
-function clipboardFiles(data: DataTransfer): File[] {
-  const byKey = new Map<string, File>();
-  for (const file of Array.from(data.files)) {
-    byKey.set(`${file.name}:${file.size}:${file.type}`, file);
-  }
-  for (const item of Array.from(data.items)) {
-    if (item.kind !== "file") {
-      continue;
-    }
-    const file = item.getAsFile();
-    if (!file) {
-      continue;
-    }
-    byKey.set(`${file.name}:${file.size}:${file.type}`, file);
-  }
-  return Array.from(byKey.values());
-}
-
-async function readPromptAttachment(
-  file: File,
-  allowedKinds: PromptAttachmentKind[]
-): Promise<PromptAttachment> {
-  const kind = promptAttachmentKindForFile(file, allowedKinds);
-  if (!kind) {
-    throw new Error(`当前模型不支持该附件类型：${file.name}`);
-  }
-  if (kind === "text" && file.size > MAX_TEXT_ATTACHMENT_BYTES) {
-    throw new Error(`文本附件过大：${file.name}，最大 ${formatBytes(MAX_TEXT_ATTACHMENT_BYTES)}。`);
-  }
-  if (kind === "image" && file.size > MAX_IMAGE_ATTACHMENT_BYTES) {
-    throw new Error(`图片附件过大：${file.name}，最大 ${formatBytes(MAX_IMAGE_ATTACHMENT_BYTES)}。`);
-  }
-
-  return {
-    id: newId(),
-    name: file.name,
-    mime: attachmentMimeForFile(file, kind),
-    size: file.size,
-    kind,
-    content: kind === "image" ? await readFileAsDataUrl(file, attachmentMimeForFile(file, kind)) : await readFileAsText(file)
-  };
-}
-
-function promptAttachmentKindForFile(
-  file: File,
-  allowedKinds: PromptAttachmentKind[]
-): PromptAttachmentKind | null {
-  if (allowedKinds.includes("image") && fileLooksImage(file)) {
-    return "image";
-  }
-  if (allowedKinds.includes("text") && fileLooksText(file)) {
-    return "text";
-  }
-  return null;
-}
-
-function fileLooksImage(file: File) {
-  return (
-    file.type.startsWith("image/") ||
-    /\.(png|jpe?g|gif|webp|bmp|avif)$/i.test(file.name)
-  );
-}
-
-function attachmentMimeForFile(file: File, kind: PromptAttachmentKind) {
-  if (file.type) {
-    return file.type;
-  }
-  if (kind === "image") {
-    const ext = file.name.toLowerCase().split(".").pop();
-    if (ext === "jpg" || ext === "jpeg") return "image/jpeg";
-    if (ext === "png") return "image/png";
-    if (ext === "gif") return "image/gif";
-    if (ext === "webp") return "image/webp";
-    if (ext === "bmp") return "image/bmp";
-    if (ext === "avif") return "image/avif";
-    return "image/png";
-  }
-  return "text/plain";
-}
-
-function fileLooksText(file: File) {
-  if (file.type.startsWith("text/")) {
-    return true;
-  }
-  const mime = file.type.toLowerCase();
-  if (
-    [
-      "application/json",
-      "application/xml",
-      "application/javascript",
-      "application/typescript",
-      "application/x-sh",
-      "application/x-yaml"
-    ].includes(mime)
-  ) {
-    return true;
-  }
-  return /\.(txt|md|markdown|json|jsonl|csv|ts|tsx|js|jsx|py|rs|go|java|kt|swift|c|cpp|h|hpp|cs|html|css|scss|xml|ya?ml|toml|sql|sh|ps1|bat|log)$/i.test(
-    file.name
-  );
-}
-
-function readFileAsText(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result ?? ""));
-    reader.onerror = () => reject(reader.error ?? new Error(`无法读取附件：${file.name}`));
-    reader.readAsText(file);
-  });
-}
-
-function readFileAsDataUrl(file: File, mime: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const value = String(reader.result ?? "");
-      resolve(value.replace(/^data:[^;,]*/, `data:${mime}`));
-    };
-    reader.onerror = () => reject(reader.error ?? new Error(`无法读取附件：${file.name}`));
-    reader.readAsDataURL(file);
-  });
-}
-
-function toPromptAttachmentInput(attachment: PromptAttachment): PromptAttachmentInput {
-  return {
-    name: attachment.name,
-    mime: attachment.mime,
-    size: attachment.size,
-    kind: attachment.kind,
-    content: attachment.content
-  };
-}
-
 function promptAttachmentSummaries(value: unknown): PromptAttachmentSummary[] {
   if (!Array.isArray(value)) {
     return [];
@@ -4879,10 +4739,6 @@ function promptAttachmentSummaries(value: unknown): PromptAttachmentSummary[] {
       }
     ];
   });
-}
-
-function newId() {
-  return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
 }
 
 function providerRecord(config: Record<string, unknown>, providerId: string) {

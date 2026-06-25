@@ -24,8 +24,8 @@
       {
         "label": "float",
         "title": "",
-        "width": 64,
-        "height": 64,
+        "width": 480,
+        "height": 480,
         "visible": false,
         "decorations": false,
         "transparent": true,

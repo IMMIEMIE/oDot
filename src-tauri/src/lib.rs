@@ -12,7 +12,7 @@ mod util;
 mod workspace;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use types::{
@@ -23,7 +23,7 @@ use types::{
 };
 
 const FLOAT_WINDOW_LABEL: &str = "float";
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 const FLOAT_DRAG_FRAME_MS: u64 = 8;
 static FLOAT_DRAG_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -49,15 +49,33 @@ fn left_mouse_button_is_down() -> bool {
     (unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } as u16 & 0x8000) != 0
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(target_os = "macos")]
+fn left_mouse_button_is_down() -> bool {
+    const K_CG_EVENT_SOURCE_STATE_COMBINED_SESSION_STATE: i32 = 0;
+    const K_CG_MOUSE_BUTTON_LEFT: u32 = 0;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventSourceButtonState(state_id: i32, button: u32) -> bool;
+    }
+
+    unsafe {
+        CGEventSourceButtonState(
+            K_CG_EVENT_SOURCE_STATE_COMBINED_SESSION_STATE,
+            K_CG_MOUSE_BUTTON_LEFT,
+        )
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn physical_i32(value: f64) -> i32 {
     value
         .round()
         .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
 }
 
-#[cfg(target_os = "windows")]
-async fn drag_float_window_windows(
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+async fn drag_float_window_native(
     app: AppHandle,
     window: tauri::WebviewWindow,
 ) -> Result<(), String> {
@@ -87,12 +105,12 @@ async fn start_float_drag(app: AppHandle, window: tauri::WebviewWindow) -> Resul
     }
     let _guard = acquire_float_drag()?;
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
-        drag_float_window_windows(app, window).await
+        drag_float_window_native(app, window).await
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = app;
         window.start_dragging().map_err(|error| error.to_string())
