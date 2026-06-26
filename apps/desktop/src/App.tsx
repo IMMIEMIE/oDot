@@ -158,11 +158,11 @@ export function App() {
   const [streamingEventId, setStreamingEventId] = useState<string | null>(null);
   const [prompt, setPrompt] = useState("");
   const [lastError, setLastError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<Notice>({
+  const [, setNotice] = useState<Notice>({
     tone: "info",
     text: i18n.t("notice.ready")
   });
-  const [isBooting, setIsBooting] = useState(true);
+  const [, setIsBooting] = useState(true);
   const [isSavingConfig, setIsSavingConfig] = useState(false);
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
   const [isCreatingSession, setIsCreatingSession] = useState(false);
@@ -825,11 +825,16 @@ export function App() {
       throw new Error(t("error.selectProject"));
     }
     if (selectedSession) {
-      if (selectedSession.mode !== mode || selectedSession.shellMode !== shellMode) {
+      if (
+        selectedSession.mode !== mode ||
+        selectedSession.shellMode !== shellMode ||
+        selectedSession.providerId !== selectedProviderId
+      ) {
         const updated = await updateSessionMode({
           sessionId: selectedSession.id,
           mode,
-          shellMode
+          shellMode,
+          providerId: selectedProviderId
         });
         setSessions((current) =>
           current.map((session) => (session.id === updated.id ? updated : session))
@@ -1360,6 +1365,37 @@ export function App() {
     }
   }
 
+  function selectAgentMode(nextMode: AgentMode) {
+    setMode(nextMode);
+    setIsShellModeMenuOpen(false);
+    if (selectedSessionId) {
+      void updateSessionMode({ sessionId: selectedSessionId, mode: nextMode })
+        .then((updated) =>
+          setSessions((current) =>
+            current.map((session) => (session.id === updated.id ? updated : session))
+          )
+        )
+        .catch(reportError);
+    }
+  }
+
+  function selectProviderForCurrentSession(providerId: string) {
+    setSelectedProviderId(providerId);
+    setIsModelMenuOpen(false);
+    if (selectedSessionId) {
+      void updateSessionMode({
+        sessionId: selectedSessionId,
+        providerId
+      })
+        .then((updated) =>
+          setSessions((current) =>
+            current.map((session) => (session.id === updated.id ? updated : session))
+          )
+        )
+        .catch(reportError);
+    }
+  }
+
   async function handleDeleteSession(sessionId: string) {
     const session = sessions.find((item) => item.id === sessionId);
     const confirmed = window.confirm(
@@ -1662,38 +1698,6 @@ export function App() {
       />
 
       <main className="mainPane">
-        <header className="topBar">
-          <div className="modeControls">
-            <Segmented
-              value={mode}
-              options={[
-                ["ask", t("mode.ask")],
-                ["plan", t("mode.plan")],
-                ["agent", t("mode.agent")]
-              ]}
-              onChange={(value) => {
-                const nextMode = value as AgentMode;
-                setMode(nextMode);
-                if (selectedSessionId) {
-                  void updateSessionMode({ sessionId: selectedSessionId, mode: nextMode })
-                    .then((updated) =>
-                      setSessions((current) =>
-                        current.map((s) => s.id === updated.id ? updated : s)
-                      )
-                    )
-                    .catch(reportError);
-                }
-              }}
-            />
-          </div>
-          <div className={`notice ${notice.tone}`}>
-            {(isBooting || isAgentWorking || isStopping) && (
-              <Loader2 className="spin" size={15} />
-            )}
-            <span>{notice.text}</span>
-          </div>
-        </header>
-
         <section className="timelinePane">
           <div className="timeline" ref={timelineScrollRef} onScroll={handleTimelineScroll}>
             <ConversationTimeline
@@ -1785,8 +1789,8 @@ export function App() {
                   ))}
                 </div>
               )}
-              <div className="promptActionRow">
-                <div className="composerControls">
+                <div className="promptActionRow">
+                  <div className="composerControls">
                   <button
                     type="button"
                     className="composerAttachButton"
@@ -1804,16 +1808,12 @@ export function App() {
                   <div
                     ref={modelMenuRef}
                     className="composerModelSelect"
-                    title={
-                      selectedSessionId
-                        ? t("session.sessionBoundModel")
-                        : t("nav.selectModel")
-                    }
+                    title={t("nav.selectModel")}
                   >
                     <button
                       type="button"
                       className="composerModelButton"
-                      disabled={isPromptLocked || Boolean(selectedSessionId)}
+                      disabled={isPromptLocked}
                       aria-haspopup="listbox"
                       aria-expanded={isModelMenuOpen}
                       aria-label={t("nav.selectModel")}
@@ -1822,7 +1822,7 @@ export function App() {
                       <span>{selectedProvider ? selectedModelLabel : t("empty.noModelConfigured")}</span>
                       <ChevronDown size={15} />
                     </button>
-                    {isModelMenuOpen && !isPromptLocked && !selectedSessionId && (
+                    {isModelMenuOpen && !isPromptLocked && (
                       <div className="composerModelMenu" role="listbox" aria-label={t("nav.selectModel")}>
                         {!providers.length && (
                           <div className="composerModelEmpty">{t("empty.noModelConfigured")}</div>
@@ -1836,10 +1836,7 @@ export function App() {
                               className={`composerModelOption ${isSelected ? "active" : ""}`}
                               role="option"
                               aria-selected={isSelected}
-                              onClick={() => {
-                                setSelectedProviderId(provider.id);
-                                setIsModelMenuOpen(false);
-                              }}
+                              onClick={() => selectProviderForCurrentSession(provider.id)}
                             >
                               <span>{providerModelLabel(provider)}</span>
                               {isSelected && <Check size={15} />}
@@ -1849,47 +1846,69 @@ export function App() {
                       </div>
                     )}
                   </div>
-                </div>
+                  </div>
                 <div
                   ref={shellModeMenuRef}
-                  className="composerShellModeSelect"
-                  title={shellModeLabel(shellMode)}
+                  className="composerRunConfigSelect"
+                  title={`${modeLabel(mode)} / ${shellModeLabel(shellMode)}`}
                 >
                   <button
                     type="button"
-                    className="composerShellModeButton"
+                    className="composerRunConfigButton"
                     disabled={isPromptLocked}
                     aria-haspopup="listbox"
                     aria-expanded={isShellModeMenuOpen}
-                    aria-label={shellModeLabel(shellMode)}
+                    aria-label={`${modeLabel(mode)} / ${shellModeLabel(shellMode)}`}
                     onClick={() => setIsShellModeMenuOpen((open) => !open)}
                   >
-                    <span>{t(`shellMode.${shellMode}`)}</span>
+                    <span>{modeLabel(mode)}</span>
+                    <small>{t(`shellMode.${shellMode}`)}</small>
                     <ChevronDown size={14} />
                   </button>
                   {isShellModeMenuOpen && !isPromptLocked && (
                     <div
-                      className="composerShellModeMenu"
+                      className="composerRunConfigMenu"
                       role="listbox"
-                      aria-label={shellModeLabel(shellMode)}
+                      aria-label={`${modeLabel(mode)} / ${shellModeLabel(shellMode)}`}
                     >
-                      {(["manual", "auto"] as ShellMode[]).map((item) => {
-                        const isSelected = item === shellMode;
-                        return (
-                          <button
-                            type="button"
-                            key={item}
-                            className={`composerShellModeOption ${isSelected ? "active" : ""}`}
-                            role="option"
-                            aria-selected={isSelected}
-                            onClick={() => selectShellMode(item)}
-                          >
-                            <span>{t(`shellMode.${item}`)}</span>
-                            <small>{shellModeLabel(item)}</small>
-                            {isSelected && <Check size={14} />}
-                          </button>
-                        );
-                      })}
+                      <div className="composerRunConfigColumn">
+                        <strong>{t("nav.runMode")}</strong>
+                        {(["ask", "plan", "agent"] as AgentMode[]).map((item) => {
+                          const isSelected = item === mode;
+                          return (
+                            <button
+                              type="button"
+                              key={item}
+                              className={`composerRunConfigOption ${isSelected ? "active" : ""}`}
+                              role="option"
+                              aria-selected={isSelected}
+                              onClick={() => selectAgentMode(item)}
+                            >
+                              <span>{modeLabel(item)}</span>
+                              {isSelected && <Check size={14} />}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <div className="composerRunConfigColumn">
+                        <strong>{t("nav.commandApproval")}</strong>
+                        {(["manual", "auto"] as ShellMode[]).map((item) => {
+                          const isSelected = item === shellMode;
+                          return (
+                            <button
+                              type="button"
+                              key={item}
+                              className={`composerRunConfigOption ${isSelected ? "active" : ""}`}
+                              role="option"
+                              aria-selected={isSelected}
+                              onClick={() => selectShellMode(item)}
+                            >
+                              <span>{t(`shellMode.${item}`)}</span>
+                              {isSelected && <Check size={14} />}
+                            </button>
+                          );
+                        })}
+                      </div>
                     </div>
                   )}
                 </div>

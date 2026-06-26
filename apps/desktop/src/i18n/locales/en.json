@@ -60,6 +60,7 @@
     "expandRightPane": "Expand right panel",
     "collapseRightPane": "Collapse right panel",
     "errorDetails": "Error details",
+    "runMode": "Run mode",
     "commandApproval": "Command approval",
     "permissionRequests": "Permission requests",
     "backgroundJobs": "Background jobs",
@@ -359,6 +360,7 @@
   "floatStatus": {
     "idle": "Agent idle",
     "working": "Agent working",
+    "thinking": "Agent thinking",
     "error": "Agent error",
     "complete": "Task complete",
     "waitingApproval": "Waiting for approval"

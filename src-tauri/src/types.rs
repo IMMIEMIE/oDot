@@ -244,6 +244,7 @@ pub struct UpdateSessionModeInput {
     pub session_id: String,
     pub mode: Option<AgentMode>,
     pub shell_mode: Option<ShellMode>,
+    pub provider_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

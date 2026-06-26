@@ -9,7 +9,13 @@ import type { PromptAttachmentKind } from "./promptAttachments";
 
 export const FLOAT_AGENT_STATUS_STORAGE_KEY = "odot.floatAgentStatus";
 
-export type FloatAgentStatusKind = "idle" | "working" | "error" | "approval" | "complete";
+export type FloatAgentStatusKind =
+  | "idle"
+  | "working"
+  | "thinking"
+  | "error"
+  | "approval"
+  | "complete";
 
 export type FloatAgentStatusRecord = {
   kind: FloatAgentStatusKind;
@@ -65,6 +71,9 @@ export function deriveFloatAgentStatus({
   }
 
   if (isWorking) {
+    if (latestModelOutputIsReasoning(eventsResponse.events)) {
+      return floatAgentStatus("thinking", appT("floatStatus.thinking"), sessionId, allowedAttachmentKinds);
+    }
     return floatAgentStatus("working", appT("floatStatus.working"), sessionId, allowedAttachmentKinds);
   }
 
@@ -196,12 +205,25 @@ function latestStatusEvent(events: EventRecord[]) {
   );
 }
 
+function latestModelOutputIsReasoning(events: EventRecord[]) {
+  const latest = [...events].reverse().find((event) =>
+    [
+      "assistant.message",
+      "assistant.message.delta",
+      "reasoning.summary",
+      "reasoning.summary.delta"
+    ].includes(event.type)
+  );
+  return latest?.type === "reasoning.summary" || latest?.type === "reasoning.summary.delta";
+}
+
 function normalizeFloatAgentStatus(value: unknown): FloatAgentStatusRecord {
   const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
   const kind = record.kind;
   if (
     kind !== "idle" &&
     kind !== "working" &&
+    kind !== "thinking" &&
     kind !== "error" &&
     kind !== "approval" &&
     kind !== "complete"

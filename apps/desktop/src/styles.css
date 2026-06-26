@@ -643,7 +643,7 @@ textarea:focus {
   min-width: 0;
   height: 100vh;
   display: grid;
-  grid-template-rows: 56px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   overflow: hidden;
 }
 
@@ -1615,7 +1615,7 @@ pre {
 
 .promptActionRow {
   width: 100%;
-  min-height: 38px;
+  min-height: 40px;
   min-width: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto auto;
@@ -1632,10 +1632,10 @@ pre {
 }
 
 .composerAttachButton {
-  width: 32px;
-  min-width: 32px;
-  height: 32px;
-  min-height: 32px;
+  width: 34px;
+  min-width: 34px;
+  height: 34px;
+  min-height: 34px;
   border: 0;
   border-radius: 50%;
   background: var(--accent-soft);
@@ -1663,7 +1663,7 @@ pre {
 }
 
 .composerModelButton {
-  height: 32px;
+  height: 34px;
   min-width: 150px;
   width: 120px;
   min-width: 0;
@@ -1760,7 +1760,7 @@ pre {
   color: var(--muted);
 }
 
-.composerShellModeSelect {
+.composerRunConfigSelect {
   position: relative;
   width: auto;
   min-width: 0;
@@ -1768,13 +1768,13 @@ pre {
   align-items: center;
 }
 
-.composerShellModeButton {
-  width: 76px;
-  min-width: 76px;
-  height: 32px;
+.composerRunConfigButton {
+  width: 116px;
+  min-width: 96px;
+  height: 40px;
   padding: 0 8px;
   border: 1px solid var(--accent-border);
-  border-radius: 8px;
+  border-radius: 5px;
   background: var(--accent-softer);
   color: var(--accent);
   display: inline-flex;
@@ -1785,82 +1785,96 @@ pre {
   font-weight: 800;
 }
 
-.composerShellModeButton span {
+.composerRunConfigButton span,
+.composerRunConfigButton small {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.composerShellModeButton svg {
+.composerRunConfigButton small {
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.composerRunConfigButton svg {
   flex: 0 0 auto;
 }
 
-.composerShellModeButton:hover:not(:disabled),
-.composerShellModeButton[aria-expanded="true"] {
+.composerRunConfigButton:hover:not(:disabled),
+.composerRunConfigButton[aria-expanded="true"] {
   border-color: var(--accent-border);
   background: var(--accent-soft);
 }
 
-.composerShellModeMenu {
+.composerRunConfigMenu {
   position: absolute;
   right: 0;
   bottom: calc(100% + 8px);
   z-index: 45;
-  width: 178px;
-  padding: 6px;
+  width: min(330px, calc(100vw - 48px));
+  padding: 8px;
   border: 1px solid var(--accent-border);
   border-radius: 12px;
   background: var(--surface-elevated);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px;
   box-shadow: var(--shadow-soft);
 }
 
-.composerShellModeOption {
+.composerRunConfigColumn {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 5px;
+}
+
+.composerRunConfigColumn strong {
+  padding: 0 6px 2px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.composerRunConfigOption {
   width: 100%;
-  min-height: 42px;
-  padding: 5px 8px;
+  min-height: 34px;
+  padding: 0 7px;
   border: 0;
-  border-radius: 8px;
+  border-radius: 6px;
   background: transparent;
   color: var(--text-soft);
   display: grid;
   grid-template-columns: minmax(0, 1fr) 16px;
   align-items: center;
-  gap: 2px 8px;
+  gap: 8px;
   text-align: left;
+  font-size: 13px;
+  font-weight: 820;
 }
 
-.composerShellModeOption span,
-.composerShellModeOption small {
+.composerRunConfigOption span {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.composerShellModeOption span {
-  font-size: 13px;
-  font-weight: 850;
-}
-
-.composerShellModeOption small {
-  color: var(--muted);
-  font-size: 11px;
-}
-
-.composerShellModeOption svg {
-  grid-row: 1 / span 2;
+.composerRunConfigOption svg {
   grid-column: 2;
   color: var(--accent);
 }
 
-.composerShellModeOption:hover,
-.composerShellModeOption:focus-visible {
+.composerRunConfigOption:hover,
+.composerRunConfigOption:focus-visible {
   background: var(--surface-soft);
   color: var(--ink);
 }
 
-.composerShellModeOption.active {
+.composerRunConfigOption.active {
   background: var(--accent-soft);
   color: var(--accent);
 }
@@ -1869,7 +1883,7 @@ pre {
   height: 40px;
   min-width: 68px;
   padding: 3px;
-  border-radius: 8px;
+  border-radius: 5px;
   display: inline-flex;
   align-items: center;
   background: var(--accent);
@@ -1888,7 +1902,7 @@ pre {
   height: 34px;
   min-height: 34px;
   border: 0;
-  border-radius: 8px;
+  border-radius: 4px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -2679,6 +2693,25 @@ body.float-window-body {
   transform-origin: 50% 50%;
 }
 
+.floatBall--thinking {
+  --float-ball-shadow: var(--accent-focus);
+  --float-ball-ring: var(--accent-border);
+  animation: floatThinkingPulse 1.6s ease-in-out infinite;
+}
+
+.floatBall--thinking svg {
+  animation: floatThinkingIcon 1.6s ease-in-out infinite;
+  transform-origin: 50% 50%;
+}
+
+.floatBall--thinking svg path,
+.floatBall--thinking svg circle,
+.floatBall--thinking svg line,
+.floatBall--thinking svg polyline {
+  stroke-dasharray: 18 10;
+  animation: floatThinkingStroke 1.15s linear infinite;
+}
+
 .floatBall--completeCelebrating {
   animation: floatCompletePop 1.8s ease-out;
 }
@@ -2730,6 +2763,13 @@ body.float-window-body {
   animation: none;
 }
 
+.floatBall--dragging svg path,
+.floatBall--dragging svg circle,
+.floatBall--dragging svg line,
+.floatBall--dragging svg polyline {
+  animation: none;
+}
+
 @keyframes floatWorkingPulse {
   0%,
   100% {
@@ -2753,6 +2793,38 @@ body.float-window-body {
 
   50% {
     transform: rotate(8deg) scale(1.06);
+  }
+}
+
+@keyframes floatThinkingPulse {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 1px var(--float-ball-ring),
+      2px 2px 4px var(--float-ball-shadow);
+  }
+
+  50% {
+    box-shadow:
+      0 0 0 5px var(--accent-soft),
+      0 10px 26px var(--float-ball-shadow);
+  }
+}
+
+@keyframes floatThinkingIcon {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+
+  50% {
+    transform: scale(1.05);
+  }
+}
+
+@keyframes floatThinkingStroke {
+  to {
+    stroke-dashoffset: -28;
   }
 }
 

@@ -260,6 +260,7 @@ export async function updateSessionMode(input: {
   sessionId: string;
   mode?: AgentMode;
   shellMode?: ShellMode;
+  providerId?: string;
 }): Promise<SessionRecord> {
   assertTauri();
   return invoke<SessionRecord>("update_session_mode", { input });

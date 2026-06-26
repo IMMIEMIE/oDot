@@ -197,7 +197,13 @@ fn update_session_mode(
     input: UpdateSessionModeInput,
 ) -> Result<SessionRecord, String> {
     let conn = storage::open_db(&app)?;
-    storage::update_session_mode(&conn, &input.session_id, input.mode, input.shell_mode)
+    storage::update_session_mode(
+        &conn,
+        &input.session_id,
+        input.mode,
+        input.shell_mode,
+        input.provider_id,
+    )
 }
 
 #[tauri::command]

@@ -8,6 +8,7 @@ import {
   ArrowLeft,
   ArrowRight,
   ArrowUp,
+  BrainCircuit,
   Check,
   KeyRound,
   Send,
@@ -145,7 +146,7 @@ export function FloatBall() {
   useEffect(() => {
     const previous = previousStatusKind.current;
     previousStatusKind.current = agentStatus.kind;
-    if (previous === "working" && agentStatus.kind === "complete") {
+    if ((previous === "working" || previous === "thinking") && agentStatus.kind === "complete") {
       setShowCompleteCheck(true);
       if (completeCheckTimer.current) {
         window.clearTimeout(completeCheckTimer.current);
@@ -603,6 +604,8 @@ function FloatAgentStatusIcon({
       return <KeyRound size={28} strokeWidth={2.3} />;
     case "error":
       return <AlertTriangle size={28} strokeWidth={2.3} />;
+    case "thinking":
+      return <BrainCircuit size={28} strokeWidth={2.3} />;
     case "complete":
     case "idle":
     default:

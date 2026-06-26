@@ -485,17 +485,22 @@ pub fn update_session_mode(
     session_id: &str,
     mode: Option<AgentMode>,
     shell_mode: Option<ShellMode>,
+    provider_id: Option<String>,
 ) -> Result<SessionRecord, String> {
     let current = get_session(conn, session_id)?;
     let next_mode = mode.unwrap_or(current.mode);
     let next_shell_mode = shell_mode.unwrap_or(current.shell_mode);
+    let next_provider_id = provider_id.unwrap_or(current.provider_id);
+    get_provider(conn, &next_provider_id)
+        .map_err(|_| "当前选择的 AI 服务配置不存在，请先保存或重新选择服务。".to_string())?;
     let updated_at = util::now_string();
     let changed = conn
         .execute(
-            "UPDATE session SET mode = ?1, shell_mode = ?2, updated_at = ?3 WHERE id = ?4",
+            "UPDATE session SET mode = ?1, shell_mode = ?2, provider_id = ?3, updated_at = ?4 WHERE id = ?5",
             params![
                 next_mode.as_str(),
                 next_shell_mode.as_str(),
+                &next_provider_id,
                 &updated_at,
                 session_id
             ],
@@ -1744,18 +1749,30 @@ mod tests {
     fn update_session_mode_can_persist_shell_mode_only() {
         let conn = memory_db();
         conn.execute(
+            "INSERT INTO provider (id, kind, name, model, credential_ref, created_at, updated_at)
+             VALUES ('p1', 'openai', 'Provider 1', 'model-a', 'provider:p1', '1', '1'),
+                    ('p2', 'openai', 'Provider 2', 'model-b', 'provider:p2', '1', '1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
             "INSERT INTO session (id, project_root, mode, provider_id, title, status, shell_mode, created_at, updated_at)
              VALUES ('s1', 'E:/oDot', 'agent', 'p1', 'Test', 'active', 'manual', '1', '1')",
             [],
         )
         .unwrap();
 
-        let updated = update_session_mode(&conn, "s1", None, Some(ShellMode::Auto)).unwrap();
+        let updated =
+            update_session_mode(&conn, "s1", None, Some(ShellMode::Auto), None).unwrap();
 
         assert!(matches!(updated.shell_mode, ShellMode::Auto));
         assert!(matches!(updated.mode, AgentMode::Agent));
         let persisted = get_session(&conn, "s1").unwrap();
         assert!(matches!(persisted.shell_mode, ShellMode::Auto));
+
+        let provider_updated =
+            update_session_mode(&conn, "s1", None, None, Some("p2".to_string())).unwrap();
+        assert_eq!(provider_updated.provider_id, "p2");
     }
 
     #[test]

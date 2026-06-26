@@ -60,6 +60,7 @@
     "expandRightPane": "展开右侧面板",
     "collapseRightPane": "折叠右侧面板",
     "errorDetails": "错误详情",
+    "runMode": "运行模式",
     "commandApproval": "命令确认",
     "permissionRequests": "权限请求",
     "backgroundJobs": "后台任务",
@@ -359,6 +360,7 @@
   "floatStatus": {
     "idle": "Agent 空闲",
     "working": "Agent 工作中",
+    "thinking": "Agent 思考中",
     "error": "Agent 报错",
     "complete": "任务完成",
     "waitingApproval": "等待批准"
