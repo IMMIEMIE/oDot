@@ -81,7 +81,8 @@ pub fn classify_error(message: &str) -> ErrorKind {
         || lower.contains("forbidden")
         || lower.contains("authentication")
         || lower.contains("api key")
-        || message.contains("鉴权")
+        || message.contains("鉴权失败")
+        || message.contains("认证失败")
         || message.contains("钥匙串")
     {
         return ErrorKind::Authentication;
@@ -107,7 +108,6 @@ pub fn classify_error(message: &str) -> ErrorKind {
         || lower.contains("connection")
         || lower.contains("network")
         || message.contains("网络")
-        || message.contains("请求失败")
         || message.contains("读取 AI 服务")
     {
         return ErrorKind::Network;
@@ -238,6 +238,22 @@ mod tests {
         assert_eq!(info.kind, ErrorKind::Authentication);
         assert!(!info.retryable);
         assert!(info
+            .suggested_actions
+            .iter()
+            .any(|item| item.id == "settings"));
+    }
+
+    #[test]
+    fn auth_header_context_does_not_make_provider_error_authentication() {
+        let info = AppErrorInfo::from_message(
+            "AI 服务请求失败: A parameter specified in the request is not valid Request id: 123\n\
+请求端点: https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions\n\
+鉴权方式: Authorization: Bearer <redacted>",
+        );
+        assert_eq!(info.kind, ErrorKind::Provider);
+        assert!(info.retryable);
+        assert!(info.suggested_actions.iter().any(|item| item.id == "retry"));
+        assert!(!info
             .suggested_actions
             .iter()
             .any(|item| item.id == "settings"));

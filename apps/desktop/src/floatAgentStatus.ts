@@ -9,7 +9,7 @@ import type { PromptAttachmentKind } from "./promptAttachments";
 
 export const FLOAT_AGENT_STATUS_STORAGE_KEY = "odot.floatAgentStatus";
 
-export type FloatAgentStatusKind = "idle" | "error" | "approval" | "complete";
+export type FloatAgentStatusKind = "idle" | "working" | "error" | "approval" | "complete";
 
 export type FloatAgentStatusRecord = {
   kind: FloatAgentStatusKind;
@@ -65,7 +65,7 @@ export function deriveFloatAgentStatus({
   }
 
   if (isWorking) {
-    return floatAgentStatus("idle", appT("floatStatus.working"), sessionId, allowedAttachmentKinds);
+    return floatAgentStatus("working", appT("floatStatus.working"), sessionId, allowedAttachmentKinds);
   }
 
   if (statusEventIsComplete(latestStatus)) {
@@ -179,7 +179,7 @@ function statusEventIsComplete(latest: EventRecord | undefined) {
     latest &&
       (latest.type === "agent.stopped" ||
         latest.type === "task.completed" ||
-        (latest.type === "step.ended" && latest.data.pending !== true))
+        (latest.type === "step.ended" && latest.data.done === true && latest.data.pending !== true))
   );
 }
 
@@ -201,6 +201,7 @@ function normalizeFloatAgentStatus(value: unknown): FloatAgentStatusRecord {
   const kind = record.kind;
   if (
     kind !== "idle" &&
+    kind !== "working" &&
     kind !== "error" &&
     kind !== "approval" &&
     kind !== "complete"

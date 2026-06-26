@@ -30,7 +30,7 @@ import {
   X
 } from "lucide-react";
 import { OdodBotIcon } from "./OdodBotIcon";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -117,6 +117,7 @@ type Notice = {
 };
 
 type ThemeMode = "system" | "light" | "dark";
+type ResolvedTheme = "light" | "dark";
 
 type PromptAttachmentSummary = Omit<PromptAttachment, "id" | "content">;
 
@@ -186,11 +187,13 @@ export function App() {
   const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
   const modelMenuRef = useRef<HTMLDivElement | null>(null);
+  const shellModeMenuRef = useRef<HTMLDivElement | null>(null);
   const realtimeTailTimerRef = useRef<number | undefined>(undefined);
   const activeRunIdRef = useRef(0);
   const stopBaselineSeqRef = useRef(0);
   const rollbackInFlightRef = useRef(false);
   const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
+  const [isShellModeMenuOpen, setIsShellModeMenuOpen] = useState(false);
   const [promptAttachments, setPromptAttachments] = useState<PromptAttachment[]>([]);
   const [leftWidth, setLeftWidth] = useState(() => {
     const stored = Number(localStorage.getItem("odot.leftWidth"));
@@ -219,9 +222,11 @@ export function App() {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
 
     function applyTheme(mode: ThemeMode) {
-      const resolvedTheme = mode === "system" ? (media.matches ? "dark" : "light") : mode;
+      const resolvedTheme: ResolvedTheme =
+        mode === "system" ? (media.matches ? "dark" : "light") : mode;
       document.documentElement.dataset.theme = resolvedTheme;
       document.documentElement.style.colorScheme = resolvedTheme;
+      void emit("odot:theme-change", { theme: resolvedTheme });
     }
 
     applyTheme(themeMode);
@@ -235,6 +240,10 @@ export function App() {
       if (window.innerWidth < 1000) {
         setIsRightPaneCollapsed(true);
       }
+      setLeftWidth((current) => {
+        const maxLeftWidth = Math.max(260, Math.min(620, window.innerWidth - 360));
+        return Math.min(current, maxLeftWidth);
+      });
     }
 
     syncRightPaneByViewport();
@@ -464,7 +473,11 @@ export function App() {
     () => eventsResponse.events.filter((event) => event.type === "prompt.submitted").length,
     [eventsResponse.events]
   );
-  const isAgentWorking = isSubmitting || isContinuing;
+  const selectedSessionIsWorking = useMemo(
+    () => sessionResponseIsWorking(eventsResponse),
+    [eventsResponse]
+  );
+  const isAgentWorking = isSubmitting || isContinuing || selectedSessionIsWorking;
   const isPromptLocked = isAgentWorking || isStopping || pendingToolEvents.length > 0;
   const floatAgentStatus = useMemo(
     () =>
@@ -480,6 +493,12 @@ export function App() {
   useEffect(() => {
     saveFloatAgentStatus(floatAgentStatus);
   }, [floatAgentStatus]);
+
+  useEffect(() => {
+    if (selectedSessionIsWorking && !isSubmitting && !isContinuing) {
+      setNotice({ tone: "info", text: t("notice.agentWorking") });
+    }
+  }, [isContinuing, isSubmitting, selectedSessionIsWorking, t]);
 
   useLayoutEffect(() => {
     if (shouldStickToTimelineBottomRef.current) {
@@ -541,10 +560,41 @@ export function App() {
   }, [isModelMenuOpen]);
 
   useEffect(() => {
+    if (!isShellModeMenuOpen) {
+      return;
+    }
+
+    function closeOnOutsidePointer(event: globalThis.PointerEvent) {
+      if (!shellModeMenuRef.current?.contains(event.target as Node)) {
+        setIsShellModeMenuOpen(false);
+      }
+    }
+
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setIsShellModeMenuOpen(false);
+      }
+    }
+
+    window.addEventListener("pointerdown", closeOnOutsidePointer);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", closeOnOutsidePointer);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [isShellModeMenuOpen]);
+
+  useEffect(() => {
     if (isPromptLocked || selectedSessionId) {
       setIsModelMenuOpen(false);
     }
   }, [isPromptLocked, selectedSessionId]);
+
+  useEffect(() => {
+    if (isPromptLocked) {
+      setIsShellModeMenuOpen(false);
+    }
+  }, [isPromptLocked]);
 
   async function bootstrap() {
     setIsBooting(true);
@@ -1293,6 +1343,23 @@ export function App() {
     });
   }
 
+  function selectShellMode(nextShellMode: ShellMode) {
+    setShellMode(nextShellMode);
+    setIsShellModeMenuOpen(false);
+    if (selectedSessionId) {
+      void updateSessionMode({
+        sessionId: selectedSessionId,
+        shellMode: nextShellMode
+      })
+        .then((updated) =>
+          setSessions((current) =>
+            current.map((s) => (s.id === updated.id ? updated : s))
+          )
+        )
+        .catch(reportError);
+    }
+  }
+
   async function handleDeleteSession(sessionId: string) {
     const session = sessions.find((item) => item.id === sessionId);
     const confirmed = window.confirm(
@@ -1388,7 +1455,11 @@ export function App() {
     const startWidth = leftWidth;
 
     function onMove(moveEvent: globalThis.PointerEvent) {
-      const nextWidth = Math.min(620, Math.max(300, startWidth + moveEvent.clientX - startX));
+      const maxLeftWidth = Math.max(260, Math.min(620, window.innerWidth - 360));
+      const nextWidth = Math.min(
+        maxLeftWidth,
+        Math.max(260, startWidth + moveEvent.clientX - startX)
+      );
       setLeftWidth(nextWidth);
     }
 
@@ -1624,34 +1695,6 @@ export function App() {
         </header>
 
         <section className="timelinePane">
-          <div className="paneHeader">
-            <div>
-              <ContextUsageMeter usage={contextUsage} />
-              <strong>{selectedSession?.title ?? t("empty.noActiveSession")}</strong>
-              <small>
-                {selectedProvider ? selectedModelLabel : t("session.noServiceSelected")} /{" "}
-                {t("session.selectedFiles", { count: selectedPaths.size })}
-              </small>
-              {selectedChildSessions.length > 0 && (
-                <small className="subagentStatus">
-                  {t("session.subAgentStatus", {
-                    total: selectedChildSessions.length,
-                    active: selectedChildSessions.filter((session) => session.status === "active")
-                      .length
-                  })}
-                </small>
-              )}
-            </div>
-            <button
-              className="iconTextButton"
-              disabled={!selectedSessionId || isMutating}
-              onClick={() => void handleCompact()}
-            >
-              <Database size={16} />
-              {t("nav.compactContext")}
-            </button>
-          </div>
-
           <div className="timeline" ref={timelineScrollRef} onScroll={handleTimelineScroll}>
             <ConversationTimeline
               events={eventsResponse.events}
@@ -1807,72 +1850,92 @@ export function App() {
                     )}
                   </div>
                 </div>
-                <Segmented
-                  className="composerShellMode"
-                  value={shellMode}
-                  disabled={isPromptLocked}
-                  options={[
-                    ["manual", t("shellMode.manual")],
-                    ["auto", t("shellMode.auto")]
-                  ]}
-                  onChange={(value) => {
-                    const nextShellMode = value as ShellMode;
-                    setShellMode(nextShellMode);
-                    if (selectedSessionId) {
-                      void updateSessionMode({
-                        sessionId: selectedSessionId,
-                        shellMode: nextShellMode
-                      })
-                        .then((updated) =>
-                          setSessions((current) =>
-                            current.map((s) => (s.id === updated.id ? updated : s))
-                          )
-                        )
-                        .catch(reportError);
-                    }
-                  }}
-                />
-                <div className="promptNavGroup">
+                <div
+                  ref={shellModeMenuRef}
+                  className="composerShellModeSelect"
+                  title={shellModeLabel(shellMode)}
+                >
                   <button
                     type="button"
-                    className="promptNavIconButton"
-                    title={t("nav.prevPrompt")}
-                    aria-label={t("nav.prevPrompt")}
-                    disabled={!promptEventCount}
-                    onClick={() => scrollToPrompt("previous")}
+                    className="composerShellModeButton"
+                    disabled={isPromptLocked}
+                    aria-haspopup="listbox"
+                    aria-expanded={isShellModeMenuOpen}
+                    aria-label={shellModeLabel(shellMode)}
+                    onClick={() => setIsShellModeMenuOpen((open) => !open)}
                   >
-                    <ChevronUp size={16} />
+                    <span>{t(`shellMode.${shellMode}`)}</span>
+                    <ChevronDown size={14} />
                   </button>
+                  {isShellModeMenuOpen && !isPromptLocked && (
+                    <div
+                      className="composerShellModeMenu"
+                      role="listbox"
+                      aria-label={shellModeLabel(shellMode)}
+                    >
+                      {(["manual", "auto"] as ShellMode[]).map((item) => {
+                        const isSelected = item === shellMode;
+                        return (
+                          <button
+                            type="button"
+                            key={item}
+                            className={`composerShellModeOption ${isSelected ? "active" : ""}`}
+                            role="option"
+                            aria-selected={isSelected}
+                            onClick={() => selectShellMode(item)}
+                          >
+                            <span>{t(`shellMode.${item}`)}</span>
+                            <small>{shellModeLabel(item)}</small>
+                            {isSelected && <Check size={14} />}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+                <div className={`composerSubmitCapsule ${isAgentWorking ? "stop" : ""}`}>
+                  <div className="promptNavGroup">
+                    <button
+                      type="button"
+                      className="promptNavIconButton"
+                      title={t("nav.prevPrompt")}
+                      aria-label={t("nav.prevPrompt")}
+                      disabled={!promptEventCount}
+                      onClick={() => scrollToPrompt("previous")}
+                    >
+                      <ChevronUp size={15} />
+                    </button>
+                    <button
+                      type="button"
+                      className="promptNavIconButton"
+                      title={t("nav.nextPrompt")}
+                      aria-label={t("nav.nextPrompt")}
+                      disabled={!promptEventCount}
+                      onClick={() => scrollToPrompt("next")}
+                    >
+                      <ChevronDown size={15} />
+                    </button>
+                  </div>
                   <button
                     type="button"
-                    className="promptNavIconButton"
-                    title={t("nav.nextPrompt")}
-                    aria-label={t("nav.nextPrompt")}
-                    disabled={!promptEventCount}
-                    onClick={() => scrollToPrompt("next")}
+                    className="composerSendButton"
+                    aria-label={isAgentWorking ? t("nav.stopAgent") : t("nav.sendPrompt")}
+                    disabled={
+                      isAgentWorking
+                        ? false
+                        : (!prompt.trim() && !promptAttachments.length) ||
+                          isPromptLocked ||
+                          !selectedProviderId
+                    }
+                    onClick={() =>
+                      isAgentWorking
+                        ? void handleStopAgent()
+                        : void handleSubmitPrompt()
+                    }
                   >
-                    <ChevronDown size={16} />
+                    {isAgentWorking ? <Square size={16} /> : <ArrowUp size={18} />}
                   </button>
                 </div>
-                <button
-                  type="button"
-                  className={`composerSendButton ${isAgentWorking ? "stop" : ""}`}
-                  aria-label={isAgentWorking ? t("nav.stopAgent") : t("nav.sendPrompt")}
-                  disabled={
-                    isAgentWorking
-                      ? false
-                      : (!prompt.trim() && !promptAttachments.length) ||
-                        isPromptLocked ||
-                        !selectedProviderId
-                  }
-                  onClick={() =>
-                    isAgentWorking
-                      ? void handleStopAgent()
-                      : void handleSubmitPrompt()
-                  }
-                >
-                  {isAgentWorking ? <Square size={17} /> : <ArrowUp size={19} />}
-                </button>
               </div>
             </div>
           </div>
@@ -1892,6 +1955,33 @@ export function App() {
 
         {!isRightPaneCollapsed && (
           <>
+            <section className="rightSection">
+              <SectionTitle icon={<Database size={16} />} title={t("nav.contextInfo")} />
+              <ContextUsageMeter usage={contextUsage} />
+              <strong>{selectedSession?.title ?? t("empty.noActiveSession")}</strong>
+              <small>
+                {selectedProvider ? selectedModelLabel : t("session.noServiceSelected")} /{" "}
+                {t("session.selectedFiles", { count: selectedPaths.size })}
+              </small>
+              {selectedChildSessions.length > 0 && (
+                <small className="subagentStatus">
+                  {t("session.subAgentStatus", {
+                    total: selectedChildSessions.length,
+                    active: selectedChildSessions.filter((session) => session.status === "active")
+                      .length
+                  })}
+                </small>
+              )}
+              <button
+                className="iconTextButton"
+                disabled={!selectedSessionId || isMutating}
+                onClick={() => void handleCompact()}
+              >
+                <Database size={16} />
+                {t("nav.compactContext")}
+              </button>
+            </section>
+
             {lastError && (
               <section className="rightSection errorSection">
                 <SectionTitle icon={<AlertTriangle size={16} />} title={t("nav.errorDetails")} />
@@ -4229,6 +4319,49 @@ function pendingCommand(event: EventRecord) {
 function visiblePermissionRequests(requests: PermissionRequestRecord[]) {
   return requests.filter(
     (request) => request.status === "pending" && !isToolPermissionRequest(request)
+  );
+}
+
+function sessionResponseIsWorking(response: SessionEventsResponse) {
+  const latest = response.events.at(-1);
+  if (latest && sessionEventEndsWork(latest)) {
+    return false;
+  }
+  if (latest && sessionEventShowsWork(latest)) {
+    return true;
+  }
+  return response.runs.some((run) => run.status === "running" && !run.endedAt);
+}
+
+function sessionEventEndsWork(event: EventRecord) {
+  return (
+    event.type === "agent.failed" ||
+    event.type === "agent.stopped" ||
+    event.type === "policy.blocked" ||
+    event.type === "step.failed" ||
+    event.type === "task.completed" ||
+    event.type === "tool.pending" ||
+    (event.type === "session.checkpoint.saved" && event.data.status !== "running") ||
+    (event.type === "step.ended" && (event.data.done === true || event.data.pending === true))
+  );
+}
+
+function sessionEventShowsWork(event: EventRecord) {
+  return (
+    (event.type === "session.checkpoint.saved" && event.data.status === "running") ||
+    event.type === "session.input.admitted" ||
+    event.type === "prompt.submitted" ||
+    event.type === "step.started" ||
+    (event.type === "step.ended" && event.data.done === false && event.data.pending !== true) ||
+    event.type === "llm.stream.started" ||
+    event.type === "llm.stream.finished" ||
+    event.type.endsWith(".delta") ||
+    event.type === "reasoning.summary" ||
+    event.type === "assistant.message" ||
+    event.type === "tool.called" ||
+    event.type === "tool.success" ||
+    event.type === "tool.failed" ||
+    event.type === "tool.rejected"
   );
 }
 

@@ -65,6 +65,7 @@
     "backgroundJobs": "后台任务",
     "stopJob": "停止任务",
     "compactContext": "压缩上下文",
+    "contextInfo": "上下文信息",
     "uploadAttachment": "上传附件",
     "selectModel": "选择模型",
     "prevPrompt": "上一条提示词",

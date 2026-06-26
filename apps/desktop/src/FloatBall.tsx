@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { emit } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import {
@@ -8,6 +8,7 @@ import {
   ArrowLeft,
   ArrowRight,
   ArrowUp,
+  Check,
   KeyRound,
   Send,
   X
@@ -15,7 +16,7 @@ import {
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ClipboardEvent as ReactClipboardEvent, PointerEvent as ReactPointerEvent } from "react";
-import { OdodBotIcon } from "./OdodBotIcon";
+import { OdodBotIcon, SleepingOdodBotIcon } from "./OdodBotIcon";
 import { appT } from "./i18n";
 import {
   approveToolCall,
@@ -41,9 +42,13 @@ import {
 } from "./promptAttachments";
 
 type ThemeMode = "system" | "light" | "dark";
+type ResolvedTheme = "light" | "dark";
 type PromptPanelDirection = "up" | "right" | "down" | "left";
 
 const DRAG_THRESHOLD = 4;
+const THEME_STORAGE_KEY = "odot.themeMode";
+const FLOAT_SLEEP_DELAY_MS = 30_000;
+const COMPLETE_CHECK_DURATION_MS = 1_800;
 
 export function FloatBall() {
   const { t } = useTranslation();
@@ -55,20 +60,70 @@ export function FloatBall() {
   const [panelError, setPanelError] = useState("");
   const [isSubmittingPrompt, setIsSubmittingPrompt] = useState(false);
   const [isResolvingApproval, setIsResolvingApproval] = useState(false);
+  const [isActionRingVisible, setIsActionRingVisible] = useState(false);
+  const [isDormant, setIsDormant] = useState(false);
+  const [showCompleteCheck, setShowCompleteCheck] = useState(false);
   const pointerStart = useRef<{ id: number; x: number; y: number } | null>(null);
   const didDrag = useRef(false);
+  const sleepTimer = useRef<number | undefined>(undefined);
+  const completeCheckTimer = useRef<number | undefined>(undefined);
+  const previousStatusKind = useRef<FloatAgentStatusKind>(agentStatus.kind);
 
   useEffect(() => {
-    const stored = localStorage.getItem("odot.themeMode");
-    const mode: ThemeMode =
-      stored === "light" || stored === "dark" || stored === "system"
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    let disposed = false;
+    let unlistenTheme: (() => void) | undefined;
+
+    function storedThemeMode(): ThemeMode {
+      const stored = localStorage.getItem(THEME_STORAGE_KEY);
+      return stored === "light" || stored === "dark" || stored === "system"
         ? stored
         : "system";
-    const media = window.matchMedia("(prefers-color-scheme: dark)");
-    const resolved =
-      mode === "system" ? (media.matches ? "dark" : "light") : mode;
-    document.documentElement.dataset.theme = resolved;
-    document.documentElement.style.colorScheme = resolved;
+    }
+
+    function applyResolvedTheme(theme: ResolvedTheme) {
+      document.documentElement.dataset.theme = theme;
+      document.documentElement.style.colorScheme = theme;
+    }
+
+    function syncTheme() {
+      const mode = storedThemeMode();
+      const resolvedTheme: ResolvedTheme =
+        mode === "system" ? (media.matches ? "dark" : "light") : mode;
+      applyResolvedTheme(resolvedTheme);
+    }
+
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === THEME_STORAGE_KEY) {
+        syncTheme();
+      }
+    };
+
+    void listen<{ theme?: unknown }>("odot:theme-change", (event) => {
+      const theme = event.payload.theme;
+      if (theme === "light" || theme === "dark") {
+        applyResolvedTheme(theme);
+      } else {
+        syncTheme();
+      }
+    }).then((unlisten) => {
+      if (disposed) {
+        unlisten();
+        return;
+      }
+      unlistenTheme = unlisten;
+    });
+
+    syncTheme();
+    window.addEventListener("storage", onStorage);
+    media.addEventListener("change", syncTheme);
+
+    return () => {
+      disposed = true;
+      window.removeEventListener("storage", onStorage);
+      media.removeEventListener("change", syncTheme);
+      unlistenTheme?.();
+    };
   }, []);
 
   useEffect(() => {
@@ -87,6 +142,34 @@ export function FloatBall() {
     };
   }, []);
 
+  useEffect(() => {
+    const previous = previousStatusKind.current;
+    previousStatusKind.current = agentStatus.kind;
+    if (previous === "working" && agentStatus.kind === "complete") {
+      setShowCompleteCheck(true);
+      if (completeCheckTimer.current) {
+        window.clearTimeout(completeCheckTimer.current);
+      }
+      completeCheckTimer.current = window.setTimeout(() => {
+        setShowCompleteCheck(false);
+      }, COMPLETE_CHECK_DURATION_MS);
+    }
+    return () => {
+      if (completeCheckTimer.current) {
+        window.clearTimeout(completeCheckTimer.current);
+      }
+    };
+  }, [agentStatus.kind]);
+
+  useEffect(() => {
+    scheduleSleepTimer();
+    return () => {
+      if (sleepTimer.current) {
+        window.clearTimeout(sleepTimer.current);
+      }
+    };
+  }, [agentStatus.kind, promptDirection]);
+
   async function restoreMainWindow() {
     const floatWin = getCurrentWindow();
     const mainWin = await WebviewWindow.getByLabel("main");
@@ -101,6 +184,28 @@ export function FloatBall() {
     }
     pointerStart.current = null;
     setIsDragging(false);
+  }
+
+  function canSleep() {
+    return !promptDirection && (agentStatus.kind === "idle" || agentStatus.kind === "complete");
+  }
+
+  function scheduleSleepTimer() {
+    if (sleepTimer.current) {
+      window.clearTimeout(sleepTimer.current);
+    }
+    if (!canSleep()) {
+      setIsDormant(false);
+      return;
+    }
+    sleepTimer.current = window.setTimeout(() => {
+      setIsDormant(true);
+    }, FLOAT_SLEEP_DELAY_MS);
+  }
+
+  function wakeFloatBall() {
+    setIsDormant(false);
+    scheduleSleepTimer();
   }
 
   const handlePointerDown = (event: ReactPointerEvent<HTMLButtonElement>) => {
@@ -148,6 +253,8 @@ export function FloatBall() {
   };
 
   function openPromptPanel(direction: PromptPanelDirection) {
+    wakeFloatBall();
+    setIsActionRingVisible(false);
     setPromptDirection(direction);
     setPanelError("");
   }
@@ -155,6 +262,7 @@ export function FloatBall() {
   function closePromptPanel() {
     setPromptDirection(null);
     setPanelError("");
+    scheduleSleepTimer();
   }
 
   async function handlePaste(event: ReactClipboardEvent<HTMLTextAreaElement>) {
@@ -187,11 +295,15 @@ export function FloatBall() {
       setPanelError(t("error.noCurrentSession"));
       return;
     }
+    const nextAttachments = attachments;
     setIsSubmittingPrompt(true);
     setPanelError("");
+    setPromptText("");
+    setAttachments([]);
+    closePromptPanel();
     setAgentStatus((current) => syncLocalStatus({
       ...current,
-      kind: "idle",
+      kind: "working",
       label: t("float.agentWorking"),
       pendingApproval: null
     }));
@@ -199,14 +311,11 @@ export function FloatBall() {
       await promptSession({
         sessionId: agentStatus.sessionId,
         prompt: prompt || t("prompt.continueFromAttachment"),
-        attachments: attachments.map(toPromptAttachmentInput),
+        attachments: nextAttachments.map(toPromptAttachmentInput),
         delivery: "queue",
         resume: true
       });
       await notifyMainSessionRefresh(agentStatus.sessionId);
-      setPromptText("");
-      setAttachments([]);
-      closePromptPanel();
       setAgentStatus(loadFloatAgentStatus());
     } catch (error) {
       setPanelError(errorSummary(error));
@@ -274,11 +383,19 @@ export function FloatBall() {
     Boolean(promptText.trim() || attachments.length) &&
     Boolean(agentStatus.sessionId) &&
     !isSubmittingPrompt;
+  const containerClassName = [
+    "floatBallContainer",
+    promptDirection ? "floatBallContainer--panelOpen" : "",
+    isActionRingVisible ? "floatBallContainer--actionsVisible" : ""
+  ].filter(Boolean).join(" ");
 
   return (
-    <div className={`floatBallContainer${promptDirection ? " floatBallContainer--panelOpen" : ""}`}>
+    <div
+      className={containerClassName}
+      onPointerLeave={() => setIsActionRingVisible(false)}
+    >
       {canOpenPrompt && (
-        <div className="floatActionRing" aria-hidden={promptDirection ? "true" : undefined}>
+        <div className="floatActionRing" aria-hidden={isActionRingVisible ? undefined : "true"}>
           <button
             type="button"
             className="floatArrow floatArrow--up"
@@ -332,20 +449,35 @@ export function FloatBall() {
 
       <button
         type="button"
-        className={`floatBall floatBall--${agentStatus.kind}${isDragging ? " floatBall--dragging" : ""}`}
-        onPointerDown={handlePointerDown}
+        className={`floatBall floatBall--${agentStatus.kind}${isDragging ? " floatBall--dragging" : ""}${showCompleteCheck ? " floatBall--completeCelebrating" : ""}`}
+        onPointerDown={(event) => {
+          wakeFloatBall();
+          handlePointerDown(event);
+        }}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerCancel}
+        onPointerEnter={() => {
+          wakeFloatBall();
+          setIsActionRingVisible(true);
+        }}
         title={agentStatus.label}
       >
-        <FloatAgentStatusIcon kind={agentStatus.kind} />
+        <FloatAgentStatusIcon kind={agentStatus.kind} dormant={isDormant} />
+        {showCompleteCheck && (
+          <span className="floatCompleteCheck" aria-hidden="true">
+            <Check size={28} strokeWidth={3.1} />
+          </span>
+        )}
       </button>
 
       {promptDirection && (
         <form
           className={promptPanelClass}
-          onPointerDown={(event) => event.stopPropagation()}
+          onPointerDown={(event) => {
+            wakeFloatBall();
+            event.stopPropagation();
+          }}
           onSubmit={(event) => {
             event.preventDefault();
             void sendPrompt();
@@ -368,6 +500,10 @@ export function FloatBall() {
             placeholder={t("prompt.placeholder")}
             disabled={isSubmittingPrompt}
             onChange={(event) => setPromptText(event.target.value)}
+            onFocus={() => {
+              wakeFloatBall();
+              setIsActionRingVisible(false);
+            }}
             onPaste={(event) => void handlePaste(event)}
             onKeyDown={(event) => {
               if (event.key === "Enter" && !event.shiftKey) {
@@ -455,7 +591,13 @@ export function FloatBall() {
   );
 }
 
-function FloatAgentStatusIcon({ kind }: { kind: FloatAgentStatusKind }) {
+function FloatAgentStatusIcon({
+  kind,
+  dormant
+}: {
+  kind: FloatAgentStatusKind;
+  dormant: boolean;
+}) {
   switch (kind) {
     case "approval":
       return <KeyRound size={28} strokeWidth={2.3} />;
@@ -464,6 +606,9 @@ function FloatAgentStatusIcon({ kind }: { kind: FloatAgentStatusKind }) {
     case "complete":
     case "idle":
     default:
+      if (dormant) {
+        return <SleepingOdodBotIcon size={28} strokeWidth={2.3} />;
+      }
       return <OdodBotIcon size={28} strokeWidth={2.3} />;
   }
 }

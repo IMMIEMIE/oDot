@@ -337,38 +337,33 @@ async fn run_session_steps(
                 current_prompt,
                 &request_config,
             )?;
-            let mut sink = StreamEventSink::new(
+            match stream_openai_compatible_with_retry(
                 conn,
                 &session.id,
                 step_index,
                 &session.provider_id,
                 &request_config,
-            );
-            let turn =
-                match provider::stream_openai_compatible(&request_config, &messages, |event| {
-                    sink.handle(event)
-                })
-                .await
-                {
-                    Ok(value) => value,
-                    Err(error) => {
-                        if stop_if_cancelled(conn, &session.id, step_index)? {
-                            break;
-                        }
-                        storage::append_event(
-                            conn,
-                            &session.id,
-                            "step.failed",
-                            json!({
-                                "step": step_index,
-                                "error": error
-                            }),
-                        )?;
-                        return Err(error);
+                &messages,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    if stop_if_cancelled(conn, &session.id, step_index)? {
+                        break;
                     }
-                };
-            sink.flush_all()?;
-            turn
+                    storage::append_event(
+                        conn,
+                        &session.id,
+                        "step.failed",
+                        json!({
+                            "step": step_index,
+                            "error": error
+                        }),
+                    )?;
+                    return Err(error);
+                }
+            }
         } else {
             let user_prompt =
                 build_user_prompt(conn, &session.id, current_prompt, &request_config)?;
@@ -631,6 +626,58 @@ async fn complete_with_retry(
             Err(error) => {
                 let info = AppErrorInfo::from_message(&error);
                 let can_retry = info.retryable && attempt < LLM_RETRY_ATTEMPTS;
+                storage::append_event(
+                    conn,
+                    session_id,
+                    "llm.retry",
+                    json!({
+                        "step": step_index,
+                        "attempt": attempt,
+                        "maxAttempts": LLM_RETRY_ATTEMPTS,
+                        "retrying": can_retry,
+                        "error": info.to_value()
+                    }),
+                )?;
+                if !can_retry {
+                    return Err(error);
+                }
+                last_error = Some(error);
+                let delay_ms = LLM_RETRY_BASE_DELAY_MS * 2_u64.pow((attempt - 1) as u32);
+                sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(crate::i18n::ai_request_failed))
+}
+
+async fn stream_openai_compatible_with_retry(
+    conn: &Connection,
+    session_id: &str,
+    step_index: usize,
+    provider_record_id: &str,
+    request_config: &ProviderRequestConfig,
+    messages: &[Value],
+) -> Result<ModelTurn, String> {
+    let mut last_error = None;
+    for attempt in 1..=LLM_RETRY_ATTEMPTS {
+        let mut sink =
+            StreamEventSink::new(conn, session_id, step_index, provider_record_id, request_config);
+        let mut emitted_stream_event = false;
+        let result = provider::stream_openai_compatible(request_config, messages, |event| {
+            emitted_stream_event = true;
+            sink.handle(event)
+        })
+        .await;
+
+        match result {
+            Ok(turn) => {
+                sink.flush_all()?;
+                return Ok(turn);
+            }
+            Err(error) => {
+                let info = AppErrorInfo::from_message(&error);
+                let can_retry =
+                    info.retryable && !emitted_stream_event && attempt < LLM_RETRY_ATTEMPTS;
                 storage::append_event(
                     conn,
                     session_id,

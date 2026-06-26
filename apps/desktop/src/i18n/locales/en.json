@@ -65,6 +65,7 @@
     "backgroundJobs": "Background jobs",
     "stopJob": "Stop job",
     "compactContext": "Compact context",
+    "contextInfo": "Context info",
     "uploadAttachment": "Upload attachment",
     "selectModel": "Select model",
     "prevPrompt": "Previous prompt",

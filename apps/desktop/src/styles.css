@@ -81,7 +81,7 @@
 
 body {
   margin: 0;
-  min-width: 1120px;
+  min-width: 0;
   height: 100vh;
   background: var(--bg);
   overflow: hidden;
@@ -158,6 +158,7 @@ textarea:focus {
   position: relative;
   border-right: 0;
   border-left: 1px solid var(--border);
+  overflow: visible;
 }
 
 .rightPaneToggle {
@@ -586,39 +587,49 @@ textarea:focus {
 }
 
 .promptNavGroup {
-  display: inline-flex;
+  width: 25px;
+  min-width: 25px;
+  height: 34px;
+  display: grid;
+  grid-template-rows: 1fr 1fr;
   align-items: center;
-  gap: 2px;
-  flex-shrink: 0;
+  border-right: 1px solid rgba(255, 255, 255, 0.28);
 }
 
 .promptNavIconButton {
-  width: 28px;
-  height: 28px;
+  width: 100%;
+  min-width: 0;
+  height: 18px;
+  min-height: 18px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   padding: 0;
   border: 0;
-  border-radius: 8px;
+  border-radius: 0;
   background: transparent;
-  color: var(--text-soft);
+  color: var(--accent-contrast);
   cursor: pointer;
   transition: background 0.15s, color 0.15s;
 }
 
 .promptNavIconButton:hover:not(:disabled) {
-  background: var(--accent-softer);
-  color: var(--accent);
+  background: rgba(255, 255, 255, 0.14);
+  color: var(--accent-contrast);
 }
 
 .promptNavIconButton:active:not(:disabled) {
-  background: var(--accent-soft);
+  background: rgba(255, 255, 255, 0.22);
 }
 
 .promptNavIconButton:disabled {
   opacity: 0.35;
   cursor: not-allowed;
+}
+
+.promptNavIconButton svg {
+  color: currentColor;
+  stroke: currentColor;
 }
 
 .iconTextButton,
@@ -702,7 +713,7 @@ textarea:focus {
 .timelinePane {
   min-height: 0;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  grid-template-rows: minmax(0, 1fr) auto auto;
   overflow: hidden;
 }
 
@@ -1494,17 +1505,19 @@ pre {
 }
 
 .promptBar {
-  padding: 14px 18px 18px;
+  min-width: 0;
+  padding: 12px clamp(10px, 2vw, 18px) 14px;
   border-top: 1px solid var(--border);
   background: var(--surface);
 }
 
 .promptComposer {
   width: 100%;
+  min-width: 0;
   margin: 0;
-  padding: 14px 12px 10px 16px;
+  padding: 12px clamp(8px, 1.4vw, 12px) 9px clamp(10px, 1.6vw, 16px);
   border: 1px solid var(--border);
-  border-radius: 24px;
+  border-radius: 8px;
   background: var(--surface-strong);
   display: grid;
   gap: 8px;
@@ -1603,19 +1616,19 @@ pre {
 .promptActionRow {
   width: 100%;
   min-height: 38px;
-  display: flex;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  gap: clamp(6px, 1.2vw, 12px);
 }
 
 .composerControls {
   min-width: 0;
-  flex: 1;
-  display: flex;
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
   align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
+  gap: clamp(6px, 1vw, 10px);
 }
 
 .composerAttachButton {
@@ -1642,8 +1655,8 @@ pre {
 
 .composerModelSelect {
   position: relative;
-  width: 180px;
-  min-width: 110px;
+  width: 100%;
+  min-width: 0;
   display: inline-flex;
   align-items: center;
   color: var(--text-soft);
@@ -1651,9 +1664,9 @@ pre {
 
 .composerModelButton {
   height: 32px;
-  max-width: 300px;
-  width: 170px;
-  min-width: 100px;
+  min-width: 150px;
+  width: 120px;
+  min-width: 0;
   padding: 0 8px 0 2px;
   border: 0;
   border-radius: 8px;
@@ -1747,47 +1760,148 @@ pre {
   color: var(--muted);
 }
 
-.composerShellMode.segmented {
-  min-height: 32px;
-  padding: 2px;
+.composerShellModeSelect {
+  position: relative;
+  width: auto;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+}
+
+.composerShellModeButton {
+  width: 76px;
+  min-width: 76px;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--accent-border);
+  border-radius: 8px;
+  background: var(--accent-softer);
+  color: var(--accent);
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 5px;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.composerShellModeButton span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composerShellModeButton svg {
+  flex: 0 0 auto;
+}
+
+.composerShellModeButton:hover:not(:disabled),
+.composerShellModeButton[aria-expanded="true"] {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+
+.composerShellModeMenu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 45;
+  width: 178px;
+  padding: 6px;
+  border: 1px solid var(--accent-border);
+  border-radius: 12px;
+  background: var(--surface-elevated);
+  box-shadow: var(--shadow-soft);
+}
+
+.composerShellModeOption {
+  width: 100%;
+  min-height: 42px;
+  padding: 5px 8px;
   border: 0;
+  border-radius: 8px;
   background: transparent;
-  flex-shrink: 0;
+  color: var(--text-soft);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 16px;
+  align-items: center;
+  gap: 2px 8px;
+  text-align: left;
 }
 
-.composerShellMode.segmented button {
-  min-width: 44px;
-  height: 28px;
+.composerShellModeOption span,
+.composerShellModeOption small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composerShellModeOption span {
+  font-size: 13px;
+  font-weight: 850;
+}
+
+.composerShellModeOption small {
   color: var(--muted);
-  font-weight: 750;
+  font-size: 11px;
 }
 
-.composerShellMode.segmented button.active {
-  color: var(--accent-contrast);
+.composerShellModeOption svg {
+  grid-row: 1 / span 2;
+  grid-column: 2;
+  color: var(--accent);
+}
+
+.composerShellModeOption:hover,
+.composerShellModeOption:focus-visible {
+  background: var(--surface-soft);
+  color: var(--ink);
+}
+
+.composerShellModeOption.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.composerSubmitCapsule {
+  height: 40px;
+  min-width: 68px;
+  padding: 3px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
   background: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-border);
+  overflow: hidden;
+}
+
+.composerSubmitCapsule.stop {
+  background: var(--red);
+  box-shadow: 0 0 0 1px rgba(189, 58, 45, 0.45);
 }
 
 .composerSendButton {
-  width: 38px;
-  min-width: 38px;
-  height: 38px;
-  min-height: 38px;
+  width: 39px;
+  min-width: 39px;
+  height: 34px;
+  min-height: 34px;
   border: 0;
-  border-radius: 50%;
+  border-radius: 8px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   color: var(--accent-contrast);
-  background: var(--accent);
+  background: transparent;
 }
 
 .composerSendButton:not(:disabled):hover {
-  background: var(--accent-hover);
+  background: rgba(255, 255, 255, 0.14);
 }
 
-.composerSendButton.stop {
-  background: var(--red);
-  color: #ffffff;
+.composerSendButton:active:not(:disabled) {
+  background: rgba(255, 255, 255, 0.22);
 }
 
 .rightSection {
@@ -2354,28 +2468,6 @@ pre {
   color: var(--muted);
 }
 
-:root[data-theme="dark"] .promptNavIconButton {
-  color: var(--muted);
-}
-
-:root[data-theme="dark"] .promptNavIconButton:hover:not(:disabled) {
-  background: var(--accent-softer);
-  color: var(--accent);
-}
-
-:root[data-theme="dark"] .promptNavIconButton:active:not(:disabled) {
-  background: var(--accent-soft);
-}
-
-:root[data-theme="dark"] .composerSendButton {
-  color: var(--accent-contrast);
-  background: var(--accent);
-}
-
-:root[data-theme="dark"] .composerSendButton:not(:disabled):hover {
-  background: var(--accent-hover);
-}
-
 :root[data-theme="dark"] .planExecutionDock {
   background: var(--surface-soft);
 }
@@ -2538,6 +2630,7 @@ body.float-window-body {
   --float-ball-bg: var(--accent);
   --float-ball-fg: var(--accent-contrast);
   --float-ball-shadow: var(--accent-border);
+  --float-ball-ring: transparent;
   width: 50px;
   height: 50px;
   padding: 10px;
@@ -2550,8 +2643,13 @@ body.float-window-body {
   align-items: center;
   justify-content: center;
   cursor: grab;
-  box-shadow: 2px 2px 4px var(--float-ball-shadow);
-  transition: box-shadow 0.16s ease;
+  box-shadow:
+    0 0 0 1px var(--float-ball-ring),
+    2px 2px 4px var(--float-ball-shadow);
+  transition:
+    background-color 0.16s ease,
+    color 0.16s ease,
+    box-shadow 0.16s ease;
   user-select: none;
   -webkit-user-select: none;
   pointer-events: auto;
@@ -2561,24 +2659,164 @@ body.float-window-body {
 }
 
 .floatBall--error {
-  --float-ball-bg: #050505;
-  --float-ball-fg: #ffffff;
-  --float-ball-shadow: rgba(0, 0, 0, 0.62);
+  --float-ball-shadow: var(--danger-soft);
+  --float-ball-ring: var(--danger-text);
 }
 
 .floatBall--approval {
-  --float-ball-bg: #facc15;
-  --float-ball-fg: #1f1600;
-  --float-ball-shadow: rgba(202, 138, 4, 0.58);
+  --float-ball-shadow: var(--warning-soft);
+  --float-ball-ring: var(--warning-text);
+}
+
+.floatBall--working {
+  --float-ball-shadow: var(--accent-focus);
+  --float-ball-ring: var(--accent-border);
+  animation: floatWorkingPulse 1.35s ease-in-out infinite;
+}
+
+.floatBall--working svg {
+  animation: floatWorkingIcon 1.1s ease-in-out infinite;
+  transform-origin: 50% 50%;
+}
+
+.floatBall--completeCelebrating {
+  animation: floatCompletePop 1.8s ease-out;
+}
+
+.floatBall--completeCelebrating > svg {
+  opacity: 0;
+  transform: scale(0.72);
+}
+
+.sleepingBotZ {
+  animation: sleepingBotSnore 2.4s ease-in-out infinite;
+  transform-origin: center;
+}
+
+.sleepingBotZ--small {
+  animation-delay: 0.35s;
+}
+
+.sleepingBotZ--tiny {
+  animation-delay: 0.7s;
+}
+
+.floatCompleteCheck {
+  position: absolute;
+  inset: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent-contrast);
+  pointer-events: none;
+  animation: floatCheckReveal 1.8s ease-out both;
 }
 
 .floatBall:hover:not(.floatBall--dragging) {
-  box-shadow: 1px 1px 10px var(--float-ball-shadow);
+  box-shadow:
+    0 0 0 1px var(--float-ball-ring),
+    1px 1px 10px var(--float-ball-shadow);
 }
 
 .floatBall--dragging {
   cursor: grabbing;
-  box-shadow: 0 10px 28px var(--float-ball-shadow);
+  animation: none;
+  box-shadow:
+    0 0 0 1px var(--float-ball-ring),
+    0 10px 28px var(--float-ball-shadow);
+}
+
+.floatBall--dragging svg {
+  animation: none;
+}
+
+@keyframes floatWorkingPulse {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 1px var(--float-ball-ring),
+      2px 2px 4px var(--float-ball-shadow);
+  }
+
+  50% {
+    box-shadow:
+      0 0 0 4px var(--accent-soft),
+      0 8px 22px var(--float-ball-shadow);
+  }
+}
+
+@keyframes floatWorkingIcon {
+  0%,
+  100% {
+    transform: rotate(0deg) scale(1);
+  }
+
+  50% {
+    transform: rotate(8deg) scale(1.06);
+  }
+}
+
+@keyframes floatCompletePop {
+  0% {
+    transform: scale(1);
+    box-shadow:
+      0 0 0 1px var(--float-ball-ring),
+      2px 2px 4px var(--float-ball-shadow);
+  }
+
+  18% {
+    transform: scale(1.16);
+    box-shadow:
+      0 0 0 7px var(--accent-soft),
+      0 12px 28px var(--accent-focus);
+  }
+
+  42% {
+    transform: scale(0.96);
+  }
+
+  100% {
+    transform: scale(1);
+    box-shadow:
+      0 0 0 1px var(--float-ball-ring),
+      2px 2px 4px var(--float-ball-shadow);
+  }
+}
+
+@keyframes floatCheckReveal {
+  0% {
+    opacity: 0;
+    transform: scale(0.35) rotate(-18deg);
+  }
+
+  22% {
+    opacity: 1;
+    transform: scale(1.18) rotate(0deg);
+  }
+
+  46%,
+  82% {
+    opacity: 1;
+    transform: scale(1) rotate(0deg);
+  }
+
+  100% {
+    opacity: 0;
+    transform: scale(0.78) rotate(0deg);
+  }
+}
+
+@keyframes sleepingBotSnore {
+  0%,
+  100% {
+    opacity: 0.45;
+    transform: translateY(0) scale(0.94);
+  }
+
+  45% {
+    opacity: 1;
+    transform: translateY(-1px) scale(1.04);
+  }
 }
 
 .floatActionRing {
@@ -2590,12 +2828,12 @@ body.float-window-body {
   z-index: 15;
 }
 
-.floatBallContainer:hover .floatActionRing {
+.floatBallContainer--actionsVisible:hover .floatActionRing {
   opacity: 1;
   pointer-events: auto;
 }
 
-.floatBallContainer--panelOpen .floatActionRing {
+.floatBallContainer--panelOpen:not(.floatBallContainer--actionsVisible) .floatActionRing {
   opacity: 0;
   pointer-events: none;
 }
