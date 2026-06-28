@@ -12,15 +12,17 @@ mod types;
 mod util;
 mod workspace;
 
+use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use types::{
-    ContextSummaryRecord, CreateSessionInput, EventRecord, ProjectFile, PromptSessionInput,
-    ProviderConfigFileResponse, ProviderInput, ProviderRecord, RecoverSessionInput,
-    ReplyPermissionInput, SessionEventsResponse, SessionRecord, ShellPolicy, SnapshotRecord,
-    SubmitPromptInput, TailSessionEventsInput, UpdateSessionModeInput, UpdateSessionTitleInput,
+    ContextSummaryRecord, CreateSessionInput, EventRecord, PersistPlanInput, ProjectFile,
+    PromptSessionInput, ProviderConfigFileResponse, ProviderInput, ProviderRecord,
+    RecoverSessionInput, ReplyPermissionInput, SessionEventsResponse, SessionRecord, ShellPolicy,
+    SnapshotRecord, SubmitPromptInput, TailSessionEventsInput, UpdateSessionModeInput,
+    UpdateSessionTitleInput,
 };
 
 const FLOAT_WINDOW_LABEL: &str = "float";
@@ -227,6 +229,7 @@ fn tail_session_events(
         checkpoints: storage::list_session_checkpoints(&conn, &input.session_id)?,
         permissions: storage::list_permission_requests(&conn, &input.session_id)?,
         jobs: storage::list_background_jobs(&conn, &input.session_id)?,
+        todos: storage::list_todos(&conn, &input.session_id)?,
     })
 }
 
@@ -392,6 +395,35 @@ fn save_shell_policy(app: AppHandle, policy: ShellPolicy) -> Result<ShellPolicy,
 }
 
 #[tauri::command]
+fn persist_plan_file(app: AppHandle, input: PersistPlanInput) -> Result<String, String> {
+    let conn = storage::open_db(&app)?;
+    let session = storage::get_session(&conn, &input.session_id)?;
+    let plan_text = input.plan_text.trim();
+    if plan_text.is_empty() {
+        return Err("计划内容不能为空。".to_string());
+    }
+    let path = util::plan_file_path(&session.created_at, &session.title);
+    let event = storage::append_event(
+        &conn,
+        &session.id,
+        "plan.persisted",
+        json!({ "path": path }),
+    )?;
+    let content = if plan_text.starts_with('#') {
+        format!("{}\n", plan_text.trim_end())
+    } else {
+        format!("# {}\n\n{}\n", session.title, plan_text)
+    };
+    let snapshot = mutation::write_file(&conn, &session, &event.id, &path, &content, None)?;
+    storage::update_event_data(
+        &conn,
+        &event.id,
+        &json!({ "path": snapshot.path, "snapshotId": snapshot.id }),
+    )?;
+    Ok(snapshot.path)
+}
+
+#[tauri::command]
 fn set_app_locale(locale: String) {
     i18n::set_app_locale(&locale);
 }
@@ -462,6 +494,7 @@ pub fn run() {
             compact_session,
             load_shell_policy,
             save_shell_policy,
+            persist_plan_file,
             list_project_files
         ])
         .run(tauri::generate_context!())

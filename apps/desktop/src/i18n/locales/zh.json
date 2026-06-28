@@ -64,6 +64,7 @@
     "commandApproval": "命令确认",
     "permissionRequests": "权限请求",
     "backgroundJobs": "后台任务",
+    "planProgress": "计划进度",
     "stopJob": "停止任务",
     "compactContext": "压缩上下文",
     "contextInfo": "上下文信息",
@@ -85,6 +86,7 @@
     "noPendingCommands": "暂无待确认命令",
     "noPermissionRequests": "暂无权限请求",
     "noBackgroundJobs": "暂无后台任务",
+    "noTodos": "暂无任务进度",
     "startPrompt": "输入提示词开始",
     "noToolCalls": "暂无工具调用记录",
     "noModelConfigured": "未配置模型"
@@ -263,6 +265,12 @@
     "detail": "{{events}} 条事件 · {{changes}} 个文件变更",
     "execFailed": "执行失败"
   },
+  "todo": {
+    "progress": "步骤 {{completed}} / {{total}}",
+    "waiting": "等待 TodoWrite",
+    "count": "{{count}} 个任务",
+    "planExit": "请求执行计划"
+  },
   "context": {
     "usage": "上下文 {{percent}}% · {{source}}",
     "actual": "实际",
@@ -300,7 +308,9 @@
     "delete": "删除",
     "shell": "命令",
     "bash": "命令",
-    "grep": "搜索"
+    "grep": "搜索",
+    "todo_write": "任务",
+    "plan_exit": "退出计划"
   },
   "event": {
     "prompt.submitted": "用户提示词",
@@ -321,6 +331,8 @@
     "tool.pending": "等待确认",
     "tool.approved": "已批准工具",
     "tool.rejected": "已拒绝工具",
+    "todo.updated": "任务已更新",
+    "plan.persisted": "计划已保存",
     "plan.candidateTool": "候选工具",
     "policy.blocked": "策略拦截",
     "agent.cancelRequested": "请求停止",
@@ -344,7 +356,9 @@
     "details": "{{count}} 条细节"
   },
   "agent": {
-    "planExecutionRequirements": "执行要求：\n- 按计划逐步修改代码，不要跳过必要的读取、搜索和验证。\n- 每完成一个重要阶段，在 message 中用一句话说明当前进度。\n- 工具调用 JSON 必须严格遵守协议：toolCalls 的每个元素只能包含 name 和 input，不要在 toolCalls 元素里添加 done 字段。\n- 如果工具失败，请根据错误信息自我修正后继续。",
+    "buildSwitchReminder": "<system-reminder>\n你的操作模式已从计划模式切换为执行模式。\n现在允许编辑文件、运行命令，并按需要使用工具。\n</system-reminder>",
+    "planExecutionRequirements": "执行要求：\n- 先读取计划文件或下方计划内容，按计划逐步修改代码。\n- 开始改文件前调用 todo_write 创建完整步骤列表，只保持一个任务为 in_progress。\n- 每完成一个步骤都调用 todo_write 更新状态，右侧面板会展示实时进度。\n- 不要跳过必要的读取、搜索和验证。\n- 工具调用 JSON 必须严格遵守协议：toolCalls 的每个元素只能包含 name 和 input，不要在 toolCalls 元素里添加 done 字段。\n- 如果工具失败，请根据错误信息自我修正后继续。",
+    "planFileLabel": "计划文件：",
     "planContentLabel": "计划内容："
   },
   "contextNotes": {

@@ -304,11 +304,17 @@ async fn run_session_steps(
         };
         let native_runtime = provider::supports_native_tools(&request_config);
         let provider_id_str = provider_id_from_record(&session.provider_id);
+        let plan_path = if matches!(session.mode, AgentMode::Plan) {
+            Some(util::plan_file_path(&session.created_at, &session.title))
+        } else {
+            None
+        };
         let system_prompt = build_system_prompt(
             session.mode.as_str(),
             native_runtime,
             &request_config.model,
             provider_id_str,
+            plan_path.as_deref(),
         );
         let turn = if native_runtime {
             storage::append_event(
@@ -660,8 +666,13 @@ async fn stream_openai_compatible_with_retry(
 ) -> Result<ModelTurn, String> {
     let mut last_error = None;
     for attempt in 1..=LLM_RETRY_ATTEMPTS {
-        let mut sink =
-            StreamEventSink::new(conn, session_id, step_index, provider_record_id, request_config);
+        let mut sink = StreamEventSink::new(
+            conn,
+            session_id,
+            step_index,
+            provider_record_id,
+            request_config,
+        );
         let mut emitted_stream_event = false;
         let result = provider::stream_openai_compatible(request_config, messages, |event| {
             emitted_stream_event = true;
@@ -762,7 +773,7 @@ async fn execute_turn_tool(
     mode: tools::ToolExecutionMode,
 ) -> Result<tools::ToolOutcome, String> {
     if normalize_tool_name(&call.name) == "task" {
-        if mode != tools::ToolExecutionMode::Agent {
+        if mode == tools::ToolExecutionMode::Ask {
             return execute_task_blocked(conn, session, call);
         }
         execute_task_tool(app, conn, session, call).await
@@ -1250,12 +1261,19 @@ async fn maybe_auto_compact(
     Ok(())
 }
 
-fn build_system_prompt(mode: &str, native_tools: bool, model: &str, provider_id: &str) -> String {
+fn build_system_prompt(
+    mode: &str,
+    native_tools: bool,
+    model: &str,
+    provider_id: &str,
+    plan_path: Option<&str>,
+) -> String {
     let shell_environment = shell_environment_prompt();
     let model_identity = format!(
         "You are oDot, a local coding agent. You are currently running on the '{}' model (provider: '{}'). When asked about your model or which AI you are, truthfully state that you are running on this specific model.",
         model, provider_id
     );
+    let mode_guidance = build_mode_guidance(mode, plan_path);
     if native_tools {
         format!(
             r#"{model_identity}
@@ -1270,17 +1288,16 @@ Tool guidance:
 - delete: delete a file.
 - shell: run verification commands. Foreground commands time out by default; use background=true for long-running dev servers such as npm run dev.
 - question: ask the user when blocked on an important choice.
-- todo_write: publish a short task checklist.
+- todo_write: create and maintain a structured task list for visible progress. Use content, status (pending|in_progress|completed|cancelled), and priority (high|medium|low).
 - task: launch an isolated subagent session for focused work. Use multiple task calls in one turn for independent parallel subtasks; the parent waits for results.
+- plan_exit: in plan mode, request user approval to switch from planning to execution after the plan file is complete.
 Use read for file contents and search for project text. Do not read project files with shell commands such as Get-Content, more, cat, grep, or sed when read/search can do it.
 
 Shell environment:
 {shell_environment}
 
 Current mode: {mode}.
-ask mode: use read/search and non-mutating inspection tools when needed, but do not edit, write, or delete files. Answer the user after inspecting enough context.
-plan mode: use read/search tools and approved shell commands to inspect the task, but do not edit, write, or delete files. When you have enough information, provide a concrete implementation plan as the final answer.
-agent mode: use tools to read, search, edit, write, delete, and run safe verification commands.
+{mode_guidance}
 If a tool fails or a shell command returns a non-zero exitCode, inspect stdout/stderr/error and try a corrected tool call. Do not stop after the first failed tool unless the failure is genuinely unrecoverable.
 Use relative paths only and keep changes scoped to the user's request."#
         )
@@ -1296,7 +1313,7 @@ JSON schema:
   "message": "user-facing response or progress note",
   "toolCalls": [
     {{
-      "name": "read|search|grep|edit|write|delete|shell|question|todo_write|task",
+      "name": "read|search|grep|edit|write|delete|shell|question|todo_write|task|plan_exit",
       "input": {{}}
     }}
   ],
@@ -1311,21 +1328,45 @@ Tool inputs:
 - delete: {{"path":"relative/path"}}
 - shell: {{"command":"test/lint/build command","workdir":"optional/path","timeoutSeconds":60,"background":false,"description":"short purpose"}}. Use background=true for long-running dev servers such as npm run dev.
 - question: {{"question":"short question"}}
-- todo_write: {{"todos":[{{"text":"task","status":"pending|in_progress|done"}}]}}
+- todo_write: {{"todos":[{{"content":"task","status":"pending|in_progress|completed|cancelled","priority":"high|medium|low"}}]}}
 - task: {{"description":"short label","prompt":"detailed subtask","subagent_type":"general"}}
+- plan_exit: {{}}
 Use read for file contents and search for project text. Do not read project files with shell commands such as Get-Content, more, cat, grep, or sed when read/search can do it.
 
 Shell environment:
 {shell_environment}
 
 Current mode: {mode}.
-ask mode: use read/search and non-mutating inspection tools when needed, but do not edit, write, or delete files. Answer the user after inspecting enough context.
-plan mode: use read/search tools and approved shell commands to inspect the task, but do not edit, write, or delete files. When you have enough information, provide a concrete implementation plan as the final answer.
-agent mode: use tools to read, search, edit, write, delete, and run safe verification commands.
+{mode_guidance}
 If you call any tool, leave "done" false. Wait for the next turn to inspect tool results before giving the final answer.
 If a tool fails or a shell command returns a non-zero exitCode, inspect stdout/stderr/error and try a corrected tool call. Do not stop after the first failed tool unless the failure is genuinely unrecoverable.
 Use relative paths only and keep changes scoped to the user's request."#
         )
+    }
+}
+
+fn build_mode_guidance(mode: &str, plan_path: Option<&str>) -> String {
+    match mode {
+        "plan" => {
+            let plan_path = plan_path.unwrap_or(".odot/plans/plan.md");
+            format!(
+                r#"Plan mode is active. The user wants a researched implementation plan before code changes.
+You MUST NOT edit, write, delete, or otherwise modify project files except for this plan file:
+- {plan_path}
+This plan file is the only writable file in plan mode. Build it incrementally with write/edit as you learn.
+
+Plan workflow:
+1. Initial understanding: read/search the relevant code and, when useful, launch up to 3 task subagents in parallel with focused exploration prompts. Ask a question only when a real requirement is ambiguous.
+2. Design: synthesize the findings into a concrete implementation approach. Use one design-focused task subagent for non-trivial work when it would improve the plan.
+3. Review: reread the critical files and check that the approach matches the user's request, constraints, and existing patterns.
+4. Final plan file: write the recommended plan to {plan_path}. Include phases, files to modify, TodoWrite execution steps, risk notes, and end-to-end verification.
+5. Exit planning: after the plan file is complete, call plan_exit. Do not ask "is this plan okay" with question; plan_exit requests approval.
+
+Final user-facing response in plan mode should be brief because the authoritative plan lives in {plan_path}."#
+            )
+        }
+        "ask" => "ask mode: use read/search and non-mutating inspection tools when needed, but do not edit, write, or delete files. Answer the user after inspecting enough context.".to_string(),
+        _ => "agent mode: use tools to read, search, edit, write, delete, and run safe verification commands. For multi-step implementation, call todo_write before changing files and keep statuses current as work progresses.".to_string(),
     }
 }
 
@@ -1352,7 +1393,18 @@ fn build_stream_system_prompt(
         .unwrap_or(crate::i18n::no_compressed_context_yet());
     Ok(format!(
         "{}\n\nProject context:\n{}\n\nCompressed context:\n{}",
-        build_system_prompt(mode, native_tools, model, provider_id),
+        build_system_prompt(
+            mode,
+            native_tools,
+            model,
+            provider_id,
+            if matches!(session.mode, AgentMode::Plan) {
+                Some(util::plan_file_path(&session.created_at, &session.title))
+            } else {
+                None
+            }
+            .as_deref()
+        ),
         project_context_text(&session.project_root),
         summary
     ))
@@ -2648,18 +2700,35 @@ mod tests {
 
     #[test]
     fn system_prompts_prefer_shell_and_read_search() {
-        let native = build_system_prompt("agent", true, "test-model", "test-provider");
-        let json = build_system_prompt("agent", false, "test-model", "test-provider");
+        let native = build_system_prompt("agent", true, "test-model", "test-provider", None);
+        let json = build_system_prompt("agent", false, "test-model", "test-provider", None);
 
         assert!(native.contains("- shell: run verification commands."));
         assert!(native.contains("- task: launch an isolated subagent session"));
+        assert!(native.contains("- plan_exit: in plan mode"));
         assert!(!native.contains("bash/shell"));
         assert!(native.contains("Use read for file contents and search for project text."));
         assert!(json.contains(
-            "\"name\": \"read|search|grep|edit|write|delete|shell|question|todo_write|task\""
+            "\"name\": \"read|search|grep|edit|write|delete|shell|question|todo_write|task|plan_exit\""
         ));
         assert!(!json.contains("shell|bash"));
         assert!(json.contains("Do not read project files with shell commands"));
+    }
+
+    #[test]
+    fn plan_prompt_mentions_plan_file_and_exit_tool() {
+        let prompt = build_system_prompt(
+            "plan",
+            true,
+            "test-model",
+            "test-provider",
+            Some(".odot/plans/123-plan.md"),
+        );
+
+        assert!(prompt.contains(".odot/plans/123-plan.md"));
+        assert!(prompt.contains("Plan workflow:"));
+        assert!(prompt.contains("call plan_exit"));
+        assert!(prompt.contains("only writable file"));
     }
 
     #[test]

@@ -162,6 +162,13 @@ export type BackgroundJobRecord = {
   endedAt?: string | null;
 };
 
+export type TodoRecord = {
+  content: string;
+  status: "pending" | "in_progress" | "completed" | "cancelled" | string;
+  priority: "high" | "medium" | "low" | string;
+  position: number;
+};
+
 export type SessionEventsResponse = {
   events: EventRecord[];
   snapshots: SnapshotRecord[];
@@ -171,6 +178,7 @@ export type SessionEventsResponse = {
   checkpoints: SessionCheckpointRecord[];
   permissions: PermissionRequestRecord[];
   jobs: BackgroundJobRecord[];
+  todos: TodoRecord[];
 };
 
 export type ProjectFile = {
@@ -300,6 +308,14 @@ export async function promptSession(input: {
 }): Promise<SessionEventsResponse> {
   assertTauri();
   return invoke<SessionEventsResponse>("prompt_session", { input });
+}
+
+export async function persistPlanFile(input: {
+  sessionId: string;
+  planText: string;
+}): Promise<string> {
+  assertTauri();
+  return invoke<string>("persist_plan_file", { input });
 }
 
 export async function waitSession(

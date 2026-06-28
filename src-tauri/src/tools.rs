@@ -1,7 +1,13 @@
 use crate::{
     mutation, storage,
-    types::{EventRecord, SessionRecord, ShellMode, ShellPolicy, ToolCallRequest},
-    util::{ignored_directories, is_likely_text_file, normalize_project_path, MAX_FILE_SIZE_BYTES},
+    types::{
+        AgentMode, EventRecord, PromptAttachment, SessionInputDelivery, SessionRecord, ShellMode,
+        ShellPolicy, TodoRecord, ToolCallRequest,
+    },
+    util::{
+        ignored_directories, is_likely_text_file, normalize_project_path, plan_file_path,
+        MAX_FILE_SIZE_BYTES,
+    },
 };
 use encoding_rs::GBK;
 use rusqlite::Connection;
@@ -135,8 +141,12 @@ pub fn approve_tool_call(conn: &Connection, event_id: &str) -> Result<EventRecor
         .get("name")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if name != "shell" && name != "bash" {
-        return Err("当前版本只支持确认等待中的 shell/bash 命令。".to_string());
+    let tool_name = normalize_tool_name(name);
+    if tool_name == "plan_exit" {
+        return approve_plan_exit(conn, &session, &event);
+    }
+    if tool_name != "shell" {
+        return Err("当前版本只支持确认等待中的 shell/bash 命令或计划退出。".to_string());
     }
 
     let command = event
@@ -175,6 +185,63 @@ pub fn approve_tool_call(conn: &Connection, event_id: &str) -> Result<EventRecor
             "pendingEventId": event.id,
             "name": name,
             "result": result
+        }),
+    )
+}
+
+fn approve_plan_exit(
+    conn: &Connection,
+    session: &SessionRecord,
+    event: &EventRecord,
+) -> Result<EventRecord, String> {
+    let plan_path = event
+        .data
+        .pointer("/pending/planPath")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| plan_file_path(&session.created_at, &session.title));
+    storage::append_event(
+        conn,
+        &session.id,
+        "tool.approved",
+        json!({
+            "pendingEventId": event.id,
+            "name": "plan_exit",
+            "planPath": plan_path.clone()
+        }),
+    )?;
+    storage::update_session_mode(conn, &session.id, Some(AgentMode::Agent), None, None)?;
+    let prompt = build_plan_exit_execution_prompt(&plan_path);
+    let admitted = storage::admit_session_input(
+        conn,
+        None,
+        &session.id,
+        &prompt,
+        &Vec::<PromptAttachment>::new(),
+        SessionInputDelivery::Queue,
+        true,
+    )?;
+    storage::append_event(
+        conn,
+        &session.id,
+        "session.input.admitted",
+        json!({
+            "inputId": admitted.id,
+            "delivery": admitted.delivery,
+            "resume": admitted.resume
+        }),
+    )?;
+    storage::append_event(
+        conn,
+        &session.id,
+        "tool.success",
+        json!({
+            "pendingEventId": event.id,
+            "name": "plan_exit",
+            "result": {
+                "planPath": plan_path.clone(),
+                "message": "User approved switching to agent mode. Execute the approved plan."
+            }
         }),
     )
 }
@@ -233,10 +300,12 @@ fn execute_tool_inner(
             })))
         }
         "edit" => {
-            if execution_mode != ToolExecutionMode::Agent {
+            let path = required_string(&call.input, "path")?;
+            if execution_mode != ToolExecutionMode::Agent
+                && !(execution_mode == ToolExecutionMode::Plan && is_plan_file_path(&path))
+            {
                 return Ok(read_only_mode_mutation_blocked(execution_mode, "edit"));
             }
-            let path = required_string(&call.input, "path")?;
             let old_string = required_string_any(&call.input, &["oldString", "old_string"])?;
             let new_string = required_string_any(&call.input, &["newString", "new_string"])?;
             let snapshot = mutation::edit_file(
@@ -254,10 +323,12 @@ fn execute_tool_inner(
             })))
         }
         "write" => {
-            if execution_mode != ToolExecutionMode::Agent {
+            let path = required_string(&call.input, "path")?;
+            if execution_mode != ToolExecutionMode::Agent
+                && !(execution_mode == ToolExecutionMode::Plan && is_plan_file_path(&path))
+            {
                 return Ok(read_only_mode_mutation_blocked(execution_mode, "write"));
             }
-            let path = required_string(&call.input, "path")?;
             let content = required_string(&call.input, "content")?;
             let expected_hash =
                 optional_string_any(&call.input, &["expectedHash", "expected_hash"]);
@@ -296,13 +367,33 @@ fn execute_tool_inner(
             })))
         }
         "todo_write" => {
-            let todos = call
-                .input
-                .get("todos")
-                .cloned()
-                .unwrap_or(Value::Array(Vec::new()));
+            let todos = parse_todos(call.input.get("todos").unwrap_or(&Value::Null))?;
+            let saved = storage::replace_todos(conn, &session.id, todos)?;
+            storage::append_event(
+                conn,
+                &session.id,
+                "todo.updated",
+                json!({
+                    "todos": saved.clone()
+                }),
+            )?;
             Ok(ToolRun::Success(json!({
-                "todos": todos
+                "todos": saved
+            })))
+        }
+        "plan_exit" => {
+            if execution_mode != ToolExecutionMode::Plan {
+                return Ok(ToolRun::Failure(json!({
+                    "blocked": true,
+                    "reason": "plan_exit 只能在计划模式结束时调用。"
+                })));
+            }
+            let plan_path = plan_file_path(&session.created_at, &session.title);
+            Ok(ToolRun::Pending(json!({
+                "kind": "plan_exit",
+                "command": format!("计划文件 {plan_path} 已完成，是否切换到执行模式并开始实现？"),
+                "planPath": plan_path,
+                "reason": "计划已完成，等待用户确认是否开始执行。"
             })))
         }
         "shell" | "bash" => {
@@ -348,7 +439,83 @@ fn normalize_tool_name(name: &str) -> String {
         "bash" => "shell".to_string(),
         "grep" => "search".to_string(),
         "todowrite" => "todo_write".to_string(),
+        "planexit" => "plan_exit".to_string(),
         other => other.to_string(),
+    }
+}
+
+fn is_plan_file_path(path: &str) -> bool {
+    let normalized = normalize_project_path(path);
+    let normalized = normalized.strip_prefix("./").unwrap_or(&normalized);
+    normalized.starts_with(".odot/plans/") && normalized.ends_with(".md")
+}
+
+fn build_plan_exit_execution_prompt(plan_path: &str) -> String {
+    format!(
+        "[odot-plan-execution]\n\n<system-reminder>\nYour operational mode has changed from plan to agent.\nYou are no longer in read-only mode.\nYou are permitted to edit files, run commands, and use tools as needed.\nA plan file exists at {plan_path}; read it when you need the authoritative implementation plan.\nBefore making code changes, call todo_write with the plan steps, keep exactly one item in_progress, and update the list after each completed step.\n</system-reminder>\n\nThe plan at {plan_path} has been approved. Execute the plan now."
+    )
+}
+
+fn parse_todos(value: &Value) -> Result<Vec<TodoRecord>, String> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| "todo_write.todos 必须是数组。".to_string())?;
+    items
+        .iter()
+        .enumerate()
+        .map(|(position, item)| parse_todo(item, position))
+        .collect()
+}
+
+fn parse_todo(value: &Value, position: usize) -> Result<TodoRecord, String> {
+    let content = value
+        .get("content")
+        .or_else(|| value.get("text"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("todo_write.todos[{position}].content 不能为空。"))?
+        .to_string();
+    let status = normalize_todo_status(
+        value
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("pending"),
+    )?;
+    let priority = normalize_todo_priority(
+        value
+            .get("priority")
+            .and_then(Value::as_str)
+            .unwrap_or("medium"),
+    )?;
+    Ok(TodoRecord {
+        content,
+        status,
+        priority,
+        position: position as i64,
+    })
+}
+
+fn normalize_todo_status(value: &str) -> Result<String, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "pending" => Ok("pending".to_string()),
+        "in_progress" | "in-progress" | "running" => Ok("in_progress".to_string()),
+        "completed" | "complete" | "done" => Ok("completed".to_string()),
+        "cancelled" | "canceled" => Ok("cancelled".to_string()),
+        other => Err(format!(
+            "不支持的 todo 状态: {other}，可用 pending/in_progress/completed/cancelled。"
+        )),
+    }
+}
+
+fn normalize_todo_priority(value: &str) -> Result<String, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "high" => Ok("high".to_string()),
+        "medium" | "normal" => Ok("medium".to_string()),
+        "low" => Ok("low".to_string()),
+        other => Err(format!(
+            "不支持的 todo 优先级: {other}，可用 high/medium/low。"
+        )),
     }
 }
 
@@ -374,9 +541,16 @@ fn read_only_mode_mutation_blocked(execution_mode: ToolExecutionMode, tool_name:
         ToolExecutionMode::Plan => "计划模式",
         ToolExecutionMode::Agent => "Agent 模式",
     };
+    let reason = if execution_mode == ToolExecutionMode::Plan {
+        format!(
+            "{mode_label}禁止执行 {tool_name}，除 .odot/plans/*.md 计划文件外，请只读取、搜索或运行不会修改代码的检查命令。"
+        )
+    } else {
+        format!("{mode_label}禁止执行 {tool_name}，请只读取、搜索或运行不会修改代码的检查命令。")
+    };
     ToolRun::Failure(json!({
         "blocked": true,
-        "reason": format!("{mode_label}禁止执行 {tool_name}，请只读取、搜索或运行不会修改代码的检查命令。")
+        "reason": reason
     }))
 }
 
@@ -1053,6 +1227,36 @@ mod tests {
             }
             other => panic!("ask mode write should be blocked, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn todo_parser_normalizes_legacy_status_and_priority() {
+        let todos = parse_todos(&json!([
+            { "text": "Implement the plan", "status": "done", "priority": "normal" },
+            { "content": "Verify right panel progress", "status": "in-progress", "priority": "high" }
+        ]))
+        .unwrap();
+
+        assert_eq!(todos.len(), 2);
+        assert_eq!(todos[0].content, "Implement the plan");
+        assert_eq!(todos[0].status, "completed");
+        assert_eq!(todos[0].priority, "medium");
+        assert_eq!(todos[0].position, 0);
+        assert_eq!(todos[1].status, "in_progress");
+        assert_eq!(todos[1].priority, "high");
+        assert_eq!(todos[1].position, 1);
+    }
+
+    #[test]
+    fn plan_mode_write_scope_only_allows_markdown_plan_files() {
+        assert!(is_plan_file_path(".odot/plans/2026-06-27-ship-plan.md"));
+        assert!(is_plan_file_path(".odot\\plans\\2026-06-27-ship-plan.md"));
+        assert!(is_plan_file_path(
+            ".\\.odot\\plans\\2026-06-27-ship-plan.md"
+        ));
+        assert!(!is_plan_file_path(".odot/plans/2026-06-27-ship-plan.txt"));
+        assert!(!is_plan_file_path("src-tauri/src/tools.rs"));
+        assert!(!is_plan_file_path(".odot/other/plan.md"));
     }
 
     #[test]

@@ -592,11 +592,34 @@ fn native_tool_definitions() -> Value {
             "type": "function",
             "function": {
                 "name": "todo_write",
-                "description": "Update the agent todo list for visible progress.",
+                "description": "Create and maintain a structured task list for the current coding session. Send the complete updated list each time.",
                 "parameters": object_schema(
-                    json!({ "todos": { "type": "array", "description": "Todo items." } }),
+                    json!({
+                        "todos": {
+                            "type": "array",
+                            "description": "The complete updated todo list.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "content": { "type": "string", "description": "Brief task description." },
+                                    "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"] },
+                                    "priority": { "type": "string", "enum": ["high", "medium", "low"] }
+                                },
+                                "required": ["content", "status", "priority"],
+                                "additionalProperties": false
+                            }
+                        }
+                    }),
                     &["todos"]
                 )
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "plan_exit",
+                "description": "Use at the end of plan mode after the plan file is complete to request user approval to switch to execution.",
+                "parameters": object_schema(json!({}), &[])
             }
         }
     ])
@@ -768,6 +791,8 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(names.contains(&"shell"));
+        assert!(names.contains(&"todo_write"));
+        assert!(names.contains(&"plan_exit"));
         assert!(!names.contains(&"bash"));
 
         let shell = tools

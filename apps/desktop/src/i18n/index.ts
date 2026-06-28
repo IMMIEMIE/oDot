@@ -57,8 +57,11 @@ export function appT(key: string, options?: Record<string, unknown>) {
   return i18n.t(key, options);
 }
 
-export function buildPlanExecutionPrompt(planText: string) {
-  return `${PLAN_EXECUTION_MARKER}\n\n${appT("agent.planExecutionRequirements")}\n\n${appT("agent.planContentLabel")}\n${planText}`;
+export function buildPlanExecutionPrompt(planText: string, planPath?: string) {
+  const planFileSection = planPath
+    ? `\n\n${appT("agent.planFileLabel")}\n${planPath}`
+    : "";
+  return `${PLAN_EXECUTION_MARKER}\n\n${appT("agent.buildSwitchReminder")}\n\n${appT("agent.planExecutionRequirements")}${planFileSection}\n\n${appT("agent.planContentLabel")}\n${planText}`;
 }
 
 export function recoveryActionLabel(id: string, fallback: string) {

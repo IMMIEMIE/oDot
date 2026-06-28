@@ -32,6 +32,36 @@ pub fn to_project_path(value: &str) -> String {
     value.replace('\\', "/")
 }
 
+pub fn plan_file_path(created_at: &str, title: &str) -> String {
+    let slug = slugify(title);
+    format!(".odot/plans/{}-{}.md", created_at, slug)
+}
+
+fn slugify(value: &str) -> String {
+    let mut slug = String::new();
+    let mut last_dash = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash && !slug.is_empty() {
+            slug.push('-');
+            last_dash = true;
+        }
+        if slug.len() >= 48 {
+            break;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "plan".to_string()
+    } else {
+        slug
+    }
+}
+
 pub fn resolve_writable_inside(root: &Path, relative_path: &str) -> Result<PathBuf, String> {
     let normalized = normalize_project_path(relative_path);
     if normalized.is_empty() {

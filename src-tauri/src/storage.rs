@@ -5,7 +5,7 @@ use crate::{
         PermissionReply, PermissionRequestRecord, PromptAttachment, ProviderInput, ProviderKind,
         ProviderRecord, SessionCheckpointRecord, SessionEventsResponse, SessionInputDelivery,
         SessionInputRecord, SessionRecord, SessionRunRecord, ShellMode, ShellPolicy,
-        SnapshotRecord,
+        SnapshotRecord, TodoRecord,
     },
     util,
 };
@@ -169,6 +169,15 @@ fn init_db(conn: &Connection) -> Result<(), String> {
           log_path TEXT,
           started_at TEXT NOT NULL,
           ended_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS todo (
+          session_id TEXT NOT NULL,
+          content TEXT NOT NULL,
+          status TEXT NOT NULL,
+          priority TEXT NOT NULL,
+          position INTEGER NOT NULL,
+          PRIMARY KEY(session_id, position)
         );
         "#,
     )
@@ -360,7 +369,11 @@ pub fn create_child_session(
         conn,
         CreateSessionInput {
             project_root: parent.project_root.clone(),
-            mode: AgentMode::Agent,
+            mode: if matches!(parent.mode, AgentMode::Plan) {
+                AgentMode::Ask
+            } else {
+                AgentMode::Agent
+            },
             provider_id: parent.provider_id.clone(),
             shell_mode: parent.shell_mode.clone(),
             title: Some(title.to_string()),
@@ -1241,6 +1254,47 @@ pub fn update_background_job_status(
     Ok(job)
 }
 
+pub fn replace_todos(
+    conn: &Connection,
+    session_id: &str,
+    todos: Vec<TodoRecord>,
+) -> Result<Vec<TodoRecord>, String> {
+    get_session(conn, session_id)?;
+    conn.execute(
+        "DELETE FROM todo WHERE session_id = ?1",
+        params![session_id],
+    )
+    .map_err(|error| error.to_string())?;
+    for (index, todo) in todos.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO todo (session_id, content, status, priority, position)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                session_id,
+                &todo.content,
+                &todo.status,
+                &todo.priority,
+                index as i64
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    list_todos(conn, session_id)
+}
+
+pub fn list_todos(conn: &Connection, session_id: &str) -> Result<Vec<TodoRecord>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT content, status, priority, position
+             FROM todo WHERE session_id = ?1 ORDER BY position ASC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map(params![session_id], todo_from_row)
+        .map_err(|error| error.to_string())?;
+    collect_rows(rows)
+}
+
 pub fn session_events_response(
     conn: &Connection,
     session_id: &str,
@@ -1254,6 +1308,7 @@ pub fn session_events_response(
         checkpoints: list_session_checkpoints(conn, session_id)?,
         permissions: list_permission_requests(conn, session_id)?,
         jobs: list_background_jobs(conn, session_id)?,
+        todos: list_todos(conn, session_id)?,
     })
 }
 
@@ -1476,6 +1531,15 @@ fn background_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Backgrou
         log_path: row.get(6)?,
         started_at: row.get(7)?,
         ended_at: row.get(8)?,
+    })
+}
+
+fn todo_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TodoRecord> {
+    Ok(TodoRecord {
+        content: row.get(0)?,
+        status: row.get(1)?,
+        priority: row.get(2)?,
+        position: row.get(3)?,
     })
 }
 
@@ -1762,8 +1826,7 @@ mod tests {
         )
         .unwrap();
 
-        let updated =
-            update_session_mode(&conn, "s1", None, Some(ShellMode::Auto), None).unwrap();
+        let updated = update_session_mode(&conn, "s1", None, Some(ShellMode::Auto), None).unwrap();
 
         assert!(matches!(updated.shell_mode, ShellMode::Auto));
         assert!(matches!(updated.mode, AgentMode::Agent));
@@ -1820,5 +1883,70 @@ mod tests {
 
         assert_eq!(job.status, "running");
         assert_eq!(list_background_jobs(&conn, "s1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn todo_records_are_replaced_and_ordered() {
+        let conn = memory_db();
+        conn.execute(
+            "INSERT INTO provider (id, kind, name, model, credential_ref, created_at, updated_at)
+             VALUES ('p1', 'openai', 'Provider', 'model', 'provider:p1', '1', '1')",
+            [],
+        )
+        .unwrap();
+        let session = create_session(
+            &conn,
+            CreateSessionInput {
+                project_root: ".".to_string(),
+                mode: AgentMode::Agent,
+                provider_id: "p1".to_string(),
+                shell_mode: ShellMode::Manual,
+                title: Some("Todo test".to_string()),
+                parent_session_id: None,
+            },
+        )
+        .unwrap();
+
+        replace_todos(
+            &conn,
+            &session.id,
+            vec![
+                TodoRecord {
+                    content: "first".to_string(),
+                    status: "completed".to_string(),
+                    priority: "high".to_string(),
+                    position: 99,
+                },
+                TodoRecord {
+                    content: "second".to_string(),
+                    status: "in_progress".to_string(),
+                    priority: "medium".to_string(),
+                    position: 99,
+                },
+            ],
+        )
+        .unwrap();
+        let replaced = replace_todos(
+            &conn,
+            &session.id,
+            vec![TodoRecord {
+                content: "replacement".to_string(),
+                status: "pending".to_string(),
+                priority: "low".to_string(),
+                position: 99,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(replaced[0].content, "replacement");
+        assert_eq!(replaced[0].position, 0);
+        assert_eq!(
+            session_events_response(&conn, &session.id)
+                .unwrap()
+                .todos
+                .len(),
+            1
+        );
     }
 }

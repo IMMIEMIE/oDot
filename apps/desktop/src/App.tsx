@@ -58,6 +58,7 @@ import {
   listSessions,
   loadShellPolicy,
   loadProviderConfig,
+  persistPlanFile,
   pickProjectDirectory,
   rejectToolCall,
   replyPermission,
@@ -79,7 +80,8 @@ import {
   type SessionRecord,
   type ShellPolicy,
   type ShellMode,
-  type SnapshotRecord
+  type SnapshotRecord,
+  type TodoRecord
 } from "./api";
 import {
   EMPTY_SESSION_EVENTS as EMPTY_EVENTS,
@@ -467,6 +469,12 @@ export function App() {
     () => latestPlanExecutionEvents(eventsResponse.events),
     [eventsResponse.events]
   );
+
+  useEffect(() => {
+    if (isRightPaneCollapsed && planExecutionEvents.length > 0) {
+      setIsRightPaneCollapsed(false);
+    }
+  }, [isRightPaneCollapsed, planExecutionEvents.length]);
 
   const latestEventId = eventsResponse.events.at(-1)?.id ?? "";
   const promptEventCount = useMemo(
@@ -996,6 +1004,10 @@ export function App() {
     setIsSubmitting(true);
     setNotice({ tone: "info", text: t("notice.executingPlan") });
     try {
+      const planPath = await persistPlanFile({
+        sessionId: selectedSession.id,
+        planText
+      });
       const executionSession = await updateSessionMode({
         sessionId: selectedSession.id,
         mode: "agent"
@@ -1009,7 +1021,7 @@ export function App() {
 
       const response = await promptSession({
         sessionId: executionSession.id,
-        prompt: buildPlanExecutionPrompt(planText),
+        prompt: buildPlanExecutionPrompt(planText, planPath),
         delivery: "queue",
         resume: true
       });
@@ -1085,6 +1097,12 @@ export function App() {
           return;
         }
         setEventsResponse(response);
+        const nextSessions = await refreshSessions();
+        const currentSession = nextSessions.find((session) => session.id === sessionId);
+        if (currentSession) {
+          setMode(currentSession.mode);
+          setShellMode(currentSession.shellMode);
+        }
         setNotice({
           tone: "success",
           text: hasUnresolvedPendingTools(response.events)
@@ -1723,13 +1741,6 @@ export function App() {
             <div ref={timelineEndRef} />
           </div>
 
-          {planExecutionEvents.length > 0 && (
-            <PlanExecutionDock
-              events={planExecutionEvents}
-              snapshots={eventsResponse.snapshots}
-            />
-          )}
-
           <div className="promptBar">
             <div className="promptComposer">
               <input
@@ -1974,6 +1985,14 @@ export function App() {
 
         {!isRightPaneCollapsed && (
           <>
+            {planExecutionEvents.length > 0 && (
+              <PlanExecutionDock
+                events={planExecutionEvents}
+                snapshots={eventsResponse.snapshots}
+                todos={eventsResponse.todos}
+              />
+            )}
+
             <section className="rightSection">
               <SectionTitle icon={<Database size={16} />} title={t("nav.contextInfo")} />
               <ContextUsageMeter usage={contextUsage} />
@@ -2019,28 +2038,30 @@ export function App() {
                   <div className="approvalRow" key={event.id}>
                     <code>{pendingCommand(event)}</code>
                     <div>
-                  <button
-                    className="iconButton success"
-                    disabled={isMutating}
-                    onClick={() => void handleApprove(event.id)}
-                    title={t("common.accept")}
-                  >
-                    <Check size={16} />
-                  </button>
-                  <button
-                    className="iconButton trust"
-                    disabled={isMutating}
-                    onClick={() => void handleApproveAndAllow(event)}
-                    title={t("common.acceptAndAllowlist")}
-                  >
-                    <Save size={16} />
-                  </button>
-                  <button
-                    className="iconButton danger"
-                    disabled={isMutating}
-                    onClick={() => void handleReject(event.id)}
-                    title={t("common.reject")}
-                  >
+                      <button
+                        className="iconButton success"
+                        disabled={isMutating}
+                        onClick={() => void handleApprove(event.id)}
+                        title={t("common.accept")}
+                      >
+                        <Check size={16} />
+                      </button>
+                      {isShellPending(event) && (
+                        <button
+                          className="iconButton trust"
+                          disabled={isMutating}
+                          onClick={() => void handleApproveAndAllow(event)}
+                          title={t("common.acceptAndAllowlist")}
+                        >
+                          <Save size={16} />
+                        </button>
+                      )}
+                      <button
+                        className="iconButton danger"
+                        disabled={isMutating}
+                        onClick={() => void handleReject(event.id)}
+                        title={t("common.reject")}
+                      >
                         <X size={16} />
                       </button>
                     </div>
@@ -3196,19 +3217,31 @@ type DockDetail = {
   errorText?: string;
 };
 
+type TodoExecutionSummary = {
+  total: number;
+  completed: number;
+  active?: TodoRecord;
+};
+
 function buildToolAction(
   event: EventRecord,
   resultByToolCall: Map<string, EventRecord>
 ): DockDetail {
   const name = valueAsString(event.data.name);
+  const normalizedName = normalizeDisplayToolName(name);
   const input = asRecord(event.data.input);
-  const label = toolLabel(name);
+  const label = toolLabel(normalizedName);
 
   let target = "";
-  if (name === "shell" || name === "bash") {
+  if (normalizedName === "shell") {
     target = valueAsString(input.command);
-  } else if (name === "search" || name === "grep") {
+  } else if (normalizedName === "search") {
     target = valueAsString(input.query) || valueAsString(input.pattern) || valueAsString(input.regex);
+  } else if (normalizedName === "todo_write") {
+    const todos = Array.isArray(input.todos) ? input.todos : [];
+    target = appT("todo.count", { count: todos.length });
+  } else if (normalizedName === "plan_exit") {
+    target = appT("todo.planExit");
   } else {
     target = valueAsString(input.path);
   }
@@ -3233,7 +3266,7 @@ function buildToolAction(
     }
   }
 
-  return { id: event.id, toolName: name, label, target, status, errorText };
+  return { id: event.id, toolName: normalizedName, label, target, status, errorText };
 }
 
 function buildResultByToolCall(events: EventRecord[]) {
@@ -3264,20 +3297,44 @@ function buildDockDetails(events: EventRecord[]): DockDetail[] {
   return details;
 }
 
+function normalizeTodoStatus(status: string) {
+  return status === "done" ? "completed" : status;
+}
+
+function buildTodoExecutionSummary(todos: TodoRecord[]): TodoExecutionSummary {
+  const completed = todos.filter(
+    (todo) => normalizeTodoStatus(todo.status) === "completed"
+  ).length;
+  const active =
+    todos.find((todo) => normalizeTodoStatus(todo.status) === "in_progress") ??
+    todos.find((todo) => normalizeTodoStatus(todo.status) === "pending") ??
+    todos.filter((todo) => normalizeTodoStatus(todo.status) === "completed").at(-1);
+  return {
+    total: todos.length,
+    completed,
+    active
+  };
+}
+
 function PlanExecutionDock({
   events,
-  snapshots
+  snapshots,
+  todos
 }: {
   events: EventRecord[];
   snapshots: SnapshotRecord[];
+  todos: TodoRecord[];
 }) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const summary = buildExecutionSummary(events, snapshots);
   const details = useMemo(() => buildDockDetails(events), [events]);
+  const todoSummary = useMemo(() => buildTodoExecutionSummary(todos), [todos]);
+  const todoProgress =
+    todoSummary.total > 0 ? Math.round((todoSummary.completed / todoSummary.total) * 100) : 0;
 
   return (
-    <section className={`planExecutionDock ${expanded ? "expanded" : ""}`}>
+    <section className={`rightSection planExecutionDock ${expanded ? "expanded" : ""}`}>
       <button
         type="button"
         className="planExecutionHeader"
@@ -3286,11 +3343,56 @@ function PlanExecutionDock({
         <div className="planExecutionTitle">
           {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
           <History size={16} />
-          <strong>{t("execution.title")}</strong>
+          <strong>{t("nav.planProgress")}</strong>
           <span className={summary.status}>{summary.statusText}</span>
         </div>
         <small>{summary.detail}</small>
       </button>
+      <div className="planTodoBlock">
+        <div className="planTodoProgressRow">
+          <strong>
+            {todoSummary.total
+              ? t("todo.progress", {
+                  completed: todoSummary.completed,
+                  total: todoSummary.total
+                })
+              : t("todo.waiting")}
+          </strong>
+          <span>{todoProgress}%</span>
+        </div>
+        <div className="planTodoProgressTrack" aria-hidden="true">
+          <span style={{ width: `${todoProgress}%` }} />
+        </div>
+        {todoSummary.active && (
+          <div className="planTodoActive">
+            <span className={`todoStatusDot ${normalizeTodoStatus(todoSummary.active.status)}`} />
+            <span>{todoSummary.active.content}</span>
+          </div>
+        )}
+        {todos.length > 0 && (
+          <div className="planTodoList">
+            {todos.map((todo) => {
+              const status = normalizeTodoStatus(todo.status);
+              return (
+                <div
+                  className={`planTodoItem ${status}`}
+                  key={`${todo.position}-${todo.content}`}
+                >
+                  <span className="todoStatusIcon">
+                    {status === "completed" && <Check size={13} />}
+                    {status === "in_progress" && <Loader2 className="spin" size={13} />}
+                    {status === "cancelled" && <X size={13} />}
+                    {status !== "completed" &&
+                      status !== "in_progress" &&
+                      status !== "cancelled" && <Clock3 size={13} />}
+                  </span>
+                  <span>{todo.content}</span>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
       <div className="executionSummary">
         <span>
           <Wrench size={14} />
@@ -4328,11 +4430,18 @@ function eventLabel(event: EventRecord) {
 }
 
 function pendingCommand(event: EventRecord) {
+  const pending = event.data.pending as Record<string, unknown> | undefined;
   return (
-    valueAsString((event.data.pending as Record<string, unknown> | undefined)?.command) ||
+    valueAsString(pending?.command) ||
+    valueAsString(pending?.question) ||
+    valueAsString(pending?.reason) ||
     valueAsString(event.data.command) ||
     appT("event.pendingCommand")
   );
+}
+
+function isShellPending(event: EventRecord) {
+  return normalizeDisplayToolName(valueAsString(event.data.name)) === "shell";
 }
 
 function visiblePermissionRequests(requests: PermissionRequestRecord[]) {
@@ -4484,6 +4593,23 @@ function toolLabel(value: string) {
   const key = `tool.${value}`;
   const translated = appT(key);
   return translated === key ? value : translated;
+}
+
+function normalizeDisplayToolName(value: string) {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "bash") {
+    return "shell";
+  }
+  if (normalized === "grep") {
+    return "search";
+  }
+  if (normalized === "todowrite") {
+    return "todo_write";
+  }
+  if (normalized === "planexit") {
+    return "plan_exit";
+  }
+  return normalized;
 }
 
 type ContextUsageSeverity = "ok" | "warning" | "danger";

@@ -64,6 +64,7 @@
     "commandApproval": "Command approval",
     "permissionRequests": "Permission requests",
     "backgroundJobs": "Background jobs",
+    "planProgress": "Plan progress",
     "stopJob": "Stop job",
     "compactContext": "Compact context",
     "contextInfo": "Context info",
@@ -85,6 +86,7 @@
     "noPendingCommands": "No pending commands",
     "noPermissionRequests": "No permission requests",
     "noBackgroundJobs": "No background jobs",
+    "noTodos": "No task progress yet",
     "startPrompt": "Enter a prompt to start",
     "noToolCalls": "No tool call records",
     "noModelConfigured": "No model configured"
@@ -263,6 +265,12 @@
     "detail": "{{events}} events · {{changes}} file changes",
     "execFailed": "Execution failed"
   },
+  "todo": {
+    "progress": "Steps {{completed}} / {{total}}",
+    "waiting": "Waiting for TodoWrite",
+    "count": "{{count}} tasks",
+    "planExit": "Request plan execution"
+  },
   "context": {
     "usage": "Context {{percent}}% · {{source}}",
     "actual": "actual",
@@ -300,7 +308,9 @@
     "delete": "Delete",
     "shell": "Command",
     "bash": "Command",
-    "grep": "Search"
+    "grep": "Search",
+    "todo_write": "Tasks",
+    "plan_exit": "Exit plan"
   },
   "event": {
     "prompt.submitted": "User prompt",
@@ -321,6 +331,8 @@
     "tool.pending": "Pending approval",
     "tool.approved": "Tool approved",
     "tool.rejected": "Tool rejected",
+    "todo.updated": "Tasks updated",
+    "plan.persisted": "Plan saved",
     "plan.candidateTool": "Candidate tool",
     "policy.blocked": "Policy blocked",
     "agent.cancelRequested": "Stop requested",
@@ -344,7 +356,9 @@
     "details": "{{count}} details"
   },
   "agent": {
-    "planExecutionRequirements": "Execution requirements:\n- Follow the plan step by step; do not skip necessary reads, searches, or verification.\n- After each important stage, summarize progress in one sentence in message.\n- Tool-call JSON must follow the protocol strictly: each toolCalls item may only contain name and input; do not add done inside toolCalls items.\n- If a tool fails, self-correct from the error and continue.",
+    "buildSwitchReminder": "<system-reminder>\nYour operational mode has changed from plan to agent.\nYou are no longer in read-only mode.\nYou are permitted to edit files, run commands, and use tools as needed.\n</system-reminder>",
+    "planExecutionRequirements": "Execution requirements:\n- Read the plan file or inline plan below, then execute it step by step.\n- Before editing files, call todo_write with the full step list and keep exactly one item in_progress.\n- After each completed step, call todo_write again so the right panel shows live progress.\n- Do not skip necessary reads, searches, or verification.\n- Tool-call JSON must follow the protocol strictly: each toolCalls item may only contain name and input; do not add done inside toolCalls items.\n- If a tool fails, self-correct from the error and continue.",
+    "planFileLabel": "Plan file:",
     "planContentLabel": "Plan content:"
   },
   "contextNotes": {

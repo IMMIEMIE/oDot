@@ -372,6 +372,15 @@ pub struct BackgroundJobRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TodoRecord {
+    pub content: String,
+    pub status: String,
+    pub priority: String,
+    pub position: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionEventsResponse {
     pub events: Vec<EventRecord>,
     pub snapshots: Vec<SnapshotRecord>,
@@ -386,6 +395,8 @@ pub struct SessionEventsResponse {
     pub permissions: Vec<PermissionRequestRecord>,
     #[serde(default)]
     pub jobs: Vec<BackgroundJobRecord>,
+    #[serde(default)]
+    pub todos: Vec<TodoRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -423,6 +434,13 @@ pub struct PromptSessionInput {
     pub delivery: Option<SessionInputDelivery>,
     #[serde(default = "default_resume")]
     pub resume: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistPlanInput {
+    pub session_id: String,
+    pub plan_text: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

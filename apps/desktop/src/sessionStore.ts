@@ -5,7 +5,8 @@ import type {
   EventRecord,
   PermissionRequestRecord,
   SnapshotRecord,
-  SessionEventsResponse
+  SessionEventsResponse,
+  TodoRecord
 } from "./api";
 
 export const EMPTY_SESSION_EVENTS: SessionEventsResponse = {
@@ -16,7 +17,8 @@ export const EMPTY_SESSION_EVENTS: SessionEventsResponse = {
   runs: [],
   checkpoints: [],
   permissions: [],
-  jobs: []
+  jobs: [],
+  todos: []
 };
 
 export type ODotRealtimeEvent = {
@@ -81,7 +83,8 @@ export function mergeSessionEvents(
     runs: incoming.runs ?? current.runs,
     checkpoints: incoming.checkpoints ?? current.checkpoints,
     permissions: incoming.permissions ?? current.permissions,
-    jobs: incoming.jobs ?? current.jobs
+    jobs: incoming.jobs ?? current.jobs,
+    todos: incoming.todos ?? current.todos
   };
 }
 
@@ -104,6 +107,13 @@ function mergeRealtimeEvent(
   let next = current;
   if (incoming.event) {
     next = mergeEventRecord(next, incoming.event);
+    const todos = todosFromEvent(incoming.event);
+    if (todos) {
+      next = {
+        ...next,
+        todos
+      };
+    }
   }
   if (incoming.permission) {
     next = {
@@ -138,6 +148,33 @@ function mergeRealtimeEvent(
     };
   }
   return next;
+}
+
+function todosFromEvent(event: EventRecord): TodoRecord[] | null {
+  if (event.type !== "todo.updated" || !Array.isArray(event.data.todos)) {
+    return null;
+  }
+  return event.data.todos
+    .map((todo, position) => todoFromValue(todo, position))
+    .filter((todo): todo is TodoRecord => Boolean(todo));
+}
+
+function todoFromValue(value: unknown, position: number): TodoRecord | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const content = typeof record.content === "string" ? record.content : "";
+  const status = typeof record.status === "string" ? record.status : "pending";
+  const priority = typeof record.priority === "string" ? record.priority : "medium";
+  const itemPosition =
+    typeof record.position === "number" && Number.isFinite(record.position)
+      ? record.position
+      : position;
+  if (!content.trim()) {
+    return null;
+  }
+  return { content, status, priority, position: itemPosition };
 }
 
 function mergeById<T extends { id: string }>(items: T[], incoming: T): T[] {
