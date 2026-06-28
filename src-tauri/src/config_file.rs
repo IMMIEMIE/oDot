@@ -414,7 +414,11 @@ pub fn find_opencode_config(project_root: Option<&str>) -> Result<Option<String>
     }
 
     if let Ok(appdata) = env::var("APPDATA") {
-        candidates.push(PathBuf::from(appdata).join("opencode").join("opencode.json"));
+        candidates.push(
+            PathBuf::from(appdata)
+                .join("opencode")
+                .join("opencode.json"),
+        );
     }
 
     for candidate in candidates {

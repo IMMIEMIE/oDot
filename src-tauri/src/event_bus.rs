@@ -160,7 +160,11 @@ fn normalized_kind(event_type: &str) -> &str {
         "assistant.message" | "assistant.message.delta" => "assistant.message",
         "tool.called" | "tool.input.delta" => "tool.call",
         "tool.success" | "tool.failed" | "tool.rejected" | "tool.pending" => "tool.result",
-        "background.job.started" | "task.created" => "task.created",
+        "background.job.started" | "task.created" | "task.background.started" => "task.created",
+        "background.job.updated"
+        | "task.background.updated"
+        | "task.promote.requested"
+        | "task.orphaned" => "background.job.updated",
         "agent.stopped" | "step.ended" | "task.completed" => "task.completed",
         _ => event_type,
     }

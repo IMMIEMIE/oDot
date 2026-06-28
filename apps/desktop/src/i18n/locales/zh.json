@@ -269,7 +269,11 @@
     "progress": "步骤 {{completed}} / {{total}}",
     "waiting": "等待 TodoWrite",
     "count": "{{count}} 个任务",
-    "planExit": "请求执行计划"
+    "planExit": "请求执行计划",
+    "planDocument": "计划文档",
+    "noPlanDocument": "尚未保存计划文档",
+    "openInFileManager": "在文件系统中打开",
+    "waitingForTodoWrite": "等待执行器调用 todo_write 后显示完整任务列表。"
   },
   "context": {
     "usage": "上下文 {{percent}}% · {{source}}",

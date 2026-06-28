@@ -445,6 +445,13 @@ pub struct PersistPlanInput {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RevealPathInput {
+    pub session_id: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RecoverSessionInput {
     pub session_id: String,
     pub checkpoint_id: Option<String>,

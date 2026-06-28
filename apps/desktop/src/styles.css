@@ -198,7 +198,8 @@ button:focus-visible {
   position: relative;
   border-right: 0;
   border-left: 1px solid var(--border);
-  overflow: visible;
+  overflow-x: hidden;
+  overflow-y: auto;
   box-shadow:
     -10px 0 30px rgba(20, 35, 31, 0.05),
     var(--inset-line);
@@ -2158,6 +2159,14 @@ pre {
   background: rgba(255, 255, 255, 0.22);
 }
 
+.stopIconSolid {
+  width: 13px;
+  height: 13px;
+  border-radius: 3px;
+  background: currentColor;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.16) inset;
+}
+
 .rightSection {
   background:
     linear-gradient(180deg, var(--surface-elevated), var(--surface));
@@ -2166,20 +2175,16 @@ pre {
 
 .planExecutionDock {
   min-height: 0;
+  max-height: min(46vh, 360px);
   display: grid;
-  gap: 10px;
+  grid-template-rows: auto auto auto;
+  gap: 12px;
   padding: 14px;
   border-top: 0;
   border-bottom: 1px solid var(--border);
-  background:
-    linear-gradient(180deg, var(--accent-softer), transparent 34%),
-    linear-gradient(180deg, var(--surface-elevated), var(--surface));
+  background: linear-gradient(180deg, var(--surface-elevated), var(--surface));
   box-shadow: var(--inset-line);
-  transition: max-height 0.2s ease;
-}
-
-.planExecutionDock.expanded {
-  max-height: none;
+  overflow: hidden;
 }
 
 .planExecutionHeader {
@@ -2189,15 +2194,7 @@ pre {
   justify-content: space-between;
   gap: 12px;
   padding: 0;
-  border: 0;
-  background: transparent;
   color: inherit;
-  cursor: pointer;
-  text-align: left;
-}
-
-.planExecutionHeader:hover .planExecutionTitle strong {
-  color: var(--accent);
 }
 
 .planExecutionTitle {
@@ -2206,6 +2203,13 @@ pre {
   align-items: center;
   gap: 8px;
   color: var(--ink);
+}
+
+.planExecutionTitle strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .planExecutionTitle span {
@@ -2238,18 +2242,75 @@ pre {
   color: var(--red);
 }
 
-.planExecutionHeader small {
-  flex: 0 1 auto;
-  color: var(--muted);
+.planDocumentCard {
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--inset-line);
   overflow: hidden;
+}
+
+.planDocumentHeader {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.planDocumentHeader > div {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.planDocumentHeader strong {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.planDocumentHeader code {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.iconTextButton.compact {
+  flex: 0 0 auto;
+  min-height: 28px;
+  padding: 0 7px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.iconTextButton.compact span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.inlineError {
+  color: var(--danger-text);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
 .planTodoBlock {
   display: grid;
-  gap: 8px;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 10px;
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .planTodoProgressRow {
@@ -2284,196 +2345,89 @@ pre {
   transition: width 0.24s ease;
 }
 
-.planTodoActive {
+.planTimeline {
+  list-style: none;
+  margin: 0;
+  padding: 2px 8px 0 0;
   min-width: 0;
-  display: grid;
-  grid-template-columns: 14px minmax(0, 1fr);
-  align-items: center;
-  gap: 7px;
-  padding: 8px;
-  border: 1px solid var(--accent-border);
-  border-radius: 8px;
-  color: var(--ink);
-  background: var(--accent-soft);
-  box-shadow: var(--inset-line);
-  font-size: 12px;
-}
-
-.planTodoActive span:last-child {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.todoStatusDot {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  background: var(--muted);
-}
-
-.todoStatusDot.in_progress {
-  background: var(--amber);
-}
-
-.todoStatusDot.completed {
-  background: var(--green);
-}
-
-.todoStatusDot.cancelled {
-  background: var(--red);
-}
-
-.planTodoList {
-  min-width: 0;
-  max-height: 180px;
+  min-height: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   display: grid;
-  gap: 4px;
+  gap: 0;
+  scrollbar-gutter: stable;
 }
 
-.planTodoItem {
+.planTimelineItem {
   min-width: 0;
   display: grid;
-  grid-template-columns: 18px minmax(0, 1fr);
-  align-items: start;
-  gap: 7px;
-  padding: 6px 7px;
-  border-radius: 7px;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: 8px;
+  position: relative;
+  padding: 0 0 14px;
   color: var(--text-soft);
   font-size: 12px;
 }
 
-.planTodoItem span:last-child {
+.planTimelineItem:not(:last-child)::before {
+  content: "";
+  position: absolute;
+  left: 10px;
+  top: 22px;
+  bottom: 0;
+  width: 1px;
+  background: var(--border);
+}
+
+.planTimelineMarker {
+  width: 21px;
+  height: 21px;
+  display: grid;
+  place-items: center;
+  position: relative;
+  z-index: 1;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--muted);
+}
+
+.planTimelineContent {
   min-width: 0;
+  padding-top: 2px;
+  line-height: 1.45;
   overflow-wrap: anywhere;
 }
 
-.planTodoItem.in_progress {
+.planTimelineItem.in_progress {
   color: var(--warning-text);
-  background: var(--warning-soft);
 }
 
-.planTodoItem.completed {
+.planTimelineItem.in_progress .planTimelineMarker {
+  border-color: color-mix(in srgb, var(--warning-text) 44%, var(--border));
+  background: var(--warning-soft);
+  color: var(--warning-text);
+}
+
+.planTimelineItem.completed {
   color: var(--success-text);
 }
 
-.planTodoItem.cancelled {
+.planTimelineItem.completed .planTimelineMarker {
+  border-color: color-mix(in srgb, var(--success-text) 44%, var(--border));
+  background: var(--success-soft);
+  color: var(--success-text);
+}
+
+.planTimelineItem.cancelled {
   color: var(--danger-text);
   text-decoration: line-through;
 }
 
-.todoStatusIcon {
-  width: 18px;
-  height: 18px;
-  display: grid;
-  place-items: center;
-}
-
-.executionSummary {
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.executionSummary span {
-  flex: 0 0 auto;
-  min-height: 24px;
-  padding: 0 8px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  color: var(--text-soft);
-  background: var(--surface);
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 12px;
-  box-shadow: var(--inset-line);
-}
-
-.dockDetailList {
-  min-height: 0;
-  max-height: 240px;
-  overflow-y: auto;
-  display: grid;
-  gap: 2px;
-  padding-top: 6px;
-  border-top: 1px solid var(--border);
-}
-
-.dockDetailItem {
-  min-height: 28px;
-  display: grid;
-  grid-template-columns: 20px auto minmax(0, 1fr);
-  align-items: center;
-  gap: 8px;
-  padding: 2px 6px;
-  border-radius: 5px;
-  font-size: 12px;
-}
-
-.dockDetailItem:hover {
-  background: var(--surface-soft);
-}
-
-.dockDetailItem.empty {
-  display: block;
-  text-align: center;
-  color: var(--muted);
-  padding: 8px 0;
-}
-
-.dockStatus {
-  width: 20px;
-  height: 20px;
-  display: grid;
-  place-items: center;
-  border-radius: 50%;
-}
-
-.dockDetailItem.success .dockStatus {
-  color: var(--green);
-}
-
-.dockDetailItem.failed .dockStatus {
-  color: var(--red);
-}
-
-.dockDetailItem.pending .dockStatus {
-  color: var(--amber);
-}
-
-.dockDetailItem.running .dockStatus {
-  color: var(--accent);
-}
-
-.dockLabel {
-  font-weight: 650;
-  color: var(--text-soft);
-  white-space: nowrap;
-}
-
-.dockTarget {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--muted);
-  font-family:
-    "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  font-size: 11px;
-}
-
-.dockError {
-  grid-column: 2 / -1;
-  color: var(--red);
-  font-size: 11px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.planTimelineItem.cancelled .planTimelineMarker {
+  border-color: color-mix(in srgb, var(--danger-text) 44%, var(--border));
+  background: var(--danger-soft);
+  color: var(--danger-text);
 }
 
 .errorSection {
@@ -2943,12 +2897,6 @@ pre {
   color: var(--danger-text);
 }
 
-:root[data-theme="dark"] .executionSummary span {
-  color: var(--text-soft);
-  background: var(--surface-soft);
-  border-color: var(--border-strong);
-}
-
 :root[data-theme="dark"] .errorDetails {
   color: var(--danger-text);
   background: var(--danger-soft);
@@ -3110,6 +3058,33 @@ pre {
   }
 }
 
+@media (max-width: 460px) {
+  .planExecutionDock {
+    max-height: min(42vh, 330px);
+    gap: 10px;
+    padding: 12px;
+  }
+
+  .planDocumentHeader {
+    gap: 6px;
+  }
+
+  .planDocumentHeader .iconTextButton.compact {
+    width: 30px;
+    min-width: 30px;
+    padding: 0;
+  }
+
+  .planDocumentHeader .iconTextButton.compact span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+}
+
 /* ===== 悬浮球模式 ===== */
 
 html.float-window {
@@ -3260,6 +3235,81 @@ body.float-window-body {
   animation: floatCheckReveal 1.8s ease-out both;
 }
 
+.floatCompletionBubble {
+  position: absolute;
+  top: 50%;
+  width: 260px;
+  max-width: min(260px, calc(50vw - 42px));
+  padding: 10px 11px 11px;
+  border: 1px solid color-mix(in srgb, var(--accent-border) 58%, var(--border));
+  border-radius: 8px;
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--surface) 94%, var(--accent-soft)), var(--surface));
+  color: var(--ink);
+  box-shadow:
+    0 18px 48px rgba(15, 23, 42, 0.24),
+    0 0 0 1px rgba(255, 255, 255, 0.46) inset;
+  pointer-events: none;
+  z-index: 28;
+}
+
+.floatCompletionBubble::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  width: 10px;
+  height: 10px;
+  border: inherit;
+  border-right: 0;
+  border-bottom: 0;
+  background: inherit;
+}
+
+.floatCompletionBubble--right {
+  left: calc(50% + 38px);
+  transform-origin: left center;
+  animation: floatCompletionBubbleRight 4.8s cubic-bezier(0.18, 0.84, 0.22, 1) both;
+}
+
+.floatCompletionBubble--right::before {
+  left: -6px;
+  transform: translateY(-50%) rotate(-45deg);
+}
+
+.floatCompletionBubble--left {
+  right: calc(50% + 38px);
+  transform-origin: right center;
+  animation: floatCompletionBubbleLeft 4.8s cubic-bezier(0.18, 0.84, 0.22, 1) both;
+}
+
+.floatCompletionBubble--left::before {
+  right: -6px;
+  transform: translateY(-50%) rotate(135deg);
+}
+
+.floatCompletionBubbleHeader {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 5px;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0;
+}
+
+.floatCompletionBubble p {
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  margin: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
 .floatBall:hover:not(.floatBall--dragging) {
   box-shadow:
     0 0 0 1px var(--float-ball-ring),
@@ -3390,6 +3440,56 @@ body.float-window-body {
   100% {
     opacity: 0;
     transform: scale(0.78) rotate(0deg);
+  }
+}
+
+@keyframes floatCompletionBubbleRight {
+  0% {
+    opacity: 0;
+    transform: translate(-12px, -50%) scale(0.94);
+    filter: blur(2px);
+  }
+
+  12% {
+    opacity: 1;
+    transform: translate(0, -50%) scale(1);
+    filter: blur(0);
+  }
+
+  78% {
+    opacity: 1;
+    transform: translate(0, -50%) scale(1);
+  }
+
+  100% {
+    opacity: 0;
+    transform: translate(10px, -50%) scale(0.98);
+    filter: blur(1px);
+  }
+}
+
+@keyframes floatCompletionBubbleLeft {
+  0% {
+    opacity: 0;
+    transform: translate(12px, -50%) scale(0.94);
+    filter: blur(2px);
+  }
+
+  12% {
+    opacity: 1;
+    transform: translate(0, -50%) scale(1);
+    filter: blur(0);
+  }
+
+  78% {
+    opacity: 1;
+    transform: translate(0, -50%) scale(1);
+  }
+
+  100% {
+    opacity: 0;
+    transform: translate(-10px, -50%) scale(0.98);
+    filter: blur(1px);
   }
 }
 

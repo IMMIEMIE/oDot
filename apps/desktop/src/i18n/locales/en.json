@@ -269,7 +269,11 @@
     "progress": "Steps {{completed}} / {{total}}",
     "waiting": "Waiting for TodoWrite",
     "count": "{{count}} tasks",
-    "planExit": "Request plan execution"
+    "planExit": "Request plan execution",
+    "planDocument": "Plan document",
+    "noPlanDocument": "No saved plan document yet",
+    "openInFileManager": "Open in file system",
+    "waitingForTodoWrite": "Waiting for the executor to call todo_write and publish the task list."
   },
   "context": {
     "usage": "Context {{percent}}% · {{source}}",

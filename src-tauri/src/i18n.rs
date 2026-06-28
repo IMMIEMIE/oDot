@@ -40,12 +40,10 @@ pub fn user_uploaded_attachments_header() -> &'static str {
 
 pub fn attachment_file_template(name: &str, mime: &str, size: u64, content: &str) -> String {
     match app_locale() {
-        AppLocale::Zh => format!(
-            "附件文件: {name}\nMIME: {mime}\n大小: {size} bytes\n\n{content}"
-        ),
-        AppLocale::En => format!(
-            "Attachment file: {name}\nMIME: {mime}\nSize: {size} bytes\n\n{content}"
-        ),
+        AppLocale::Zh => format!("附件文件: {name}\nMIME: {mime}\n大小: {size} bytes\n\n{content}"),
+        AppLocale::En => {
+            format!("Attachment file: {name}\nMIME: {mime}\nSize: {size} bytes\n\n{content}")
+        }
     }
 }
 
@@ -201,7 +199,11 @@ pub fn no_recoverable_checkpoint() -> String {
 }
 
 pub fn checkpoint_wrong_session() -> String {
-    pick("检查点不属于当前会话。", "Checkpoint does not belong to this session.").to_string()
+    pick(
+        "检查点不属于当前会话。",
+        "Checkpoint does not belong to this session.",
+    )
+    .to_string()
 }
 
 pub fn ai_request_failed() -> String {

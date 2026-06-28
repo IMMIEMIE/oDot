@@ -2,7 +2,7 @@ use crate::{
     config_file,
     error_model::AppErrorInfo,
     llm_runtime::{sanitize_assistant_content, LlmStreamEvent},
-    provider, storage, tools,
+    provider, session_coordinator, storage, task_registry, tools,
     types::{
         AgentMode, ContextSummaryRecord, EventRecord, ModelTurn, PromptAttachment,
         PromptAttachmentKind, PromptSessionInput, ProviderPricing, ProviderRequestConfig,
@@ -10,6 +10,7 @@ use crate::{
     },
     util,
 };
+use futures_util::future::{select, Either};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::{
@@ -21,7 +22,8 @@ use std::{
 use tauri::AppHandle;
 use tokio::time::sleep;
 
-const MAX_STEPS: usize = 25;
+const STEP_CHECKPOINT_INTERVAL: usize = 25;
+const MAX_TOTAL_STEPS: usize = 250;
 const MAX_CONTEXT_EVENT_LIMIT: usize = 2_000;
 const RECENT_EVENT_CHAR_BUDGET: usize = 48_000;
 const RECENT_EVENT_MIN_KEEP: usize = 12;
@@ -33,6 +35,8 @@ const STREAM_DELTA_FLUSH_CHARS: usize = 96;
 const STREAM_DELTA_FLUSH_MS: u64 = 120;
 const LLM_RETRY_ATTEMPTS: usize = 3;
 const LLM_RETRY_BASE_DELAY_MS: u64 = 350;
+const BACKGROUND_TASK_STARTED: &str = "The task is running in the background. You will be notified automatically when it finishes. Continue only with work that does not duplicate that task.";
+const BACKGROUND_TASK_UPDATED: &str = "Additional context was sent to the running background task. You will be notified automatically when it finishes. Continue only with work that does not duplicate that task.";
 
 pub async fn submit_prompt(
     app: &AppHandle,
@@ -80,13 +84,39 @@ pub async fn prompt_session(
     )?;
 
     if admitted.resume {
-        resume_session(app, conn, admitted.session_id).await
+        wake_session(app, conn, admitted.session_id).await
     } else {
         storage::session_events_response(conn, &admitted.session_id)
     }
 }
 
+async fn wake_session(
+    app: &AppHandle,
+    conn: &Connection,
+    session_id: String,
+) -> Result<SessionEventsResponse, String> {
+    let lock_session_id = session_id.clone();
+    session_coordinator::with_session_lock(
+        &lock_session_id,
+        wake_session_unlocked(app, conn, session_id),
+    )
+    .await
+}
+
 pub async fn continue_session(
+    app: &AppHandle,
+    conn: &Connection,
+    session_id: String,
+) -> Result<SessionEventsResponse, String> {
+    let lock_session_id = session_id.clone();
+    session_coordinator::with_session_lock(
+        &lock_session_id,
+        continue_session_unlocked(app, conn, session_id),
+    )
+    .await
+}
+
+async fn continue_session_unlocked(
     app: &AppHandle,
     conn: &Connection,
     session_id: String,
@@ -130,19 +160,103 @@ pub async fn resume_session(
     conn: &Connection,
     session_id: String,
 ) -> Result<SessionEventsResponse, String> {
-    let run = storage::begin_session_run(conn, &session_id)?;
+    let lock_session_id = session_id.clone();
+    session_coordinator::with_session_lock(
+        &lock_session_id,
+        resume_session_unlocked(app, conn, session_id),
+    )
+    .await
+}
+
+pub async fn wake_pending_session(
+    app: &AppHandle,
+    conn: &Connection,
+    session_id: String,
+) -> Result<SessionEventsResponse, String> {
+    wake_session(app, conn, session_id).await
+}
+
+pub fn promote_task(
+    conn: &Connection,
+    parent_session_id: &str,
+    child_session_id: &str,
+) -> Result<SessionEventsResponse, String> {
+    let child = storage::get_session(conn, child_session_id)?;
+    if child.parent_session_id.as_deref() != Some(parent_session_id) {
+        return Err("任务不属于当前父会话。".to_string());
+    }
+
+    let already_background = storage::list_background_jobs(conn, parent_session_id)?
+        .iter()
+        .any(|job| {
+            job.command == task_registry::task_command(child_session_id) && job.status == "running"
+        });
+    if already_background {
+        return storage::session_events_response(conn, parent_session_id);
+    }
+
+    storage::append_event(
+        conn,
+        parent_session_id,
+        "task.promote.requested",
+        json!({
+            "sessionId": child_session_id
+        }),
+    )?;
+    if !task_registry::promote(child_session_id) {
+        return Err("任务当前不可切到后台，可能已经完成或不在前台等待。".to_string());
+    }
+
+    storage::session_events_response(conn, parent_session_id)
+}
+
+async fn wake_session_unlocked(
+    app: &AppHandle,
+    conn: &Connection,
+    session_id: String,
+) -> Result<SessionEventsResponse, String> {
+    let mut last_response = None;
+    loop {
+        if storage::next_pending_session_input(conn, &session_id)?.is_none() {
+            return match last_response {
+                Some(response) => Ok(response),
+                None => storage::session_events_response(conn, &session_id),
+            };
+        }
+
+        let response =
+            run_session_from_pending_input(app, conn, &session_id, "wake_session").await?;
+        last_response = Some(response);
+    }
+}
+
+async fn resume_session_unlocked(
+    app: &AppHandle,
+    conn: &Connection,
+    session_id: String,
+) -> Result<SessionEventsResponse, String> {
+    run_session_from_pending_input(app, conn, &session_id, "resume_session").await
+}
+
+async fn run_session_from_pending_input(
+    app: &AppHandle,
+    conn: &Connection,
+    session_id: &str,
+    reason: &str,
+) -> Result<SessionEventsResponse, String> {
+    let run = storage::begin_session_run(conn, session_id)?;
     storage::save_session_checkpoint(
         conn,
-        &session_id,
+        session_id,
         Some(&run.id),
         "run.started",
         None,
         "running",
         json!({
-            "reason": "resume_session"
+            "reason": reason
         }),
     )?;
-    let result = resume_session_inner(app, conn, &session_id, Some(&run.id)).await;
+    let result = resume_session_inner(app, conn, session_id, Some(&run.id)).await;
     let status = if result.is_ok() {
         "completed"
     } else {
@@ -150,12 +264,77 @@ pub async fn resume_session(
     };
     let _ = storage::end_session_run(conn, &run.id, status);
     if let Err(error) = &result {
-        let _ = record_agent_failure(conn, &session_id, Some(&run.id), error);
+        let _ = record_agent_failure(conn, session_id, Some(&run.id), error);
     }
     result
 }
 
+pub fn prepare_durable_recovery(conn: &Connection) -> Result<Vec<String>, String> {
+    for run in storage::list_running_session_runs(conn)? {
+        storage::append_event(
+            conn,
+            &run.session_id,
+            "run.orphaned",
+            json!({
+                "runId": run.id,
+                "startedAt": run.started_at
+            }),
+        )?;
+    }
+    storage::orphan_running_session_runs(conn)?;
+
+    for job in storage::list_running_background_jobs(conn)? {
+        if !task_registry::is_task_command(&job.command) {
+            continue;
+        }
+        storage::update_background_job_status(conn, &job.id, "orphaned")?;
+        let child_session_id = task_registry::task_session_id(&job.command).unwrap_or("");
+        storage::append_event(
+            conn,
+            &job.session_id,
+            "task.orphaned",
+            json!({
+                "jobId": job.id,
+                "command": job.command,
+                "sessionId": child_session_id,
+                "startedAt": job.started_at
+            }),
+        )?;
+        let prompt = render_background_task_prompt(
+            child_session_id,
+            "Recovered background task",
+            "error",
+            "The app restarted while this background task was running. Its in-memory worker was lost, so the task has been marked orphaned. Inspect the child session if you need to recover its last durable state, then continue with the safest next step.",
+        );
+        storage::admit_session_input(
+            conn,
+            None,
+            &job.session_id,
+            &prompt,
+            &[],
+            SessionInputDelivery::Queue,
+            true,
+        )?;
+    }
+
+    storage::list_session_ids_with_pending_input(conn)
+}
+
 pub async fn recover_session_from_checkpoint(
+    app: &AppHandle,
+    conn: &Connection,
+    session_id: String,
+    checkpoint_id: Option<String>,
+) -> Result<SessionEventsResponse, String> {
+    let lock_session_id = session_id.clone();
+    session_coordinator::with_session_lock(
+        &lock_session_id,
+        recover_session_from_checkpoint_unlocked(app, conn, session_id, checkpoint_id),
+    )
+    .await
+}
+
+async fn recover_session_from_checkpoint_unlocked(
     app: &AppHandle,
     conn: &Connection,
     session_id: String,
@@ -267,7 +446,9 @@ async fn run_session_steps(
     current_prompt: &str,
     run_id: Option<&str>,
 ) -> Result<SessionEventsResponse, String> {
-    for step_index in 1..=MAX_STEPS {
+    let mut current_prompt = current_prompt.to_string();
+    let mut step_index = 1;
+    while step_index <= MAX_TOTAL_STEPS {
         storage::append_event(
             conn,
             &session.id,
@@ -340,7 +521,7 @@ async fn run_session_steps(
                 conn,
                 &session.id,
                 &stream_system_prompt,
-                current_prompt,
+                &current_prompt,
                 &request_config,
             )?;
             match stream_openai_compatible_with_retry(
@@ -372,7 +553,7 @@ async fn run_session_steps(
             }
         } else {
             let user_prompt =
-                build_user_prompt(conn, &session.id, current_prompt, &request_config)?;
+                build_user_prompt(conn, &session.id, &current_prompt, &request_config)?;
             let completion = match complete_with_retry(
                 conn,
                 &session.id,
@@ -504,6 +685,11 @@ async fn run_session_steps(
                 if has_pending {
                     break;
                 }
+                if should_continue_after_step_checkpoint(step_index, has_pending) {
+                    current_prompt = step_checkpoint_continuation_prompt(step_index);
+                    step_index += 1;
+                    continue;
+                }
             }
             AgentMode::Plan => {
                 if turn.tool_calls.is_empty() {
@@ -551,6 +737,11 @@ async fn run_session_steps(
                 if has_pending {
                     break;
                 }
+                if should_continue_after_step_checkpoint(step_index, has_pending) {
+                    current_prompt = step_checkpoint_continuation_prompt(step_index);
+                    step_index += 1;
+                    continue;
+                }
             }
             AgentMode::Agent => {
                 if turn.tool_calls.is_empty() {
@@ -588,11 +779,51 @@ async fn run_session_steps(
                 if has_pending {
                     break;
                 }
+                if should_continue_after_step_checkpoint(step_index, has_pending) {
+                    current_prompt = step_checkpoint_continuation_prompt(step_index);
+                    step_index += 1;
+                    continue;
+                }
             }
         }
+
+        step_index += 1;
+    }
+
+    if step_index > MAX_TOTAL_STEPS {
+        let error = max_total_steps_error();
+        storage::append_event(
+            conn,
+            &session.id,
+            "step.failed",
+            json!({
+                "step": MAX_TOTAL_STEPS,
+                "error": error
+            }),
+        )?;
+        return Err(error);
     }
 
     Ok(storage::session_events_response(conn, &session.id)?)
+}
+
+fn should_continue_after_step_checkpoint(step_index: usize, has_pending: bool) -> bool {
+    step_index > 0
+        && step_index < MAX_TOTAL_STEPS
+        && step_index % STEP_CHECKPOINT_INTERVAL == 0
+        && !has_pending
+}
+
+fn step_checkpoint_continuation_prompt(step_index: usize) -> String {
+    format!(
+        "You have reached step checkpoint {step_index}. Inspect the latest tool result and decide whether the user's request is complete. If it is complete, provide the final user-facing answer now. If it is not complete, continue working with the next needed tool call. Do not repeat already completed work."
+    )
+}
+
+fn max_total_steps_error() -> String {
+    format!(
+        "Reached the maximum total step budget ({MAX_TOTAL_STEPS}) without completing the request."
+    )
 }
 
 fn save_step_checkpoint(
@@ -832,14 +1063,25 @@ async fn execute_agent_turn_tools(
     let mut task_runs = Vec::new();
     for call in calls {
         if normalize_tool_name(&call.name) == "task" {
-            task_runs.push(start_task_tool(app, conn, session, call)?);
+            let task = start_task_tool(app, conn, session, call)?;
+            if task_background(&call.input) {
+                if let Some(job) = running_background_task_job(conn, &session.id, &task.child_id)? {
+                    mark_task_tool_background_updated(conn, &session.id, &task, &job.id)?;
+                    detach_task_extension(task);
+                } else {
+                    let job_id = mark_task_tool_background_started(conn, &session.id, &task)?;
+                    detach_task_tool(app.clone(), session.id.clone(), task, job_id);
+                }
+            } else {
+                task_runs.push(task);
+            }
         } else {
             let outcome = tools::execute_tool(conn, session, &session.shell_mode, call)?;
             has_pending |= outcome.pending;
         }
     }
     for task in task_runs {
-        let outcome = finish_task_tool(conn, &session.id, task).await?;
+        let outcome = finish_task_tool(app, conn, &session.id, task).await?;
         has_pending |= outcome.pending;
     }
     Ok(has_pending)
@@ -852,7 +1094,17 @@ async fn execute_task_tool(
     call: &ToolCallRequest,
 ) -> Result<tools::ToolOutcome, String> {
     let task = start_task_tool(app, conn, session, call)?;
-    finish_task_tool(conn, &session.id, task).await
+    if task_background(&call.input) {
+        if let Some(job) = running_background_task_job(conn, &session.id, &task.child_id)? {
+            mark_task_tool_background_updated(conn, &session.id, &task, &job.id)?;
+            detach_task_extension(task);
+        } else {
+            let job_id = mark_task_tool_background_started(conn, &session.id, &task)?;
+            detach_task_tool(app.clone(), session.id.clone(), task, job_id);
+        }
+        return Ok(tools::ToolOutcome { pending: false });
+    }
+    finish_task_tool(app, conn, &session.id, task).await
 }
 
 fn start_task_tool(
@@ -866,8 +1118,17 @@ fn start_task_tool(
     let prompt = task_string(&call.input, &["prompt", "task"])?;
     let subagent_type = task_string(&call.input, &["subagent_type", "subagentType"])
         .unwrap_or_else(|_| "general".to_string());
-    let child_title = format!("{description} (@{subagent_type} subagent)");
-    let child = storage::create_child_session(conn, session, &child_title)?;
+    let requested_child_id = task_optional_string(&call.input, &["task_id", "taskId"]);
+    let child = if let Some(child_id) = requested_child_id {
+        let child = storage::get_session(conn, &child_id)?;
+        if child.parent_session_id.as_deref() != Some(session.id.as_str()) {
+            return Err("task_id 不属于当前父会话。".to_string());
+        }
+        child
+    } else {
+        let child_title = format!("{description} (@{subagent_type} subagent)");
+        storage::create_child_session(conn, session, &child_title)?
+    };
     let called = storage::append_event(
         conn,
         &session.id,
@@ -886,7 +1147,13 @@ fn start_task_tool(
     storage::append_event(
         conn,
         &session.id,
-        "task.created",
+        if child.parent_session_id.as_deref() == Some(session.id.as_str())
+            && task_optional_string(&call.input, &["task_id", "taskId"]).is_some()
+        {
+            "task.resumed"
+        } else {
+            "task.created"
+        },
         json!({
             "toolCallEventId": called.id,
             "sessionId": child.id,
@@ -926,11 +1193,26 @@ fn start_task_tool(
 }
 
 async fn finish_task_tool(
+    app: &AppHandle,
     conn: &Connection,
     parent_session_id: &str,
-    task: TaskRun,
+    mut task: TaskRun,
 ) -> Result<tools::ToolOutcome, String> {
-    let result = task.handle.await.map_err(|error| error.to_string())?;
+    let child_id = task.child_id.clone();
+    let (promote_sender, promote_receiver) = tokio::sync::oneshot::channel();
+    task_registry::register_promotable(&child_id, promote_sender);
+
+    let result = match select(&mut task.handle, promote_receiver).await {
+        Either::Left((result, _)) => {
+            task_registry::unregister_promotable(&child_id);
+            result.map_err(|error| error.to_string())?
+        }
+        Either::Right((_promoted, _)) => {
+            let job_id = mark_task_tool_background_started(conn, parent_session_id, &task)?;
+            detach_task_tool(app.clone(), parent_session_id.to_string(), task, job_id);
+            return Ok(tools::ToolOutcome { pending: false });
+        }
+    };
 
     match result {
         Ok(response) => {
@@ -1000,6 +1282,283 @@ async fn finish_task_tool(
     Ok(tools::ToolOutcome { pending: false })
 }
 
+fn mark_task_tool_background_started(
+    conn: &Connection,
+    parent_session_id: &str,
+    task: &TaskRun,
+) -> Result<String, String> {
+    let parent = storage::get_session(conn, parent_session_id)?;
+    let job = storage::insert_background_job(
+        conn,
+        parent_session_id,
+        &task_registry::task_command(&task.child_id),
+        &parent.project_root,
+        0,
+        None,
+    )?;
+    storage::append_event(
+        conn,
+        parent_session_id,
+        "tool.success",
+        json!({
+            "toolCallEventId": task.called_event_id,
+            "name": task.call_name,
+            "result": {
+                "taskId": task.child_id,
+                "sessionId": task.child_id,
+                "jobId": job.id,
+                "description": task.description,
+                "subagentType": task.subagent_type,
+                "status": "running",
+                "background": true,
+                "output": BACKGROUND_TASK_STARTED
+            }
+        }),
+    )?;
+    storage::append_event(
+        conn,
+        parent_session_id,
+        "task.background.started",
+        json!({
+            "toolCallEventId": task.called_event_id,
+            "sessionId": task.child_id,
+            "jobId": job.id,
+            "description": task.description,
+            "subagentType": task.subagent_type
+        }),
+    )?;
+    task_registry::register(&job.id);
+    Ok(job.id)
+}
+
+fn mark_task_tool_background_updated(
+    conn: &Connection,
+    parent_session_id: &str,
+    task: &TaskRun,
+    job_id: &str,
+) -> Result<(), String> {
+    storage::append_event(
+        conn,
+        parent_session_id,
+        "tool.success",
+        json!({
+            "toolCallEventId": task.called_event_id,
+            "name": task.call_name,
+            "result": {
+                "taskId": task.child_id,
+                "sessionId": task.child_id,
+                "jobId": job_id,
+                "description": task.description,
+                "subagentType": task.subagent_type,
+                "status": "running",
+                "background": true,
+                "updated": true,
+                "output": BACKGROUND_TASK_UPDATED
+            }
+        }),
+    )?;
+    storage::append_event(
+        conn,
+        parent_session_id,
+        "task.background.updated",
+        json!({
+            "toolCallEventId": task.called_event_id,
+            "sessionId": task.child_id,
+            "jobId": job_id,
+            "description": task.description,
+            "subagentType": task.subagent_type
+        }),
+    )?;
+    Ok(())
+}
+
+fn running_background_task_job(
+    conn: &Connection,
+    parent_session_id: &str,
+    child_session_id: &str,
+) -> Result<Option<crate::types::BackgroundJobRecord>, String> {
+    let command = task_registry::task_command(child_session_id);
+    Ok(storage::list_background_jobs(conn, parent_session_id)?
+        .into_iter()
+        .find(|job| job.command == command && job.status == "running"))
+}
+
+fn detach_task_extension(task: TaskRun) {
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = task
+            .handle
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|inner| inner.map(|_| ()))
+        {
+            log::error!("background task extension failed: {error}");
+        }
+    });
+}
+
+fn detach_task_tool(app: AppHandle, parent_session_id: String, task: TaskRun, job_id: String) {
+    tauri::async_runtime::spawn(async move {
+        let called_event_id = task.called_event_id.clone();
+        let call_name = task.call_name.clone();
+        let child_id = task.child_id.clone();
+        let description = task.description.clone();
+        let subagent_type = task.subagent_type.clone();
+        let result = task.handle.await.map_err(|error| error.to_string());
+        task_registry::unregister(&job_id);
+        let app_for_finish = app.clone();
+        let finish = tauri::async_runtime::spawn_blocking(move || {
+            let conn = storage::open_db(&app_for_finish)?;
+            let notification = finish_background_task_tool(
+                &conn,
+                &parent_session_id,
+                TaskCompletion {
+                    called_event_id,
+                    call_name,
+                    child_id,
+                    description,
+                    subagent_type,
+                    job_id,
+                    result,
+                },
+            )?;
+            if let Some(prompt) = notification {
+                tauri::async_runtime::block_on(prompt_session(
+                    &app_for_finish,
+                    &conn,
+                    PromptSessionInput {
+                        id: None,
+                        session_id: parent_session_id,
+                        prompt,
+                        attachments: Vec::new(),
+                        delivery: Some(SessionInputDelivery::Queue),
+                        resume: true,
+                    },
+                ))
+                .map(|_| ())?;
+            }
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|inner| inner);
+        if let Err(error) = finish {
+            log::error!("background task completion failed: {error}");
+        }
+    });
+}
+
+struct TaskCompletion {
+    called_event_id: String,
+    call_name: String,
+    child_id: String,
+    description: String,
+    subagent_type: String,
+    job_id: String,
+    result: Result<Result<SessionEventsResponse, String>, String>,
+}
+
+fn finish_background_task_tool(
+    conn: &Connection,
+    parent_session_id: &str,
+    task: TaskCompletion,
+) -> Result<Option<String>, String> {
+    match task.result {
+        Ok(Ok(response)) => {
+            let output = task_output_text(&response);
+            let cancelled = storage::get_background_job(conn, &task.job_id)
+                .map(|job| job.status == "cancelled")
+                .unwrap_or(false);
+            if cancelled {
+                storage::set_session_status(conn, &task.child_id, "cancelled")?;
+                storage::append_event(
+                    conn,
+                    parent_session_id,
+                    "task.failed",
+                    json!({
+                        "toolCallEventId": task.called_event_id,
+                        "name": task.call_name,
+                        "sessionId": task.child_id,
+                        "jobId": task.job_id,
+                        "description": task.description,
+                        "subagentType": task.subagent_type,
+                        "status": "cancelled",
+                        "background": true,
+                        "cancelled": true,
+                        "output": output
+                    }),
+                )?;
+                return Ok(None);
+            }
+            storage::update_background_job_status(conn, &task.job_id, "completed")?;
+            storage::set_session_status(conn, &task.child_id, "completed")?;
+            storage::append_event(
+                conn,
+                parent_session_id,
+                "task.completed",
+                json!({
+                    "toolCallEventId": task.called_event_id,
+                    "sessionId": task.child_id,
+                    "jobId": task.job_id,
+                    "description": task.description,
+                    "subagentType": task.subagent_type,
+                    "background": true,
+                    "output": output
+                }),
+            )?;
+            Ok(Some(render_background_task_prompt(
+                &task.child_id,
+                &task.description,
+                "completed",
+                &output,
+            )))
+        }
+        Ok(Err(error)) | Err(error) => {
+            let cancelled = storage::get_background_job(conn, &task.job_id)
+                .map(|job| job.status == "cancelled")
+                .unwrap_or(false);
+            let status = if cancelled { "cancelled" } else { "failed" };
+            if !cancelled {
+                storage::update_background_job_status(conn, &task.job_id, status)?;
+            }
+            storage::set_session_status(conn, &task.child_id, status)?;
+            storage::append_event(
+                conn,
+                parent_session_id,
+                "task.failed",
+                json!({
+                    "toolCallEventId": task.called_event_id,
+                    "name": task.call_name,
+                    "sessionId": task.child_id,
+                    "jobId": task.job_id,
+                    "description": task.description,
+                    "subagentType": task.subagent_type,
+                    "status": status,
+                    "background": true,
+                    "cancelled": cancelled,
+                    "error": error
+                }),
+            )?;
+            Ok(Some(render_background_task_prompt(
+                &task.child_id,
+                &task.description,
+                status,
+                &error,
+            )))
+        }
+    }
+}
+
+fn render_background_task_prompt(
+    session_id: &str,
+    description: &str,
+    state: &str,
+    text: &str,
+) -> String {
+    format!(
+        "<task id=\"{session_id}\" state=\"{state}\">\n<summary>Background task {state}: {description}</summary>\n<task_result>\n{text}\n</task_result>\n</task>"
+    )
+}
+
 fn task_string(input: &Value, keys: &[&str]) -> Result<String, String> {
     for key in keys {
         if let Some(value) = input.get(*key).and_then(Value::as_str) {
@@ -1010,6 +1569,22 @@ fn task_string(input: &Value, keys: &[&str]) -> Result<String, String> {
         }
     }
     Err(format!("task 缺少必填字段: {}", keys[0]))
+}
+
+fn task_optional_string(input: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| input.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn task_background(input: &Value) -> bool {
+    input
+        .get("background")
+        .or_else(|| input.get("runInBackground"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn task_output_text(response: &SessionEventsResponse) -> String {
@@ -1289,7 +1864,7 @@ Tool guidance:
 - shell: run verification commands. Foreground commands time out by default; use background=true for long-running dev servers such as npm run dev.
 - question: ask the user when blocked on an important choice.
 - todo_write: create and maintain a structured task list for visible progress. Use content, status (pending|in_progress|completed|cancelled), and priority (high|medium|low).
-- task: launch an isolated subagent session for focused work. Use multiple task calls in one turn for independent parallel subtasks; the parent waits for results.
+- task: launch an isolated subagent session for focused work. Use multiple task calls in one turn for independent parallel subtasks. Use task_id to continue an existing subagent. Use background=true only for independent long-running work; the result will be injected when ready.
 - plan_exit: in plan mode, request user approval to switch from planning to execution after the plan file is complete.
 Use read for file contents and search for project text. Do not read project files with shell commands such as Get-Content, more, cat, grep, or sed when read/search can do it.
 
@@ -1329,7 +1904,7 @@ Tool inputs:
 - shell: {{"command":"test/lint/build command","workdir":"optional/path","timeoutSeconds":60,"background":false,"description":"short purpose"}}. Use background=true for long-running dev servers such as npm run dev.
 - question: {{"question":"short question"}}
 - todo_write: {{"todos":[{{"content":"task","status":"pending|in_progress|completed|cancelled","priority":"high|medium|low"}}]}}
-- task: {{"description":"short label","prompt":"detailed subtask","subagent_type":"general"}}
+- task: {{"description":"short label","prompt":"detailed subtask","subagent_type":"general","task_id":"optional existing task session id","background":false}}
 - plan_exit: {{}}
 Use read for file contents and search for project text. Do not read project files with shell commands such as Get-Content, more, cat, grep, or sed when read/search can do it.
 
@@ -2705,14 +3280,69 @@ mod tests {
 
         assert!(native.contains("- shell: run verification commands."));
         assert!(native.contains("- task: launch an isolated subagent session"));
+        assert!(native.contains("background=true only for independent long-running work"));
         assert!(native.contains("- plan_exit: in plan mode"));
         assert!(!native.contains("bash/shell"));
         assert!(native.contains("Use read for file contents and search for project text."));
         assert!(json.contains(
             "\"name\": \"read|search|grep|edit|write|delete|shell|question|todo_write|task|plan_exit\""
         ));
+        assert!(json.contains("\"background\":false"));
+        assert!(json.contains("\"task_id\":\"optional existing task session id\""));
         assert!(!json.contains("shell|bash"));
         assert!(json.contains("Do not read project files with shell commands"));
+    }
+
+    #[test]
+    fn task_background_accepts_background_flag() {
+        assert!(task_background(&json!({ "background": true })));
+        assert!(task_background(&json!({ "runInBackground": true })));
+        assert!(!task_background(&json!({ "background": false })));
+        assert!(!task_background(&json!({})));
+    }
+
+    #[test]
+    fn task_optional_string_accepts_task_id_aliases() {
+        assert_eq!(
+            task_optional_string(&json!({ "task_id": " child-1 " }), &["task_id", "taskId"]),
+            Some("child-1".to_string())
+        );
+        assert_eq!(
+            task_optional_string(&json!({ "taskId": "child-2" }), &["task_id", "taskId"]),
+            Some("child-2".to_string())
+        );
+        assert_eq!(
+            task_optional_string(&json!({}), &["task_id", "taskId"]),
+            None
+        );
+    }
+
+    #[test]
+    fn step_checkpoint_can_continue_long_running_work() {
+        assert!(should_continue_after_step_checkpoint(
+            STEP_CHECKPOINT_INTERVAL,
+            false
+        ));
+        assert!(should_continue_after_step_checkpoint(
+            STEP_CHECKPOINT_INTERVAL * 2,
+            false
+        ));
+        assert!(!should_continue_after_step_checkpoint(
+            STEP_CHECKPOINT_INTERVAL - 1,
+            false
+        ));
+        assert!(!should_continue_after_step_checkpoint(
+            STEP_CHECKPOINT_INTERVAL,
+            true
+        ));
+        assert!(!should_continue_after_step_checkpoint(
+            MAX_TOTAL_STEPS,
+            false
+        ));
+        assert!(
+            step_checkpoint_continuation_prompt(STEP_CHECKPOINT_INTERVAL)
+                .contains("continue working with the next needed tool call")
+        );
     }
 
     #[test]

@@ -395,6 +395,21 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionRecord>, String> {
     collect_rows(rows)
 }
 
+pub fn list_session_ids_with_pending_input(conn: &Connection) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT session_id
+             FROM session_input
+             WHERE status = 'pending'
+             ORDER BY session_id ASC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map([], |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    collect_rows(rows)
+}
+
 pub fn get_session(conn: &Connection, id: &str) -> Result<SessionRecord, String> {
     conn.query_row(
         "SELECT id, parent_session_id, project_root, mode, provider_id, title, status, shell_mode, total_cost, total_input_tokens, total_output_tokens, created_at, updated_at
@@ -937,6 +952,19 @@ pub fn active_session_run(
     rows.next().transpose().map_err(|error| error.to_string())
 }
 
+pub fn list_running_session_runs(conn: &Connection) -> Result<Vec<SessionRunRecord>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, status, started_at, ended_at
+             FROM session_run WHERE status = 'running' ORDER BY started_at ASC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map([], session_run_from_row)
+        .map_err(|error| error.to_string())?;
+    collect_rows(rows)
+}
+
 pub fn get_session_run(conn: &Connection, id: &str) -> Result<SessionRunRecord, String> {
     conn.query_row(
         "SELECT id, session_id, status, started_at, ended_at FROM session_run WHERE id = ?1",
@@ -954,6 +982,15 @@ pub fn end_session_run(conn: &Connection, run_id: &str, status: &str) -> Result<
     )
     .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+pub fn orphan_running_session_runs(conn: &Connection) -> Result<usize, String> {
+    let now = util::now_string();
+    conn.execute(
+        "UPDATE session_run SET status = 'orphaned', ended_at = ?1 WHERE status = 'running'",
+        params![&now],
+    )
+    .map_err(|error| error.to_string())
 }
 
 pub fn list_session_runs(
@@ -1234,6 +1271,19 @@ pub fn list_background_jobs(
         .map_err(|error| error.to_string())?;
     let rows = stmt
         .query_map(params![session_id], background_job_from_row)
+        .map_err(|error| error.to_string())?;
+    collect_rows(rows)
+}
+
+pub fn list_running_background_jobs(conn: &Connection) -> Result<Vec<BackgroundJobRecord>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, command, cwd, pid, status, log_path, started_at, ended_at
+             FROM background_job WHERE status = 'running' ORDER BY started_at ASC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map([], background_job_from_row)
         .map_err(|error| error.to_string())?;
     collect_rows(rows)
 }
@@ -1883,6 +1933,39 @@ mod tests {
 
         assert_eq!(job.status, "running");
         assert_eq!(list_background_jobs(&conn, "s1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recovery_helpers_find_and_orphan_durable_work() {
+        let conn = memory_db();
+        conn.execute(
+            "INSERT INTO session (id, project_root, mode, provider_id, title, status, shell_mode, created_at, updated_at)
+             VALUES ('s1', 'E:/oDot', 'agent', 'p1', 'Test', 'active', 'auto', '1', '1')",
+            [],
+        )
+        .unwrap();
+        admit_session_input(
+            &conn,
+            Some("input-1".to_string()),
+            "s1",
+            "resume me",
+            &[],
+            SessionInputDelivery::Queue,
+            true,
+        )
+        .unwrap();
+        let run = begin_session_run(&conn, "s1").unwrap();
+        let job = insert_background_job(&conn, "s1", "task:child-1", "E:/oDot", 0, None).unwrap();
+
+        assert_eq!(
+            list_session_ids_with_pending_input(&conn).unwrap(),
+            vec!["s1".to_string()]
+        );
+        assert_eq!(list_running_session_runs(&conn).unwrap()[0].id, run.id);
+        assert_eq!(list_running_background_jobs(&conn).unwrap()[0].id, job.id);
+
+        assert_eq!(orphan_running_session_runs(&conn).unwrap(), 1);
+        assert_eq!(get_session_run(&conn, &run.id).unwrap().status, "orphaned");
     }
 
     #[test]

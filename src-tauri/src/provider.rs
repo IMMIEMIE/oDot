@@ -577,12 +577,14 @@ fn native_tool_definitions() -> Value {
             "type": "function",
             "function": {
                 "name": "task",
-                "description": "Launch an isolated subagent session for a focused task. Use multiple task calls in the same turn for independent work that can run in parallel. The parent waits for results.",
+                "description": "Launch an isolated subagent session for a focused task. Use multiple task calls in the same turn for independent work that can run in parallel. Use background=true only for independent long-running work; the result is injected when ready.",
                 "parameters": object_schema(
                     json!({
                         "description": { "type": "string", "description": "Short 3-7 word task label." },
                         "prompt": { "type": "string", "description": "Detailed task for the subagent." },
-                        "subagent_type": { "type": "string", "description": "Agent type. Use general when no specialized type is needed." }
+                        "subagent_type": { "type": "string", "description": "Agent type. Use general when no specialized type is needed." },
+                        "task_id": { "type": "string", "description": "Existing child task session id to continue instead of creating a new subagent." },
+                        "background": { "type": "boolean", "description": "Run independently and return immediately. Use only when the parent can continue without waiting." }
                     }),
                     &["description", "prompt"]
                 )
@@ -801,6 +803,16 @@ mod tests {
             .expect("shell tool");
         assert!(shell
             .pointer("/function/parameters/properties/description")
+            .is_some());
+        let task = tools
+            .iter()
+            .find(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some("task"))
+            .expect("task tool");
+        assert!(task
+            .pointer("/function/parameters/properties/task_id")
+            .is_some());
+        assert!(task
+            .pointer("/function/parameters/properties/background")
             .is_some());
     }
 

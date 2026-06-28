@@ -318,6 +318,14 @@ export async function persistPlanFile(input: {
   return invoke<string>("persist_plan_file", { input });
 }
 
+export async function revealProjectPath(input: {
+  sessionId: string;
+  path: string;
+}): Promise<void> {
+  assertTauri();
+  return invoke<void>("reveal_project_path", { input });
+}
+
 export async function waitSession(
   sessionId: string
 ): Promise<SessionEventsResponse> {
@@ -344,6 +352,17 @@ export async function recoverSessionFromCheckpoint(input: {
   assertTauri();
   return invoke<SessionEventsResponse>("recover_session_from_checkpoint", {
     input
+  });
+}
+
+export async function promoteTask(input: {
+  sessionId: string;
+  taskSessionId: string;
+}): Promise<SessionEventsResponse> {
+  assertTauri();
+  return invoke<SessionEventsResponse>("promote_task", {
+    sessionId: input.sessionId,
+    taskSessionId: input.taskSessionId
   });
 }
 

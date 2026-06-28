@@ -10,6 +10,7 @@ import {
   Clock3,
   Database,
   FileCode2,
+  FileText,
   FolderOpen,
   History,
   KeyRound,
@@ -23,7 +24,6 @@ import {
   Save,
   Search,
   Settings,
-  Square,
   Terminal,
   Trash2,
   Wrench,
@@ -60,6 +60,8 @@ import {
   loadProviderConfig,
   persistPlanFile,
   pickProjectDirectory,
+  promoteTask,
+  revealProjectPath,
   rejectToolCall,
   replyPermission,
   recoverSessionFromCheckpoint,
@@ -70,6 +72,7 @@ import {
   updateSessionMode,
   updateSessionTitle,
   type AgentMode,
+  type BackgroundJobRecord,
   type EventRecord,
   type PermissionRequestRecord,
   type PermissionReply,
@@ -275,7 +278,9 @@ export function App() {
         payload.kind === "session.start" ||
         payload.kind === "task.created" ||
         payload.kind === "task.completed" ||
-        payload.kind === "task.failed"
+        payload.kind === "task.failed" ||
+        payload.kind === "background.job.started" ||
+        payload.kind === "background.job.updated"
       ) {
         void refreshSessions().catch(() => undefined);
       }
@@ -356,6 +361,19 @@ export function App() {
         : [],
     [availableSessions, selectedSessionId]
   );
+  const activeChildSessions = useMemo(
+    () => selectedChildSessions.filter((session) => session.status === "active"),
+    [selectedChildSessions]
+  );
+  const backgroundTaskSessionIds = useMemo(
+    () =>
+      new Set(
+        eventsResponse.jobs
+          .filter((job) => job.command.startsWith("task:") && job.status === "running")
+          .map((job) => job.command.slice("task:".length))
+      ),
+    [eventsResponse.jobs]
+  );
 
   useEffect(() => {
     if (
@@ -423,19 +441,23 @@ export function App() {
       ),
     [dismissedJobIds, eventsResponse.jobs]
   );
+  const visiblePermissions = useMemo(
+    () => visiblePermissionRequests(eventsResponse.permissions),
+    [eventsResponse.permissions]
+  );
 
   // Auto-expand right pane when agent needs user approval
   useEffect(() => {
     if (
       isRightPaneCollapsed &&
-      (pendingToolEvents.length > 0 ||
-        visiblePermissionRequests(eventsResponse.permissions).length > 0)
+      (pendingToolEvents.length > 0 || visiblePermissions.length > 0 || visibleJobs.length > 0)
     ) {
       setIsRightPaneCollapsed(false);
     }
   }, [
     pendingToolEvents,
-    eventsResponse.permissions,
+    visiblePermissions,
+    visibleJobs.length,
     isRightPaneCollapsed,
   ]);
 
@@ -469,12 +491,24 @@ export function App() {
     () => latestPlanExecutionEvents(eventsResponse.events),
     [eventsResponse.events]
   );
+  const planArtifact = useMemo(
+    () => buildPlanArtifact(eventsResponse.events, eventsResponse.snapshots),
+    [eventsResponse.events, eventsResponse.snapshots]
+  );
 
   useEffect(() => {
-    if (isRightPaneCollapsed && planExecutionEvents.length > 0) {
+    if (
+      isRightPaneCollapsed &&
+      (planExecutionEvents.length > 0 || eventsResponse.todos.length > 0 || planArtifact)
+    ) {
       setIsRightPaneCollapsed(false);
     }
-  }, [isRightPaneCollapsed, planExecutionEvents.length]);
+  }, [
+    eventsResponse.todos.length,
+    isRightPaneCollapsed,
+    planArtifact,
+    planExecutionEvents.length
+  ]);
 
   const latestEventId = eventsResponse.events.at(-1)?.id ?? "";
   const promptEventCount = useMemo(
@@ -1209,6 +1243,25 @@ export function App() {
             : [job, ...current.jobs]
         }));
       }
+      reportError(error);
+    } finally {
+      setIsMutating(false);
+    }
+  }
+
+  async function handlePromoteTask(taskSessionId: string) {
+    if (!selectedSessionId) {
+      return;
+    }
+    setIsMutating(true);
+    try {
+      const response = await promoteTask({
+        sessionId: selectedSessionId,
+        taskSessionId
+      });
+      setEventsResponse((current) => mergeSessionEvents(current, response));
+      setNotice({ tone: "success", text: t("notice.agentContinuing") });
+    } catch (error) {
       reportError(error);
     } finally {
       setIsMutating(false);
@@ -1963,7 +2016,7 @@ export function App() {
                         : void handleSubmitPrompt()
                     }
                   >
-                    {isAgentWorking ? <Square size={16} /> : <ArrowUp size={18} />}
+                    {isAgentWorking ? <span className="stopIconSolid" aria-hidden="true" /> : <ArrowUp size={18} />}
                   </button>
                 </div>
               </div>
@@ -1985,9 +2038,11 @@ export function App() {
 
         {!isRightPaneCollapsed && (
           <>
-            {planExecutionEvents.length > 0 && (
+            {(planExecutionEvents.length > 0 || eventsResponse.todos.length > 0 || planArtifact) && (
               <PlanExecutionDock
                 events={planExecutionEvents}
+                plan={planArtifact}
+                sessionId={selectedSessionId}
                 snapshots={eventsResponse.snapshots}
                 todos={eventsResponse.todos}
               />
@@ -2005,10 +2060,29 @@ export function App() {
                 <small className="subagentStatus">
                   {t("session.subAgentStatus", {
                     total: selectedChildSessions.length,
-                    active: selectedChildSessions.filter((session) => session.status === "active")
-                      .length
+                    active: activeChildSessions.length
                   })}
                 </small>
+              )}
+              {activeChildSessions.length > 0 && (
+                <div className="stackList compact">
+                  {activeChildSessions.map((session) => {
+                    const isBackground = backgroundTaskSessionIds.has(session.id);
+                    return (
+                      <div className="approvalRow" key={session.id}>
+                        <code>{session.title}</code>
+                        <button
+                          className="iconButton"
+                          disabled={isMutating || isBackground}
+                          onClick={() => void handlePromoteTask(session.id)}
+                          title={t("nav.backgroundJobs")}
+                        >
+                          <Clock3 size={16} />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
               )}
               <button
                 className="iconTextButton"
@@ -2031,51 +2105,52 @@ export function App() {
               </section>
             )}
 
-            <section className="rightSection">
-              <SectionTitle icon={<Terminal size={16} />} title={t("nav.commandApproval")} />
-              <div className="stackList">
-                {pendingToolEvents.map((event) => (
-                  <div className="approvalRow" key={event.id}>
-                    <code>{pendingCommand(event)}</code>
-                    <div>
-                      <button
-                        className="iconButton success"
-                        disabled={isMutating}
-                        onClick={() => void handleApprove(event.id)}
-                        title={t("common.accept")}
-                      >
-                        <Check size={16} />
-                      </button>
-                      {isShellPending(event) && (
+            {pendingToolEvents.length > 0 && (
+              <section className="rightSection">
+                <SectionTitle icon={<Terminal size={16} />} title={t("nav.commandApproval")} />
+                <div className="stackList">
+                  {pendingToolEvents.map((event) => (
+                    <div className="approvalRow" key={event.id}>
+                      <code>{pendingCommand(event)}</code>
+                      <div>
                         <button
-                          className="iconButton trust"
+                          className="iconButton success"
                           disabled={isMutating}
-                          onClick={() => void handleApproveAndAllow(event)}
-                          title={t("common.acceptAndAllowlist")}
+                          onClick={() => void handleApprove(event.id)}
+                          title={t("common.accept")}
                         >
-                          <Save size={16} />
+                          <Check size={16} />
                         </button>
-                      )}
-                      <button
-                        className="iconButton danger"
-                        disabled={isMutating}
-                        onClick={() => void handleReject(event.id)}
-                        title={t("common.reject")}
-                      >
-                        <X size={16} />
-                      </button>
+                        {isShellPending(event) && (
+                          <button
+                            className="iconButton trust"
+                            disabled={isMutating}
+                            onClick={() => void handleApproveAndAllow(event)}
+                            title={t("common.acceptAndAllowlist")}
+                          >
+                            <Save size={16} />
+                          </button>
+                        )}
+                        <button
+                          className="iconButton danger"
+                          disabled={isMutating}
+                          onClick={() => void handleReject(event.id)}
+                          title={t("common.reject")}
+                        >
+                          <X size={16} />
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                ))}
-                {!pendingToolEvents.length && <EmptyLine text={t("empty.noPendingCommands")} />}
-              </div>
-            </section>
+                  ))}
+                </div>
+              </section>
+            )}
 
-            <section className="rightSection">
-              <SectionTitle icon={<KeyRound size={16} />} title={t("nav.permissionRequests")} />
-              <div className="stackList">
-                {visiblePermissionRequests(eventsResponse.permissions)
-                  .map((request) => (
+            {visiblePermissions.length > 0 && (
+              <section className="rightSection">
+                <SectionTitle icon={<KeyRound size={16} />} title={t("nav.permissionRequests")} />
+                <div className="stackList">
+                  {visiblePermissions.map((request) => (
                     <div className="approvalRow" key={request.id}>
                       <code>{request.action}: {request.resources.join(", ")}</code>
                       <div>
@@ -2106,31 +2181,30 @@ export function App() {
                       </div>
                     </div>
                   ))}
-                {!visiblePermissionRequests(eventsResponse.permissions).length && (
-                  <EmptyLine text={t("empty.noPermissionRequests")} />
-                )}
-              </div>
-            </section>
+                </div>
+              </section>
+            )}
 
-            <section className="rightSection">
-              <SectionTitle icon={<Clock3 size={16} />} title={t("nav.backgroundJobs")} />
-              <div className="stackList">
-                {visibleJobs.map((job) => (
-                  <div className="approvalRow" key={job.id}>
-                    <code>{job.status} #{job.pid} {job.command}</code>
-                    <button
-                      className="iconButton danger"
-                      disabled={isMutating || job.status !== "running"}
-                      onClick={() => void handleCancelJob(job.id)}
-                      title={t("nav.stopJob")}
-                    >
-                      <X size={16} />
-                    </button>
-                  </div>
-                ))}
-                {!visibleJobs.length && <EmptyLine text={t("empty.noBackgroundJobs")} />}
-              </div>
-            </section>
+            {visibleJobs.length > 0 && (
+              <section className="rightSection">
+                <SectionTitle icon={<Clock3 size={16} />} title={t("nav.backgroundJobs")} />
+                <div className="stackList">
+                  {visibleJobs.map((job) => (
+                    <div className="approvalRow" key={job.id}>
+                      <code>{formatBackgroundJob(job)}</code>
+                      <button
+                        className="iconButton danger"
+                        disabled={isMutating || job.status !== "running"}
+                        onClick={() => void handleCancelJob(job.id)}
+                        title={t("nav.stopJob")}
+                      >
+                        <X size={16} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
 
           </>
         )}
@@ -3208,94 +3282,15 @@ type ExecutionSummary = {
   detail: string;
 };
 
-type DockDetail = {
-  id: string;
-  toolName: string;
-  label: string;
-  target: string;
-  status: "success" | "failed" | "pending" | "running";
-  errorText?: string;
-};
-
 type TodoExecutionSummary = {
   total: number;
   completed: number;
   active?: TodoRecord;
 };
 
-function buildToolAction(
-  event: EventRecord,
-  resultByToolCall: Map<string, EventRecord>
-): DockDetail {
-  const name = valueAsString(event.data.name);
-  const normalizedName = normalizeDisplayToolName(name);
-  const input = asRecord(event.data.input);
-  const label = toolLabel(normalizedName);
-
-  let target = "";
-  if (normalizedName === "shell") {
-    target = valueAsString(input.command);
-  } else if (normalizedName === "search") {
-    target = valueAsString(input.query) || valueAsString(input.pattern) || valueAsString(input.regex);
-  } else if (normalizedName === "todo_write") {
-    const todos = Array.isArray(input.todos) ? input.todos : [];
-    target = appT("todo.count", { count: todos.length });
-  } else if (normalizedName === "plan_exit") {
-    target = appT("todo.planExit");
-  } else {
-    target = valueAsString(input.path);
-  }
-  if (target.length > 80) {
-    target = target.slice(0, 77) + "...";
-  }
-
-  const result = resultByToolCall.get(event.id);
-  let status: DockDetail["status"] = "running";
-  let errorText: string | undefined;
-  if (result) {
-    if (result.type === "tool.success") {
-      status = "success";
-    } else if (result.type === "tool.failed") {
-      status = "failed";
-      errorText =
-        valueAsString(result.data.error) ||
-        valueAsString(asRecord(result.data.result).stderr) ||
-        appT("execution.execFailed");
-    } else if (result.type === "tool.pending") {
-      status = "pending";
-    }
-  }
-
-  return { id: event.id, toolName: normalizedName, label, target, status, errorText };
-}
-
-function buildResultByToolCall(events: EventRecord[]) {
-  const resultByToolCall = new Map<string, EventRecord>();
-  for (const event of events) {
-    const toolCallEventId = valueAsString(event.data.toolCallEventId);
-    if (
-      toolCallEventId &&
-      (event.type === "tool.success" ||
-        event.type === "tool.failed" ||
-        event.type === "tool.pending")
-    ) {
-      resultByToolCall.set(toolCallEventId, event);
-    }
-  }
-  return resultByToolCall;
-}
-
-function buildDockDetails(events: EventRecord[]): DockDetail[] {
-  const resultByToolCall = buildResultByToolCall(events);
-  const details: DockDetail[] = [];
-  for (const event of events) {
-    if (event.type !== "tool.called") {
-      continue;
-    }
-    details.push(buildToolAction(event, resultByToolCall));
-  }
-  return details;
-}
+type PlanArtifact = {
+  path: string;
+};
 
 function normalizeTodoStatus(status: string) {
   return status === "done" ? "completed" : status;
@@ -3316,38 +3311,111 @@ function buildTodoExecutionSummary(todos: TodoRecord[]): TodoExecutionSummary {
   };
 }
 
+function buildPlanArtifact(
+  events: EventRecord[],
+  snapshots: SnapshotRecord[]
+): PlanArtifact | null {
+  const planSnapshot = [...snapshots]
+    .reverse()
+    .find((snapshot) => isPlanDocumentPath(snapshot.path));
+  const eventPath = latestPlanPathFromEvents(events);
+  const path = planSnapshot?.path || eventPath;
+  if (!path) {
+    return null;
+  }
+  return {
+    path
+  };
+}
+
+function latestPlanPathFromEvents(events: EventRecord[]) {
+  for (const event of [...events].reverse()) {
+    if (event.type === "plan.persisted") {
+      const path = valueAsString(event.data.path);
+      if (path) {
+        return path;
+      }
+    }
+    if (event.type === "tool.pending" || event.type === "tool.success") {
+      const pending = asRecord(event.data.pending);
+      const result = asRecord(event.data.result);
+      const path =
+        valueAsString(pending.planPath) ||
+        valueAsString(result.planPath) ||
+        valueAsString(event.data.planPath);
+      if (path) {
+        return path;
+      }
+    }
+  }
+  return "";
+}
+
+function isPlanDocumentPath(path: string) {
+  const normalized = path.replace(/\\/g, "/").replace(/^\.\//, "");
+  return normalized.startsWith(".odot/plans/") && normalized.endsWith(".md");
+}
+
 function PlanExecutionDock({
   events,
+  plan,
+  sessionId,
   snapshots,
   todos
 }: {
   events: EventRecord[];
+  plan: PlanArtifact | null;
+  sessionId: string;
   snapshots: SnapshotRecord[];
   todos: TodoRecord[];
 }) {
   const { t } = useTranslation();
-  const [expanded, setExpanded] = useState(false);
+  const [openError, setOpenError] = useState("");
   const summary = buildExecutionSummary(events, snapshots);
-  const details = useMemo(() => buildDockDetails(events), [events]);
   const todoSummary = useMemo(() => buildTodoExecutionSummary(todos), [todos]);
   const todoProgress =
     todoSummary.total > 0 ? Math.round((todoSummary.completed / todoSummary.total) * 100) : 0;
 
   return (
-    <section className={`rightSection planExecutionDock ${expanded ? "expanded" : ""}`}>
-      <button
-        type="button"
-        className="planExecutionHeader"
-        onClick={() => setExpanded((prev) => !prev)}
-      >
+    <section className="rightSection planExecutionDock">
+      <header className="planExecutionHeader">
         <div className="planExecutionTitle">
-          {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
           <History size={16} />
           <strong>{t("nav.planProgress")}</strong>
           <span className={summary.status}>{summary.statusText}</span>
         </div>
-        <small>{summary.detail}</small>
-      </button>
+      </header>
+      <div className="planDocumentCard">
+        <div className="planDocumentHeader">
+          <div>
+            <strong>
+              <FileText size={14} />
+              {t("todo.planDocument")}
+            </strong>
+            <code>{plan?.path || t("todo.noPlanDocument")}</code>
+          </div>
+          <button
+            type="button"
+            className="iconTextButton compact"
+            disabled={!plan?.path || !sessionId}
+            onClick={async () => {
+              if (!plan?.path || !sessionId) {
+                return;
+              }
+              setOpenError("");
+              try {
+                await revealProjectPath({ sessionId, path: plan.path });
+              } catch (error) {
+                setOpenError(errorSummary(String(error)));
+              }
+            }}
+          >
+            <FolderOpen size={14} />
+            <span>{t("todo.openInFileManager")}</span>
+          </button>
+        </div>
+        {openError && <small className="inlineError">{openError}</small>}
+      </div>
       <div className="planTodoBlock">
         <div className="planTodoProgressRow">
           <strong>
@@ -3363,65 +3431,48 @@ function PlanExecutionDock({
         <div className="planTodoProgressTrack" aria-hidden="true">
           <span style={{ width: `${todoProgress}%` }} />
         </div>
-        {todoSummary.active && (
-          <div className="planTodoActive">
-            <span className={`todoStatusDot ${normalizeTodoStatus(todoSummary.active.status)}`} />
-            <span>{todoSummary.active.content}</span>
-          </div>
-        )}
-        {todos.length > 0 && (
-          <div className="planTodoList">
-            {todos.map((todo) => {
-              const status = normalizeTodoStatus(todo.status);
-              return (
-                <div
-                  className={`planTodoItem ${status}`}
-                  key={`${todo.position}-${todo.content}`}
-                >
-                  <span className="todoStatusIcon">
-                    {status === "completed" && <Check size={13} />}
-                    {status === "in_progress" && <Loader2 className="spin" size={13} />}
-                    {status === "cancelled" && <X size={13} />}
-                    {status !== "completed" &&
-                      status !== "in_progress" &&
-                      status !== "cancelled" && <Clock3 size={13} />}
-                  </span>
-                  <span>{todo.content}</span>
-                </div>
-              );
-            })}
-          </div>
-        )}
+        <PlanTodoTimeline todos={todos} />
       </div>
-      <div className="executionSummary">
-        <span>
-          <Wrench size={14} />
-          {t("execution.tools")} {summary.toolCount}
-        </span>
-        <span>{t("execution.reads")} {summary.readCount}</span>
-        <span>{t("execution.searches")} {summary.searchCount}</span>
-        <span>{t("execution.commands")} {summary.commandCount}</span>
-        <span>{t("execution.changes")} {summary.changeCount}</span>
-      </div>
-      {expanded && (
-        <div className="dockDetailList">
-          {details.map((detail) => (
-            <div key={detail.id} className={`dockDetailItem ${detail.status}`}>
-              <span className="dockStatus">
-                {detail.status === "success" && <Check size={14} />}
-                {detail.status === "failed" && <AlertTriangle size={14} />}
-                {detail.status === "pending" && <Clock3 size={14} />}
-                {detail.status === "running" && <Loader2 className="spin" size={14} />}
-              </span>
-              <span className="dockLabel">{detail.label}</span>
-              <span className="dockTarget">{detail.target || "—"}</span>
-              {detail.errorText && <span className="dockError">{detail.errorText}</span>}
-            </div>
-          ))}
-          {!details.length && <div className="dockDetailItem empty">{t("empty.noToolCalls")}</div>}
-        </div>
-      )}
     </section>
+  );
+}
+
+function PlanTodoTimeline({ todos }: { todos: TodoRecord[] }) {
+  const { t } = useTranslation();
+  const timelineTodos =
+    todos.length > 0
+      ? todos
+      : [
+          {
+            content: t("todo.waitingForTodoWrite"),
+            status: "pending",
+            priority: "medium",
+            position: 0
+          }
+        ];
+
+  return (
+    <ol className="planTimeline">
+      {timelineTodos.map((todo) => {
+        const status = normalizeTodoStatus(todo.status);
+        return (
+          <li
+            className={`planTimelineItem ${status}`}
+            key={`${todo.position}-${todo.content}`}
+          >
+            <span className="planTimelineMarker">
+              {status === "completed" && <Check size={13} />}
+              {status === "in_progress" && <Loader2 className="spin" size={13} />}
+              {status === "cancelled" && <X size={13} />}
+              {status !== "completed" &&
+                status !== "in_progress" &&
+                status !== "cancelled" && <Clock3 size={13} />}
+            </span>
+            <span className="planTimelineContent">{todo.content}</span>
+          </li>
+        );
+      })}
+    </ol>
   );
 }
 
@@ -4448,6 +4499,14 @@ function visiblePermissionRequests(requests: PermissionRequestRecord[]) {
   return requests.filter(
     (request) => request.status === "pending" && !isToolPermissionRequest(request)
   );
+}
+
+function formatBackgroundJob(job: BackgroundJobRecord) {
+  if (job.command.startsWith("task:")) {
+    const childSessionId = job.command.slice("task:".length);
+    return `${appT("common.subAgent")} · ${job.status} · ${childSessionId.slice(0, 8)}`;
+  }
+  return `${job.status} #${job.pid} ${job.command}`;
 }
 
 function sessionResponseIsWorking(response: SessionEventsResponse) {

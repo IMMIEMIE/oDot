@@ -1,5 +1,5 @@
 use crate::{
-    mutation, storage,
+    mutation, storage, task_registry,
     types::{
         AgentMode, EventRecord, PromptAttachment, SessionInputDelivery, SessionRecord, ShellMode,
         ShellPolicy, TodoRecord, ToolCallRequest,
@@ -809,6 +809,18 @@ fn terminate_process_tree(child: &mut Child) {
 
 pub fn wait_job(conn: &Connection, job_id: &str) -> Result<Value, String> {
     let job = storage::get_background_job(conn, job_id)?;
+    if task_registry::is_task_command(&job.command) {
+        let job = if job.status == "running" && !task_registry::is_registered(job_id) {
+            storage::update_background_job_status(conn, job_id, "orphaned")?
+        } else {
+            job
+        };
+        let running = job.status == "running";
+        return Ok(json!({
+            "job": job,
+            "running": running
+        }));
+    }
     if job.status != "running" {
         return Ok(json!({ "job": job, "running": false }));
     }
@@ -823,6 +835,11 @@ pub fn wait_job(conn: &Connection, job_id: &str) -> Result<Value, String> {
 
 pub fn cancel_job(conn: &Connection, job_id: &str) -> Result<Value, String> {
     let job = storage::get_background_job(conn, job_id)?;
+    if task_registry::is_task_command(&job.command) {
+        let aborted = task_registry::cancel(job_id);
+        let job = storage::update_background_job_status(conn, job_id, "cancelled")?;
+        return Ok(json!({ "job": job, "aborted": aborted }));
+    }
     terminate_pid_tree(job.pid);
     let job = storage::update_background_job_status(conn, job_id, "cancelled")?;
     Ok(json!({ "job": job }))

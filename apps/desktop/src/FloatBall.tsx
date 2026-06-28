@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { currentMonitor, getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import {
   AlertTriangle,
@@ -45,6 +45,7 @@ import {
 type ThemeMode = "system" | "light" | "dark";
 type ResolvedTheme = "light" | "dark";
 type PromptPanelDirection = "up" | "right" | "down" | "left";
+type CompletionBubbleDirection = "right" | "left";
 
 const DRAG_THRESHOLD = 4;
 const THEME_STORAGE_KEY = "odot.themeMode";
@@ -64,6 +65,8 @@ export function FloatBall() {
   const [isActionRingVisible, setIsActionRingVisible] = useState(false);
   const [isDormant, setIsDormant] = useState(false);
   const [showCompleteCheck, setShowCompleteCheck] = useState(false);
+  const [completionBubbleDirection, setCompletionBubbleDirection] =
+    useState<CompletionBubbleDirection>("right");
   const pointerStart = useRef<{ id: number; x: number; y: number } | null>(null);
   const didDrag = useRef(false);
   const sleepTimer = useRef<number | undefined>(undefined);
@@ -148,6 +151,7 @@ export function FloatBall() {
     previousStatusKind.current = agentStatus.kind;
     if ((previous === "working" || previous === "thinking") && agentStatus.kind === "complete") {
       setShowCompleteCheck(true);
+      void resolveCompletionBubbleDirection().then(setCompletionBubbleDirection);
       if (completeCheckTimer.current) {
         window.clearTimeout(completeCheckTimer.current);
       }
@@ -377,6 +381,9 @@ export function FloatBall() {
   }
 
   const canOpenPrompt = agentStatus.kind === "idle" || agentStatus.kind === "complete";
+  const completionMessage = agentStatus.message?.trim() || "";
+  const showCompletionBubble =
+    agentStatus.kind === "complete" && showCompleteCheck && completionMessage.length > 0;
   const promptPanelClass = promptDirection
     ? `floatPromptPanel floatPromptPanel--${promptDirection}`
     : "floatPromptPanel";
@@ -471,6 +478,19 @@ export function FloatBall() {
           </span>
         )}
       </button>
+
+      {showCompletionBubble && (
+        <section
+          className={`floatCompletionBubble floatCompletionBubble--${completionBubbleDirection}`}
+          aria-live="polite"
+        >
+          <div className="floatCompletionBubbleHeader">
+            <Check size={13} strokeWidth={3} />
+            <span>{agentStatus.label}</span>
+          </div>
+          <p>{completionMessage}</p>
+        </section>
+      )}
 
       {promptDirection && (
         <form
@@ -590,6 +610,29 @@ export function FloatBall() {
       )}
     </div>
   );
+}
+
+async function resolveCompletionBubbleDirection(): Promise<CompletionBubbleDirection> {
+  try {
+    const floatWin = getCurrentWindow();
+    const [position, monitor] = await Promise.all([
+      floatWin.outerPosition(),
+      currentMonitor()
+    ]);
+    if (!monitor) {
+      return window.screenX + window.innerWidth * 0.5 > window.screen.availWidth * 0.62
+        ? "left"
+        : "right";
+    }
+    const monitorLeft = monitor.position.x;
+    const monitorWidth = monitor.size.width;
+    const windowCenter = position.x + window.innerWidth * window.devicePixelRatio * 0.5;
+    return windowCenter > monitorLeft + monitorWidth * 0.62 ? "left" : "right";
+  } catch {
+    return window.screenX + window.innerWidth * 0.5 > window.screen.availWidth * 0.62
+      ? "left"
+      : "right";
+  }
 }
 
 function FloatAgentStatusIcon({

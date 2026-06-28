@@ -6,23 +6,29 @@ mod llm_runtime;
 mod mutation;
 mod provider;
 mod runner;
+mod session_coordinator;
 mod storage;
+mod task_registry;
 mod tools;
 mod types;
 mod util;
 mod workspace;
 
 use serde_json::json;
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::time::Duration;
+use std::{
+    path::Path,
+    process::Command,
+    sync::atomic::{AtomicBool, Ordering},
+};
 use tauri::{AppHandle, Emitter};
 use types::{
     ContextSummaryRecord, CreateSessionInput, EventRecord, PersistPlanInput, ProjectFile,
     PromptSessionInput, ProviderConfigFileResponse, ProviderInput, ProviderRecord,
-    RecoverSessionInput, ReplyPermissionInput, SessionEventsResponse, SessionRecord, ShellPolicy,
-    SnapshotRecord, SubmitPromptInput, TailSessionEventsInput, UpdateSessionModeInput,
-    UpdateSessionTitleInput,
+    RecoverSessionInput, ReplyPermissionInput, RevealPathInput, SessionEventsResponse,
+    SessionRecord, ShellPolicy, SnapshotRecord, SubmitPromptInput, TailSessionEventsInput,
+    UpdateSessionModeInput, UpdateSessionTitleInput,
 };
 
 const FLOAT_WINDOW_LABEL: &str = "float";
@@ -307,6 +313,16 @@ async fn recover_session_from_checkpoint(
 }
 
 #[tauri::command]
+fn promote_task(
+    app: AppHandle,
+    session_id: String,
+    task_session_id: String,
+) -> Result<SessionEventsResponse, String> {
+    let conn = storage::open_db(&app)?;
+    runner::promote_task(&conn, &session_id, &task_session_id)
+}
+
+#[tauri::command]
 async fn approve_tool_call(app: AppHandle, event_id: String) -> Result<EventRecord, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let conn = storage::open_db(&app)?;
@@ -424,6 +440,99 @@ fn persist_plan_file(app: AppHandle, input: PersistPlanInput) -> Result<String, 
 }
 
 #[tauri::command]
+fn reveal_project_path(app: AppHandle, input: RevealPathInput) -> Result<(), String> {
+    let conn = storage::open_db(&app)?;
+    let session = storage::get_session(&conn, &input.session_id)?;
+    let root = std::fs::canonicalize(&session.project_root).map_err(|error| error.to_string())?;
+    let target = util::resolve_writable_inside(&root, &input.path)?;
+    let target_to_open = if target.exists() {
+        target
+    } else {
+        target
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| format!("路径没有父目录: {}", input.path))?
+    };
+    reveal_in_file_manager(&target_to_open)
+}
+
+fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let directory = if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or(path)
+        };
+        Command::new("xdg-open")
+            .arg(directory)
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+}
+
+async fn recover_durable_state(app: AppHandle) {
+    let app_for_prepare = app.clone();
+    let pending_sessions = tauri::async_runtime::spawn_blocking(move || {
+        let conn = storage::open_db(&app_for_prepare)?;
+        runner::prepare_durable_recovery(&conn)
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|inner| inner);
+
+    let pending_sessions = match pending_sessions {
+        Ok(value) => value,
+        Err(error) => {
+            log::error!("durable recovery prepare failed: {error}");
+            return;
+        }
+    };
+
+    for session_id in pending_sessions {
+        let app_for_session = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let session_for_log = session_id.clone();
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                let conn = storage::open_db(&app_for_session)?;
+                tauri::async_runtime::block_on(runner::wake_pending_session(
+                    &app_for_session,
+                    &conn,
+                    session_id,
+                ))
+                .map(|_| ())
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|inner| inner);
+            if let Err(error) = result {
+                log::error!("durable recovery wake failed for {session_for_log}: {error}");
+            }
+        });
+    }
+}
+
+#[tauri::command]
 fn set_app_locale(locale: String) {
     i18n::set_app_locale(&locale);
 }
@@ -440,6 +549,7 @@ pub fn run() {
         .setup(|app| {
             event_bus::init();
             let app_handle = app.handle().clone();
+            let recovery_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mut receiver = event_bus::subscribe();
                 loop {
@@ -451,6 +561,9 @@ pub fn run() {
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
+            });
+            tauri::async_runtime::spawn(async move {
+                recover_durable_state(recovery_app).await;
             });
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -484,6 +597,7 @@ pub fn run() {
             wait_session,
             continue_session,
             recover_session_from_checkpoint,
+            promote_task,
             approve_tool_call,
             reject_tool_call,
             reply_permission,
@@ -495,6 +609,7 @@ pub fn run() {
             load_shell_policy,
             save_shell_policy,
             persist_plan_file,
+            reveal_project_path,
             list_project_files
         ])
         .run(tauri::generate_context!())

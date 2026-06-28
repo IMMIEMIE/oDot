@@ -22,6 +22,7 @@ export type FloatAgentStatusRecord = {
   label: string;
   sessionId: string;
   allowedAttachmentKinds: PromptAttachmentKind[];
+  message?: string;
   pendingApproval?: FloatPendingApproval | null;
   updatedAt: number;
 };
@@ -77,8 +78,16 @@ export function deriveFloatAgentStatus({
     return floatAgentStatus("working", appT("floatStatus.working"), sessionId, allowedAttachmentKinds);
   }
 
+  const latestAssistantMessage = latestAssistantText(eventsResponse.events);
   if (statusEventIsComplete(latestStatus)) {
-    return floatAgentStatus("complete", appT("floatStatus.complete"), sessionId, allowedAttachmentKinds);
+    return floatAgentStatus(
+      "complete",
+      appT("floatStatus.complete"),
+      sessionId,
+      allowedAttachmentKinds,
+      null,
+      latestAssistantMessage
+    );
   }
 
   if (currentPendingApproval || hasPendingPermissionRequest) {
@@ -92,7 +101,14 @@ export function deriveFloatAgentStatus({
   }
 
   if (session.status === "completed") {
-    return floatAgentStatus("complete", appT("floatStatus.complete"), sessionId, allowedAttachmentKinds);
+    return floatAgentStatus(
+      "complete",
+      appT("floatStatus.complete"),
+      sessionId,
+      allowedAttachmentKinds,
+      null,
+      latestAssistantMessage
+    );
   }
 
   return floatAgentStatus("idle", appT("floatStatus.idle"), sessionId, allowedAttachmentKinds);
@@ -119,13 +135,15 @@ function floatAgentStatus(
   label: string,
   sessionId: string,
   allowedAttachmentKinds: PromptAttachmentKind[],
-  pendingApproval: FloatPendingApproval | null = null
+  pendingApproval: FloatPendingApproval | null = null,
+  message = ""
 ): FloatAgentStatusRecord {
   return {
     kind,
     label,
     sessionId,
     allowedAttachmentKinds,
+    message,
     pendingApproval,
     updatedAt: Date.now()
   };
@@ -217,6 +235,23 @@ function latestModelOutputIsReasoning(events: EventRecord[]) {
   return latest?.type === "reasoning.summary" || latest?.type === "reasoning.summary.delta";
 }
 
+function latestAssistantText(events: EventRecord[]) {
+  const event = [...events].reverse().find((item) => item.type === "assistant.message");
+  return compactMessagePreview(valueAsString(event?.data.text));
+}
+
+function compactMessagePreview(value: string) {
+  const cleaned = value
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/<\/?think>/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (cleaned.length <= 260) {
+    return cleaned;
+  }
+  return `${cleaned.slice(0, 257).trimEnd()}...`;
+}
+
 function normalizeFloatAgentStatus(value: unknown): FloatAgentStatusRecord {
   const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
   const kind = record.kind;
@@ -235,6 +270,7 @@ function normalizeFloatAgentStatus(value: unknown): FloatAgentStatusRecord {
     label: valueAsString(record.label) || DEFAULT_FLOAT_AGENT_STATUS.label,
     sessionId: valueAsString(record.sessionId),
     allowedAttachmentKinds: normalizeAttachmentKinds(record.allowedAttachmentKinds),
+    message: valueAsString(record.message),
     pendingApproval: normalizePendingApproval(record.pendingApproval),
     updatedAt:
       typeof record.updatedAt === "number"
