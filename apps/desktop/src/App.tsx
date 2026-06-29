@@ -208,6 +208,7 @@ export function App() {
     return Number.isFinite(stored) && stored >= 300 ? stored : 420;
   });
   const [isRightPaneCollapsed, setIsRightPaneCollapsed] = useState(true);
+  const [isPlanDockDismissed, setIsPlanDockDismissed] = useState(false);
 
   useEffect(() => {
     void bootstrap();
@@ -513,16 +514,18 @@ export function App() {
     [eventsResponse.events, eventsResponse.snapshots]
   );
 
+  const planRightPaneRef = useRef(isRightPaneCollapsed);
+  planRightPaneRef.current = isRightPaneCollapsed;
+
   useEffect(() => {
-    if (
-      isRightPaneCollapsed &&
-      (planExecutionEvents.length > 0 || eventsResponse.todos.length > 0 || planArtifact)
-    ) {
-      setIsRightPaneCollapsed(false);
+    if (planExecutionEvents.length > 0 || eventsResponse.todos.length > 0 || planArtifact) {
+      setIsPlanDockDismissed(false);
+      if (planRightPaneRef.current) {
+        setIsRightPaneCollapsed(false);
+      }
     }
   }, [
     eventsResponse.todos.length,
-    isRightPaneCollapsed,
     planArtifact,
     planExecutionEvents.length
   ]);
@@ -2085,9 +2088,10 @@ export function App() {
 
         {!isRightPaneCollapsed && (
           <>
-            {(planExecutionEvents.length > 0 || eventsResponse.todos.length > 0 || planArtifact) && (
+            {!isPlanDockDismissed && (planExecutionEvents.length > 0 || eventsResponse.todos.length > 0 || planArtifact) && (
               <PlanExecutionDock
                 events={planExecutionEvents}
+                onDismiss={() => setIsPlanDockDismissed(true)}
                 plan={planArtifact}
                 sessionId={selectedSessionId}
                 snapshots={eventsResponse.snapshots}
@@ -3476,12 +3480,14 @@ function isPlanDocumentPath(path: string) {
 
 function PlanExecutionDock({
   events,
+  onDismiss,
   plan,
   sessionId,
   snapshots,
   todos
 }: {
   events: EventRecord[];
+  onDismiss?: () => void;
   plan: PlanArtifact | null;
   sessionId: string;
   snapshots: SnapshotRecord[];
@@ -3502,6 +3508,16 @@ function PlanExecutionDock({
           <strong>{t("nav.planProgress")}</strong>
           <span className={summary.status}>{summary.statusText}</span>
         </div>
+        {onDismiss && (
+          <button
+            type="button"
+            className="planDockDismissButton"
+            onClick={onDismiss}
+            title={t("common.close", { defaultValue: "Close" })}
+          >
+            <X size={14} />
+          </button>
+        )}
       </header>
       <div className="planDocumentCard">
         <div className="planDocumentHeader">

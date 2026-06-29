@@ -27,6 +27,7 @@ where
     F: FnMut() -> Result<ProviderRequestConfig, String>,
 {
     let mut current_prompt = current_prompt.to_string();
+    let prior_step_count = current_prompt_step_count(conn, &session.id)?;
     let mut step_index = 1;
     let mut last_executed_step = 0usize;
     let mut activity_status = "completed";
@@ -41,36 +42,63 @@ where
             "maxTotalSteps": MAX_TOTAL_STEPS
         }),
     )?;
-    while step_index <= MAX_TOTAL_STEPS {
-        if step_index > MAX_ACTIVITY_STEPS {
-            activity_status = "paused";
-            storage::append_event(
-                conn,
-                &session.id,
-                "run.activity.limit_reached",
-                json!({
-                    "step": step_index - 1,
-                    "limit": MAX_ACTIVITY_STEPS,
-                    "canContinue": true,
-                    "autoQueued": false,
-                    "continueCommand": "continue_session",
-                    "message": "Reached the per-activity step limit. Continue the session to start the next bounded activity."
-                }),
-            )?;
-            storage::save_session_checkpoint(
-                conn,
-                &session.id,
-                run_id,
-                "activity.limit_reached",
-                Some((step_index - 1) as i64),
-                "ready",
-                json!({
-                    "step": step_index - 1,
-                    "limit": MAX_ACTIVITY_STEPS,
-                    "canContinue": true
-                }),
-            )?;
-            break;
+    loop {
+        match activity_budget_decision(prior_step_count, step_index) {
+            ActivityBudgetDecision::Continue => {}
+            ActivityBudgetDecision::ActivityLimitReached {
+                completed_step,
+                total_steps,
+            } => {
+                activity_status = "paused";
+                storage::append_event(
+                    conn,
+                    &session.id,
+                    "run.activity.limit_reached",
+                    json!({
+                        "step": completed_step,
+                        "totalSteps": total_steps,
+                        "limit": MAX_ACTIVITY_STEPS,
+                        "maxTotalSteps": MAX_TOTAL_STEPS,
+                        "canContinue": true,
+                        "autoQueued": false,
+                        "continueCommand": "continue_session",
+                        "message": "Reached the per-activity step limit. Continue the session to start the next bounded activity."
+                    }),
+                )?;
+                storage::save_session_checkpoint(
+                    conn,
+                    &session.id,
+                    run_id,
+                    "activity.limit_reached",
+                    Some(completed_step as i64),
+                    "ready",
+                    json!({
+                        "step": completed_step,
+                        "totalSteps": total_steps,
+                        "limit": MAX_ACTIVITY_STEPS,
+                        "canContinue": true
+                    }),
+                )?;
+                break;
+            }
+            ActivityBudgetDecision::TotalLimitExceeded {
+                attempted_total_step,
+            } => {
+                let error = max_total_steps_error();
+                storage::append_event(
+                    conn,
+                    &session.id,
+                    "step.failed",
+                    json!({
+                        "step": last_executed_step.max(1),
+                        "attemptedTotalStep": attempted_total_step,
+                        "maxTotalSteps": MAX_TOTAL_STEPS,
+                        "error": error
+                    }),
+                )?;
+                append_activity_ended(conn, &session.id, run_id, last_executed_step, "failed")?;
+                return Err(error);
+            }
         }
         storage::append_event(
             conn,
@@ -458,21 +486,6 @@ where
         step_index += 1;
     }
 
-    if step_index > MAX_TOTAL_STEPS {
-        let error = max_total_steps_error();
-        storage::append_event(
-            conn,
-            &session.id,
-            "step.failed",
-            json!({
-                "step": MAX_TOTAL_STEPS,
-                "error": error
-            }),
-        )?;
-        append_activity_ended(conn, &session.id, run_id, last_executed_step, "failed")?;
-        return Err(error);
-    }
-
     append_activity_ended(
         conn,
         &session.id,
@@ -481,6 +494,51 @@ where
         activity_status,
     )?;
     Ok(storage::session_events_response(conn, &session.id)?)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ActivityBudgetDecision {
+    Continue,
+    ActivityLimitReached {
+        completed_step: usize,
+        total_steps: usize,
+    },
+    TotalLimitExceeded {
+        attempted_total_step: usize,
+    },
+}
+
+fn activity_budget_decision(
+    prior_step_count: usize,
+    activity_step: usize,
+) -> ActivityBudgetDecision {
+    let attempted_total_step = prior_step_count.saturating_add(activity_step);
+    if attempted_total_step > MAX_TOTAL_STEPS {
+        return ActivityBudgetDecision::TotalLimitExceeded {
+            attempted_total_step,
+        };
+    }
+    if activity_step > MAX_ACTIVITY_STEPS {
+        return ActivityBudgetDecision::ActivityLimitReached {
+            completed_step: activity_step - 1,
+            total_steps: prior_step_count + activity_step - 1,
+        };
+    }
+    ActivityBudgetDecision::Continue
+}
+
+fn current_prompt_step_count(conn: &Connection, session_id: &str) -> Result<usize, String> {
+    let events = storage::list_events(conn, session_id)?;
+    let latest_prompt_seq = events
+        .iter()
+        .rev()
+        .find(|event| event.event_type == "prompt.submitted")
+        .map(|event| event.seq)
+        .unwrap_or(0);
+    Ok(events
+        .iter()
+        .filter(|event| event.seq > latest_prompt_seq && event.event_type == "step.started")
+        .count())
 }
 
 pub(super) fn should_continue_after_step_checkpoint(step_index: usize, has_pending: bool) -> bool {
@@ -631,6 +689,62 @@ mod tests {
         assert_eq!(events[0].event_type, "run.activity.ended");
         assert_eq!(events[0].data.get("status"), Some(&json!("failed")));
         assert_eq!(events[0].data.get("lastStep"), Some(&json!(3)));
+    }
+
+    #[test]
+    fn activity_budget_pauses_after_single_activity_limit() {
+        assert_eq!(
+            activity_budget_decision(0, MAX_ACTIVITY_STEPS),
+            ActivityBudgetDecision::Continue
+        );
+        assert_eq!(
+            activity_budget_decision(0, MAX_ACTIVITY_STEPS + 1),
+            ActivityBudgetDecision::ActivityLimitReached {
+                completed_step: MAX_ACTIVITY_STEPS,
+                total_steps: MAX_ACTIVITY_STEPS
+            }
+        );
+    }
+
+    #[test]
+    fn activity_budget_keeps_hard_total_across_continued_activities() {
+        assert_eq!(
+            activity_budget_decision(MAX_TOTAL_STEPS - MAX_ACTIVITY_STEPS, MAX_ACTIVITY_STEPS),
+            ActivityBudgetDecision::Continue
+        );
+        assert_eq!(
+            activity_budget_decision(MAX_TOTAL_STEPS - MAX_ACTIVITY_STEPS, MAX_ACTIVITY_STEPS + 1),
+            ActivityBudgetDecision::TotalLimitExceeded {
+                attempted_total_step: MAX_TOTAL_STEPS + 1
+            }
+        );
+    }
+
+    #[test]
+    fn current_prompt_step_count_resets_after_new_prompt() {
+        let conn = memory_db();
+        storage::append_event(
+            &conn,
+            "s1",
+            "prompt.submitted",
+            json!({ "prompt": "first" }),
+        )
+        .unwrap();
+        storage::append_event(&conn, "s1", "step.started", json!({ "step": 1 })).unwrap();
+        storage::append_event(&conn, "s1", "step.started", json!({ "step": 2 })).unwrap();
+        assert_eq!(current_prompt_step_count(&conn, "s1").unwrap(), 2);
+
+        storage::append_event(
+            &conn,
+            "s1",
+            "prompt.submitted",
+            json!({ "prompt": "second" }),
+        )
+        .unwrap();
+        assert_eq!(current_prompt_step_count(&conn, "s1").unwrap(), 0);
+
+        storage::append_event(&conn, "s1", "step.started", json!({ "step": 1 })).unwrap();
+        assert_eq!(current_prompt_step_count(&conn, "s1").unwrap(), 1);
     }
 
     #[test]

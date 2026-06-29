@@ -3,12 +3,11 @@ import { emit, listen } from "@tauri-apps/api/event";
 import { currentMonitor, getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import {
-  AlertTriangle,
   ArrowDown,
   ArrowLeft,
   ArrowRight,
   ArrowUp,
-  BrainCircuit,
+  AlertTriangle,
   Check,
   KeyRound,
   Send,
@@ -17,14 +16,16 @@ import {
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ClipboardEvent as ReactClipboardEvent, PointerEvent as ReactPointerEvent } from "react";
-import { OdodBotIcon, SleepingOdodBotIcon } from "./OdodBotIcon";
+import { OdodBotIcon, SleepingOdodBotIcon, WorkingOdodBotIcon } from "./OdodBotIcon";
 import { appT } from "./i18n";
 import {
   approveToolCall,
+  cancelSession,
   continueSession,
   loadShellPolicy,
   promptSession,
   rejectToolCall,
+  replyPermission,
   saveShellPolicy
 } from "./api";
 import {
@@ -45,12 +46,12 @@ import {
 type ThemeMode = "system" | "light" | "dark";
 type ResolvedTheme = "light" | "dark";
 type PromptPanelDirection = "up" | "right" | "down" | "left";
-type CompletionBubbleDirection = "right" | "left";
+type SideBubbleDirection = "right" | "left";
 
 const DRAG_THRESHOLD = 4;
 const THEME_STORAGE_KEY = "odot.themeMode";
-const FLOAT_SLEEP_DELAY_MS = 30_000;
 const COMPLETE_CHECK_DURATION_MS = 1_800;
+const FLOAT_SLEEP_DELAY_MS = 30_000;
 
 export function FloatBall() {
   const { t } = useTranslation();
@@ -63,14 +64,20 @@ export function FloatBall() {
   const [isSubmittingPrompt, setIsSubmittingPrompt] = useState(false);
   const [isResolvingApproval, setIsResolvingApproval] = useState(false);
   const [isActionRingVisible, setIsActionRingVisible] = useState(false);
-  const [isDormant, setIsDormant] = useState(false);
+  const [isSleeping, setIsSleeping] = useState(false);
   const [showCompleteCheck, setShowCompleteCheck] = useState(false);
   const [completionBubbleDirection, setCompletionBubbleDirection] =
-    useState<CompletionBubbleDirection>("right");
+    useState<SideBubbleDirection>("right");
+  const [thinkingBubbleDirection, setThinkingBubbleDirection] =
+    useState<SideBubbleDirection>("right");
+  const [isApprovalPanelOpen, setIsApprovalPanelOpen] = useState(false);
+  const [approvalBubbleDirection, setApprovalBubbleDirection] =
+    useState<SideBubbleDirection>("right");
   const pointerStart = useRef<{ id: number; x: number; y: number } | null>(null);
   const didDrag = useRef(false);
-  const sleepTimer = useRef<number | undefined>(undefined);
   const completeCheckTimer = useRef<number | undefined>(undefined);
+  const sleepTimer = useRef<number | undefined>(undefined);
+  const cancelledErrorSession = useRef<string | undefined>(undefined);
   const previousStatusKind = useRef<FloatAgentStatusKind>(agentStatus.kind);
 
   useEffect(() => {
@@ -147,11 +154,21 @@ export function FloatBall() {
   }, []);
 
   useEffect(() => {
+    recordFloatMouseEvent();
+    return () => {
+      if (sleepTimer.current) {
+        window.clearTimeout(sleepTimer.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     const previous = previousStatusKind.current;
     previousStatusKind.current = agentStatus.kind;
     if ((previous === "working" || previous === "thinking") && agentStatus.kind === "complete") {
+      recordFloatMouseEvent();
       setShowCompleteCheck(true);
-      void resolveCompletionBubbleDirection().then(setCompletionBubbleDirection);
+      void resolveSideBubbleDirection().then(setCompletionBubbleDirection);
       if (completeCheckTimer.current) {
         window.clearTimeout(completeCheckTimer.current);
       }
@@ -167,13 +184,29 @@ export function FloatBall() {
   }, [agentStatus.kind]);
 
   useEffect(() => {
-    scheduleSleepTimer();
-    return () => {
-      if (sleepTimer.current) {
-        window.clearTimeout(sleepTimer.current);
-      }
-    };
-  }, [agentStatus.kind, promptDirection]);
+    if (agentStatus.kind === "working" || agentStatus.kind === "thinking") {
+      void resolveSideBubbleDirection().then(setThinkingBubbleDirection);
+    }
+  }, [agentStatus.kind]);
+
+  useEffect(() => {
+    if (agentStatus.kind !== "approval") {
+      setIsApprovalPanelOpen(false);
+    }
+  }, [agentStatus.kind]);
+
+  useEffect(() => {
+    if (agentStatus.kind !== "error" || !agentStatus.sessionId) {
+      return;
+    }
+    if (cancelledErrorSession.current === agentStatus.sessionId) {
+      return;
+    }
+    cancelledErrorSession.current = agentStatus.sessionId;
+    void cancelSession(agentStatus.sessionId)
+      .then(() => notifyMainSessionRefresh(agentStatus.sessionId))
+      .catch(() => undefined);
+  }, [agentStatus.kind, agentStatus.sessionId]);
 
   async function restoreMainWindow() {
     const floatWin = getCurrentWindow();
@@ -191,29 +224,18 @@ export function FloatBall() {
     setIsDragging(false);
   }
 
-  function canSleep() {
-    return !promptDirection && (agentStatus.kind === "idle" || agentStatus.kind === "complete");
-  }
-
-  function scheduleSleepTimer() {
+  function recordFloatMouseEvent() {
+    setIsSleeping(false);
     if (sleepTimer.current) {
       window.clearTimeout(sleepTimer.current);
     }
-    if (!canSleep()) {
-      setIsDormant(false);
-      return;
-    }
     sleepTimer.current = window.setTimeout(() => {
-      setIsDormant(true);
+      setIsSleeping(true);
     }, FLOAT_SLEEP_DELAY_MS);
   }
 
-  function wakeFloatBall() {
-    setIsDormant(false);
-    scheduleSleepTimer();
-  }
-
   const handlePointerDown = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    recordFloatMouseEvent();
     if (event.button !== 0) {
       return;
     }
@@ -227,6 +249,7 @@ export function FloatBall() {
   };
 
   const handlePointerMove = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    recordFloatMouseEvent();
     const start = pointerStart.current;
     if (!start || start.id !== event.pointerId || didDrag.current) {
       return;
@@ -244,21 +267,30 @@ export function FloatBall() {
   };
 
   const handlePointerUp = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    recordFloatMouseEvent();
     const dragged = didDrag.current;
     resetPointer(event.currentTarget, event.pointerId);
     didDrag.current = false;
-    if (!dragged) {
+    if (dragged) {
+      return;
+    }
+    if (agentStatus.kind === "approval") {
+      setIsActionRingVisible(false);
+      setPanelError("");
+      setIsApprovalPanelOpen((current) => !current);
+      void resolveSideBubbleDirection().then(setApprovalBubbleDirection);
+    } else {
       void restoreMainWindow();
     }
   };
 
   const handlePointerCancel = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    recordFloatMouseEvent();
     resetPointer(event.currentTarget, event.pointerId);
     didDrag.current = false;
   };
 
   function openPromptPanel(direction: PromptPanelDirection) {
-    wakeFloatBall();
     setIsActionRingVisible(false);
     setPromptDirection(direction);
     setPanelError("");
@@ -267,7 +299,6 @@ export function FloatBall() {
   function closePromptPanel() {
     setPromptDirection(null);
     setPanelError("");
-    scheduleSleepTimer();
   }
 
   async function handlePaste(event: ReactClipboardEvent<HTMLTextAreaElement>) {
@@ -342,7 +373,12 @@ export function FloatBall() {
     setIsResolvingApproval(true);
     setPanelError("");
     try {
-      if (action === "allow") {
+      if (pending.kind === "permission") {
+        await replyPermission({
+          requestId: pending.eventId,
+          reply: action === "allow" ? "always" : action === "reject" ? "reject" : "once"
+        });
+      } else if (action === "allow") {
         const policy = await loadShellPolicy();
         const prefix = shellAllowlistPrefix(pending.command);
         if (prefix) {
@@ -351,10 +387,14 @@ export function FloatBall() {
           });
         }
       }
-      if (action === "reject") {
-        await rejectToolCall(pending.eventId);
-      } else {
-        await approveToolCall(pending.eventId);
+      if (pending.kind === "tool") {
+        if (action === "reject") {
+          await rejectToolCall(pending.eventId);
+        } else {
+          await approveToolCall(pending.eventId);
+        }
+      }
+      if (action !== "reject") {
         if (agentStatus.sessionId) {
           await continueSession(agentStatus.sessionId);
         }
@@ -364,7 +404,7 @@ export function FloatBall() {
       }
       setAgentStatus((current) => syncLocalStatus({
         ...current,
-        kind: "idle",
+        kind: action === "reject" ? "idle" : "working",
         label: action === "reject" ? t("float.commandRejected") : t("float.agentWorking"),
         pendingApproval: null
       }));
@@ -381,6 +421,15 @@ export function FloatBall() {
   }
 
   const canOpenPrompt = agentStatus.kind === "idle" || agentStatus.kind === "complete";
+  const isAgentActive = agentStatus.kind === "working" || agentStatus.kind === "thinking";
+  const isApprovalPending = agentStatus.kind === "approval";
+  const isError = agentStatus.kind === "error";
+  const showSleepingIcon =
+    isSleeping && !isAgentActive && !isApprovalPending && !isError && !showCompleteCheck;
+  const thinkingMessage = agentStatus.message?.trim() || agentStatus.label;
+  const showThinkingBubble = isAgentActive && thinkingMessage.length > 0;
+  const showApprovalPanel =
+    isApprovalPending && isApprovalPanelOpen && Boolean(agentStatus.pendingApproval);
   const completionMessage = agentStatus.message?.trim() || "";
   const showCompletionBubble =
     agentStatus.kind === "complete" && showCompleteCheck && completionMessage.length > 0;
@@ -394,8 +443,21 @@ export function FloatBall() {
   const containerClassName = [
     "floatBallContainer",
     promptDirection ? "floatBallContainer--panelOpen" : "",
-    isActionRingVisible ? "floatBallContainer--actionsVisible" : ""
+    isActionRingVisible ? "floatBallContainer--actionsVisible" : "",
+    isAgentActive ? "floatBallContainer--active" : "",
+    isApprovalPending ? "floatBallContainer--approval" : "",
+    isError ? "floatBallContainer--error" : ""
   ].filter(Boolean).join(" ");
+  const floatBallClassName = [
+    "floatBall",
+    isDragging ? "floatBall--dragging" : "",
+    showSleepingIcon ? "floatBall--sleeping" : "",
+    isAgentActive ? "floatBall--working" : "",
+    isApprovalPending ? "floatBall--approval" : "",
+    isError ? "floatBall--error" : "",
+    showCompleteCheck ? "floatBall--complete" : ""
+  ].filter(Boolean).join(" ");
+  const approvalTitle = agentStatus.pendingApproval?.command.trim();
 
   return (
     <div
@@ -457,27 +519,48 @@ export function FloatBall() {
 
       <button
         type="button"
-        className={`floatBall floatBall--${agentStatus.kind}${isDragging ? " floatBall--dragging" : ""}${showCompleteCheck ? " floatBall--completeCelebrating" : ""}`}
+        className={floatBallClassName}
         onPointerDown={(event) => {
-          wakeFloatBall();
           handlePointerDown(event);
         }}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerCancel}
         onPointerEnter={() => {
-          wakeFloatBall();
+          recordFloatMouseEvent();
           setIsActionRingVisible(true);
         }}
-        title={agentStatus.label}
+        title={approvalTitle || agentStatus.label}
       >
-        <FloatAgentStatusIcon kind={agentStatus.kind} dormant={isDormant} />
+        {isError ? (
+          <AlertTriangle size={27} strokeWidth={2.3} />
+        ) : isApprovalPending ? (
+          <KeyRound size={28} strokeWidth={2.3} />
+        ) : isAgentActive ? (
+          <WorkingOdodBotIcon size={28} strokeWidth={2.3} />
+        ) : showSleepingIcon ? (
+          <SleepingOdodBotIcon size={28} strokeWidth={2.3} />
+        ) : (
+          <OdodBotIcon size={28} strokeWidth={2.3} />
+        )}
         {showCompleteCheck && (
-          <span className="floatCompleteCheck" aria-hidden="true">
-            <Check size={28} strokeWidth={3.1} />
+          <span className="floatBallCheckBurst" aria-hidden="true">
+            <Check size={24} strokeWidth={3.2} />
           </span>
         )}
       </button>
+
+      {showThinkingBubble && (
+        <section
+          className={`floatThinkingBubble floatThinkingBubble--${thinkingBubbleDirection}`}
+          aria-live="polite"
+        >
+          <div className="floatThinkingBubbleHeader">
+            <span>{agentStatus.label}</span>
+          </div>
+          <p>{thinkingMessage}</p>
+        </section>
+      )}
 
       {showCompletionBubble && (
         <section
@@ -496,7 +579,6 @@ export function FloatBall() {
         <form
           className={promptPanelClass}
           onPointerDown={(event) => {
-            wakeFloatBall();
             event.stopPropagation();
           }}
           onSubmit={(event) => {
@@ -522,7 +604,6 @@ export function FloatBall() {
             disabled={isSubmittingPrompt}
             onChange={(event) => setPromptText(event.target.value)}
             onFocus={() => {
-              wakeFloatBall();
               setIsActionRingVisible(false);
             }}
             onPaste={(event) => void handlePaste(event)}
@@ -568,9 +649,9 @@ export function FloatBall() {
         </form>
       )}
 
-      {agentStatus.kind === "approval" && agentStatus.pendingApproval && (
+      {showApprovalPanel && agentStatus.pendingApproval && (
         <section
-          className="floatApprovalPanel"
+          className={`floatApprovalPanel floatApprovalPanel--${approvalBubbleDirection}`}
           onPointerDown={(event) => event.stopPropagation()}
         >
           <div className="floatPanelHeader">
@@ -612,7 +693,7 @@ export function FloatBall() {
   );
 }
 
-async function resolveCompletionBubbleDirection(): Promise<CompletionBubbleDirection> {
+async function resolveSideBubbleDirection(): Promise<SideBubbleDirection> {
   try {
     const floatWin = getCurrentWindow();
     const [position, monitor] = await Promise.all([
@@ -620,42 +701,18 @@ async function resolveCompletionBubbleDirection(): Promise<CompletionBubbleDirec
       currentMonitor()
     ]);
     if (!monitor) {
-      return window.screenX + window.innerWidth * 0.5 > window.screen.availWidth * 0.62
+      return window.screenX + window.innerWidth * 0.5 > window.screen.availWidth * 0.5
         ? "left"
         : "right";
     }
     const monitorLeft = monitor.position.x;
     const monitorWidth = monitor.size.width;
     const windowCenter = position.x + window.innerWidth * window.devicePixelRatio * 0.5;
-    return windowCenter > monitorLeft + monitorWidth * 0.62 ? "left" : "right";
+    return windowCenter > monitorLeft + monitorWidth * 0.5 ? "left" : "right";
   } catch {
-    return window.screenX + window.innerWidth * 0.5 > window.screen.availWidth * 0.62
+    return window.screenX + window.innerWidth * 0.5 > window.screen.availWidth * 0.5
       ? "left"
       : "right";
-  }
-}
-
-function FloatAgentStatusIcon({
-  kind,
-  dormant
-}: {
-  kind: FloatAgentStatusKind;
-  dormant: boolean;
-}) {
-  switch (kind) {
-    case "approval":
-      return <KeyRound size={28} strokeWidth={2.3} />;
-    case "error":
-      return <AlertTriangle size={28} strokeWidth={2.3} />;
-    case "thinking":
-      return <BrainCircuit size={28} strokeWidth={2.3} />;
-    case "complete":
-    case "idle":
-    default:
-      if (dormant) {
-        return <SleepingOdodBotIcon size={28} strokeWidth={2.3} />;
-      }
-      return <OdodBotIcon size={28} strokeWidth={2.3} />;
   }
 }
 

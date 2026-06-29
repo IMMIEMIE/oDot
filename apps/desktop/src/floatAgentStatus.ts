@@ -28,6 +28,7 @@ export type FloatAgentStatusRecord = {
 };
 
 export type FloatPendingApproval = {
+  kind: "tool" | "permission";
   eventId: string;
   command: string;
 };
@@ -65,17 +66,42 @@ export function deriveFloatAgentStatus({
     ? isPendingApprovalCurrent(eventsResponse.events, pendingApproval.eventId, latestStatus)
     : false;
   const currentPendingApproval = pendingApprovalIsCurrent ? pendingApproval : null;
-  const hasPendingPermissionRequest = hasPendingPermission(eventsResponse.permissions);
+  const pendingPermissionApproval = pendingPermissionRequest(eventsResponse.permissions);
 
   if (session.status === "failed" || statusEventIsFailure(latestStatus)) {
     return floatAgentStatus("error", appT("floatStatus.error"), sessionId, allowedAttachmentKinds);
   }
 
+  if (currentPendingApproval || pendingPermissionApproval) {
+    return floatAgentStatus(
+      "approval",
+      appT("floatStatus.waitingApproval"),
+      sessionId,
+      allowedAttachmentKinds,
+      currentPendingApproval ?? pendingPermissionApproval
+    );
+  }
+
   if (isWorking) {
+    const latestReasoningMessage = latestReasoningText(eventsResponse.events);
     if (latestModelOutputIsReasoning(eventsResponse.events)) {
-      return floatAgentStatus("thinking", appT("floatStatus.thinking"), sessionId, allowedAttachmentKinds);
+      return floatAgentStatus(
+        "thinking",
+        appT("floatStatus.thinking"),
+        sessionId,
+        allowedAttachmentKinds,
+        null,
+        latestReasoningMessage
+      );
     }
-    return floatAgentStatus("working", appT("floatStatus.working"), sessionId, allowedAttachmentKinds);
+    return floatAgentStatus(
+      "working",
+      appT("floatStatus.working"),
+      sessionId,
+      allowedAttachmentKinds,
+      null,
+      latestReasoningMessage
+    );
   }
 
   const latestAssistantMessage = latestAssistantText(eventsResponse.events);
@@ -87,16 +113,6 @@ export function deriveFloatAgentStatus({
       allowedAttachmentKinds,
       null,
       latestAssistantMessage
-    );
-  }
-
-  if (currentPendingApproval || hasPendingPermissionRequest) {
-    return floatAgentStatus(
-      "approval",
-      appT("floatStatus.waitingApproval"),
-      sessionId,
-      allowedAttachmentKinds,
-      currentPendingApproval
     );
   }
 
@@ -165,13 +181,29 @@ function unresolvedPendingTool(events: EventRecord[]): FloatPendingApproval | nu
     return null;
   }
   return {
+    kind: "tool",
     eventId: event.id,
     command: pendingCommand(event)
   };
 }
 
-function hasPendingPermission(permissions: PermissionRequestRecord[]) {
-  return permissions.some((permission) => permission.status === "pending");
+function pendingPermissionRequest(permissions: PermissionRequestRecord[]): FloatPendingApproval | null {
+  const request = permissions.find(
+    (permission) => permission.status === "pending" && !isToolPermissionRequest(permission)
+  );
+  if (!request) {
+    return null;
+  }
+  return {
+    kind: "permission",
+    eventId: request.id,
+    command: permissionCommand(request)
+  };
+}
+
+function isToolPermissionRequest(permission: PermissionRequestRecord) {
+  const source = asRecord(permission.sourceJson);
+  return source.type === "tool";
 }
 
 function isPendingApprovalCurrent(
@@ -240,6 +272,13 @@ function latestAssistantText(events: EventRecord[]) {
   return compactMessagePreview(valueAsString(event?.data.text));
 }
 
+function latestReasoningText(events: EventRecord[]) {
+  const event = [...events].reverse().find((item) =>
+    item.type === "reasoning.summary" || item.type === "reasoning.summary.delta"
+  );
+  return compactMessagePreview(valueAsString(event?.data.text));
+}
+
 function compactMessagePreview(value: string) {
   const cleaned = value
     .replace(/<think>[\s\S]*?<\/think>/gi, "")
@@ -288,6 +327,14 @@ function pendingCommand(event: EventRecord) {
   );
 }
 
+function permissionCommand(permission: PermissionRequestRecord) {
+  const resources = permission.resources
+    .map((resource) => resource.trim())
+    .filter(Boolean)
+    .join(", ");
+  return resources ? `${permission.action}: ${resources}` : permission.action;
+}
+
 function isApprovalTool(event: EventRecord) {
   const name = valueAsString(event.data.name).toLowerCase();
   return name === "shell" || name === "bash";
@@ -306,6 +353,7 @@ function normalizePendingApproval(value: unknown): FloatPendingApproval | null {
     return null;
   }
   return {
+    kind: record.kind === "permission" ? "permission" : "tool",
     eventId,
     command: valueAsString(record.command) || appT("event.pendingCommand")
   };
