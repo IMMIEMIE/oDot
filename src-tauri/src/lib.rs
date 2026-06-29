@@ -26,9 +26,9 @@ use tauri::{AppHandle, Emitter};
 use types::{
     ContextSummaryRecord, CreateSessionInput, EventRecord, PersistPlanInput, ProjectFile,
     PromptSessionInput, ProviderConfigFileResponse, ProviderInput, ProviderRecord,
-    RecoverSessionInput, ReplyPermissionInput, RevealPathInput, SessionEventsResponse,
-    SessionRecord, ShellPolicy, SnapshotRecord, SubmitPromptInput, TailSessionEventsInput,
-    UpdateSessionModeInput, UpdateSessionTitleInput,
+    RecoverBackgroundTaskInput, RecoverSessionInput, ReplyPermissionInput, RevealPathInput,
+    SessionEventsResponse, SessionRecord, ShellPolicy, SnapshotRecord, SubmitPromptInput,
+    TailSessionEventsInput, UpdateSessionModeInput, UpdateSessionTitleInput,
 };
 
 const FLOAT_WINDOW_LABEL: &str = "float";
@@ -187,7 +187,7 @@ fn delete_session(app: AppHandle, session_id: String) -> Result<(), String> {
 #[tauri::command]
 fn cancel_session(app: AppHandle, session_id: String) -> Result<EventRecord, String> {
     let conn = storage::open_db(&app)?;
-    storage::cancel_session(&conn, &session_id)
+    runner::cancel_session(&conn, &session_id)
 }
 
 #[tauri::command]
@@ -242,7 +242,7 @@ fn tail_session_events(
 #[tauri::command]
 fn interrupt_session(app: AppHandle, session_id: String) -> Result<EventRecord, String> {
     let conn = storage::open_db(&app)?;
-    storage::cancel_session(&conn, &session_id)
+    runner::cancel_session(&conn, &session_id)
 }
 
 #[tauri::command]
@@ -295,6 +295,19 @@ async fn continue_session(
 }
 
 #[tauri::command]
+async fn await_session_idle(
+    app: AppHandle,
+    session_id: String,
+) -> Result<SessionEventsResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = storage::open_db(&app)?;
+        tauri::async_runtime::block_on(runner::await_session_idle(&conn, session_id))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 async fn recover_session_from_checkpoint(
     app: AppHandle,
     input: RecoverSessionInput,
@@ -336,6 +349,25 @@ async fn approve_tool_call(app: AppHandle, event_id: String) -> Result<EventReco
 fn reject_tool_call(app: AppHandle, event_id: String) -> Result<EventRecord, String> {
     let conn = storage::open_db(&app)?;
     tools::reject_tool_call(&conn, &event_id)
+}
+
+#[tauri::command]
+fn delete_queued_input(app: AppHandle, input_id: String) -> Result<SessionEventsResponse, String> {
+    let conn = storage::open_db(&app)?;
+    runner::delete_queued_input(&conn, &input_id)
+}
+
+#[tauri::command]
+async fn recover_background_task(
+    app: AppHandle,
+    input: RecoverBackgroundTaskInput,
+) -> Result<SessionEventsResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = storage::open_db(&app)?;
+        tauri::async_runtime::block_on(runner::recover_background_task(&app, &conn, input))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -596,7 +628,10 @@ pub fn run() {
             prompt_session,
             wait_session,
             continue_session,
+            await_session_idle,
             recover_session_from_checkpoint,
+            recover_background_task,
+            delete_queued_input,
             promote_task,
             approve_tool_call,
             reject_tool_call,

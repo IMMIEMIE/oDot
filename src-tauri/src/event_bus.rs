@@ -164,7 +164,8 @@ fn normalized_kind(event_type: &str) -> &str {
         "background.job.updated"
         | "task.background.updated"
         | "task.promote.requested"
-        | "task.orphaned" => "background.job.updated",
+        | "task.orphaned"
+        | "task.recoverable" => "background.job.updated",
         "agent.stopped" | "step.ended" | "task.completed" => "task.completed",
         _ => event_type,
     }

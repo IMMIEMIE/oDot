@@ -457,6 +457,20 @@ pub struct RecoverSessionInput {
     pub checkpoint_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoverBackgroundTaskInput {
+    pub job_id: String,
+    pub action: RecoverBackgroundTaskAction,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RecoverBackgroundTaskAction {
+    ResumeChild,
+    Abandon,
+}
+
 fn default_resume() -> bool {
     true
 }

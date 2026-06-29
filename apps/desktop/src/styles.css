@@ -2478,6 +2478,38 @@ pre {
   gap: 7px;
 }
 
+.approvalRow .inlineActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.activityPauseBox {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid color-mix(in srgb, var(--warning-text) 44%, var(--border));
+  border-radius: 8px;
+  background: var(--warning-soft);
+  color: var(--warning-text);
+}
+
+.activityPauseBox strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.activityPauseBox span {
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.activityPauseBox .iconTextButton {
+  justify-self: end;
+}
+
 .patchStat {
   min-width: 42px;
   padding: 2px 6px;

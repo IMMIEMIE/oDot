@@ -1,16 +1,16 @@
 use crate::{
     config_file,
-    error_model::AppErrorInfo,
+    error_model::{AppErrorInfo, ErrorKind},
     llm_runtime::{sanitize_assistant_content, LlmStreamEvent},
     provider, session_coordinator, storage, task_registry, tools,
     types::{
         AgentMode, ContextSummaryRecord, EventRecord, ModelTurn, PromptAttachment,
         PromptAttachmentKind, PromptSessionInput, ProviderPricing, ProviderRequestConfig,
-        SessionEventsResponse, SessionInputDelivery, SubmitPromptInput, ToolCallRequest, ToolMode,
+        RecoverBackgroundTaskAction, RecoverBackgroundTaskInput, SessionEventsResponse,
+        SessionInputDelivery, SubmitPromptInput, ToolCallRequest, ToolMode,
     },
     util,
 };
-use futures_util::future::{select, Either};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::{
@@ -22,7 +22,21 @@ use std::{
 use tauri::AppHandle;
 use tokio::time::sleep;
 
+mod background_task;
+mod compaction;
+mod input_queue;
+mod run_loop;
+
+use background_task::{
+    execute_agent_turn_tools, execute_turn_tool, render_background_task_prompt,
+    BackgroundTaskStatus,
+};
+use compaction::maybe_auto_compact;
+pub use compaction::{compact_session, compact_session_with_provider};
+use run_loop::run_session_steps;
+
 const STEP_CHECKPOINT_INTERVAL: usize = 25;
+const MAX_ACTIVITY_STEPS: usize = 25;
 const MAX_TOTAL_STEPS: usize = 250;
 const MAX_CONTEXT_EVENT_LIMIT: usize = 2_000;
 const RECENT_EVENT_CHAR_BUDGET: usize = 48_000;
@@ -35,9 +49,6 @@ const STREAM_DELTA_FLUSH_CHARS: usize = 96;
 const STREAM_DELTA_FLUSH_MS: u64 = 120;
 const LLM_RETRY_ATTEMPTS: usize = 3;
 const LLM_RETRY_BASE_DELAY_MS: u64 = 350;
-const BACKGROUND_TASK_STARTED: &str = "The task is running in the background. You will be notified automatically when it finishes. Continue only with work that does not duplicate that task.";
-const BACKGROUND_TASK_UPDATED: &str = "Additional context was sent to the running background task. You will be notified automatically when it finishes. Continue only with work that does not duplicate that task.";
-
 pub async fn submit_prompt(
     app: &AppHandle,
     conn: &Connection,
@@ -63,30 +74,18 @@ pub async fn prompt_session(
     conn: &Connection,
     input: PromptSessionInput,
 ) -> Result<SessionEventsResponse, String> {
-    let admitted = storage::admit_session_input(
-        conn,
-        input.id,
-        &input.session_id,
-        &input.prompt,
-        &input.attachments,
-        input.delivery.unwrap_or(SessionInputDelivery::Queue),
-        input.resume,
-    )?;
-    storage::append_event(
-        conn,
-        &admitted.session_id,
-        "session.input.admitted",
-        json!({
-            "inputId": admitted.id,
-            "delivery": admitted.delivery,
-            "resume": admitted.resume
-        }),
-    )?;
+    let admitted = input_queue::admit(conn, input)?;
 
-    if admitted.resume {
-        wake_session(app, conn, admitted.session_id).await
+    if admitted.input.resume {
+        wake_session(
+            app,
+            conn,
+            admitted.input.session_id,
+            Some(admitted.event.seq),
+        )
+        .await
     } else {
-        storage::session_events_response(conn, &admitted.session_id)
+        storage::session_events_response(conn, &admitted.input.session_id)
     }
 }
 
@@ -94,13 +93,16 @@ async fn wake_session(
     app: &AppHandle,
     conn: &Connection,
     session_id: String,
+    seq: Option<i64>,
 ) -> Result<SessionEventsResponse, String> {
     let lock_session_id = session_id.clone();
-    session_coordinator::with_session_lock(
+    session_coordinator::with_session_demand(
         &lock_session_id,
+        session_coordinator::RunDemand::Wake { seq },
         wake_session_unlocked(app, conn, session_id),
     )
     .await
+    .unwrap_or_else(|| storage::session_events_response(conn, &lock_session_id))
 }
 
 pub async fn continue_session(
@@ -109,11 +111,13 @@ pub async fn continue_session(
     session_id: String,
 ) -> Result<SessionEventsResponse, String> {
     let lock_session_id = session_id.clone();
-    session_coordinator::with_session_lock(
+    session_coordinator::with_session_demand(
         &lock_session_id,
+        session_coordinator::RunDemand::Run,
         continue_session_unlocked(app, conn, session_id),
     )
     .await
+    .unwrap_or_else(|| storage::session_events_response(conn, &lock_session_id))
 }
 
 async fn continue_session_unlocked(
@@ -161,11 +165,13 @@ pub async fn resume_session(
     session_id: String,
 ) -> Result<SessionEventsResponse, String> {
     let lock_session_id = session_id.clone();
-    session_coordinator::with_session_lock(
+    session_coordinator::with_session_demand(
         &lock_session_id,
+        session_coordinator::RunDemand::Run,
         resume_session_unlocked(app, conn, session_id),
     )
     .await
+    .unwrap_or_else(|| storage::session_events_response(conn, &lock_session_id))
 }
 
 pub async fn wake_pending_session(
@@ -173,7 +179,15 @@ pub async fn wake_pending_session(
     conn: &Connection,
     session_id: String,
 ) -> Result<SessionEventsResponse, String> {
-    wake_session(app, conn, session_id).await
+    wake_session(app, conn, session_id, None).await
+}
+
+pub async fn await_session_idle(
+    conn: &Connection,
+    session_id: String,
+) -> Result<SessionEventsResponse, String> {
+    let _ = session_coordinator::await_idle(&session_id).await;
+    storage::session_events_response(conn, &session_id)
 }
 
 pub fn promote_task(
@@ -189,7 +203,8 @@ pub fn promote_task(
     let already_background = storage::list_background_jobs(conn, parent_session_id)?
         .iter()
         .any(|job| {
-            job.command == task_registry::task_command(child_session_id) && job.status == "running"
+            job.command == task_registry::task_command(child_session_id)
+                && BackgroundTaskStatus::is_active(&job.status)
         });
     if already_background {
         return storage::session_events_response(conn, parent_session_id);
@@ -208,6 +223,82 @@ pub fn promote_task(
     }
 
     storage::session_events_response(conn, parent_session_id)
+}
+
+pub fn cancel_session(conn: &Connection, session_id: &str) -> Result<EventRecord, String> {
+    let event = storage::cancel_session(conn, session_id)?;
+    session_coordinator::record_interrupt(session_id, Some(event.seq));
+    Ok(event)
+}
+
+pub fn delete_queued_input(
+    conn: &Connection,
+    input_id: &str,
+) -> Result<SessionEventsResponse, String> {
+    let input = input_queue::delete_pending(conn, input_id)?;
+    storage::session_events_response(conn, &input.session_id)
+}
+
+pub async fn recover_background_task(
+    app: &AppHandle,
+    conn: &Connection,
+    input: RecoverBackgroundTaskInput,
+) -> Result<SessionEventsResponse, String> {
+    let job = storage::get_background_job(conn, &input.job_id)?;
+    let child_session_id = task_registry::task_session_id(&job.command)
+        .ok_or_else(|| "后台任务不是子任务会话。".to_string())?
+        .to_string();
+    match input.action {
+        RecoverBackgroundTaskAction::ResumeChild => {
+            storage::update_background_job_status(
+                conn,
+                &job.id,
+                BackgroundTaskStatus::Recoverable.as_str(),
+            )?;
+            storage::append_event(
+                conn,
+                &job.session_id,
+                "task.recoverable",
+                json!({
+                    "jobId": job.id,
+                    "sessionId": child_session_id,
+                    "action": "resumeChild"
+                }),
+            )?;
+            let _ = recover_session_from_checkpoint(app, conn, child_session_id, None).await?;
+            storage::session_events_response(conn, &job.session_id)
+        }
+        RecoverBackgroundTaskAction::Abandon => {
+            storage::update_background_job_status(
+                conn,
+                &job.id,
+                BackgroundTaskStatus::Cancelled.as_str(),
+            )?;
+            storage::append_event(
+                conn,
+                &job.session_id,
+                "task.recoverable",
+                json!({
+                    "jobId": job.id,
+                    "sessionId": child_session_id,
+                    "action": "abandon"
+                }),
+            )?;
+            storage::append_event(
+                conn,
+                &job.session_id,
+                "task.failed",
+                json!({
+                    "jobId": job.id,
+                    "sessionId": child_session_id,
+                    "background": true,
+                    "status": "abandoned",
+                    "error": "Background task was abandoned during recovery."
+                }),
+            )?;
+            storage::session_events_response(conn, &job.session_id)
+        }
+    }
 }
 
 async fn wake_session_unlocked(
@@ -287,7 +378,11 @@ pub fn prepare_durable_recovery(conn: &Connection) -> Result<Vec<String>, String
         if !task_registry::is_task_command(&job.command) {
             continue;
         }
-        storage::update_background_job_status(conn, &job.id, "orphaned")?;
+        storage::update_background_job_status(
+            conn,
+            &job.id,
+            BackgroundTaskStatus::Recoverable.as_str(),
+        )?;
         let child_session_id = task_registry::task_session_id(&job.command).unwrap_or("");
         storage::append_event(
             conn,
@@ -298,6 +393,18 @@ pub fn prepare_durable_recovery(conn: &Connection) -> Result<Vec<String>, String
                 "command": job.command,
                 "sessionId": child_session_id,
                 "startedAt": job.started_at
+            }),
+        )?;
+        storage::append_event(
+            conn,
+            &job.session_id,
+            "task.recoverable",
+            json!({
+                "jobId": job.id,
+                "command": job.command,
+                "sessionId": child_session_id,
+                "startedAt": job.started_at,
+                "actions": ["resumeChild", "abandon"]
             }),
         )?;
         let prompt = render_background_task_prompt(
@@ -327,11 +434,13 @@ pub async fn recover_session_from_checkpoint(
     checkpoint_id: Option<String>,
 ) -> Result<SessionEventsResponse, String> {
     let lock_session_id = session_id.clone();
-    session_coordinator::with_session_lock(
+    session_coordinator::with_session_demand(
         &lock_session_id,
+        session_coordinator::RunDemand::Run,
         recover_session_from_checkpoint_unlocked(app, conn, session_id, checkpoint_id),
     )
     .await
+    .unwrap_or_else(|| storage::session_events_response(conn, &lock_session_id))
 }
 
 async fn recover_session_from_checkpoint_unlocked(
@@ -402,20 +511,10 @@ async fn resume_session_inner(
 ) -> Result<SessionEventsResponse, String> {
     let session = storage::get_session(conn, session_id)?;
     storage::set_session_status(conn, &session.id, "active")?;
-    let prompt = if let Some(input) = storage::next_pending_session_input(conn, &session.id)? {
-        let event = storage::append_event(
-            conn,
-            &session.id,
-            "prompt.submitted",
-            json!({
-                "inputId": input.id,
-                "prompt": input.prompt,
-                "attachments": attachment_summaries(&input.attachments),
-                "delivery": input.delivery
-            }),
-        )?;
-        storage::mark_session_input_promoted(conn, &input.id, &event.id)?;
-        input.prompt
+    let prompt = if let Some(input) =
+        input_queue::promote_next(conn, &session.id, attachment_summaries)?
+    {
+        input.input.prompt
     } else {
         "Continue from the latest tool result. Inspect recent tool success/failure output, then either call the next needed tool or provide the final user-facing answer.".to_string()
     };
@@ -439,430 +538,31 @@ async fn resume_session_inner(
     run_session_steps(app, conn, &session, &prompt, run_id).await
 }
 
-async fn run_session_steps(
-    app: &AppHandle,
-    conn: &Connection,
-    session: &crate::types::SessionRecord,
-    current_prompt: &str,
-    run_id: Option<&str>,
-) -> Result<SessionEventsResponse, String> {
-    let mut current_prompt = current_prompt.to_string();
-    let mut step_index = 1;
-    while step_index <= MAX_TOTAL_STEPS {
-        storage::append_event(
-            conn,
-            &session.id,
-            "step.started",
-            json!({
-                "step": step_index
-            }),
-        )?;
-        if stop_if_cancelled(conn, &session.id, step_index)? {
-            break;
-        }
-
-        let request_config = match config_file::load_provider_request_config(
-            app,
-            &session.project_root,
-            &session.provider_id,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                if stop_if_cancelled(conn, &session.id, step_index)? {
-                    break;
-                }
-                storage::append_event(
-                    conn,
-                    &session.id,
-                    "step.failed",
-                    json!({
-                        "step": step_index,
-                        "error": error
-                    }),
-                )?;
-                return Err(error);
-            }
-        };
-        let native_runtime = provider::supports_native_tools(&request_config);
-        let provider_id_str = provider_id_from_record(&session.provider_id);
-        let plan_path = if matches!(session.mode, AgentMode::Plan) {
-            Some(util::plan_file_path(&session.created_at, &session.title))
-        } else {
-            None
-        };
-        let system_prompt = build_system_prompt(
-            session.mode.as_str(),
-            native_runtime,
-            &request_config.model,
-            provider_id_str,
-            plan_path.as_deref(),
-        );
-        let turn = if native_runtime {
-            storage::append_event(
-                conn,
-                &session.id,
-                "llm.stream.started",
-                json!({
-                    "step": step_index,
-                    "runtime": "rust-openai-chat",
-                    "providerId": provider_id_str,
-                    "model": &request_config.model
-                }),
-            )?;
-            let stream_system_prompt = build_stream_system_prompt(
-                conn,
-                session,
-                session.mode.as_str(),
-                native_runtime,
-                &request_config.model,
-                provider_id_str,
-            )?;
-            let messages = build_stream_messages(
-                conn,
-                &session.id,
-                &stream_system_prompt,
-                &current_prompt,
-                &request_config,
-            )?;
-            match stream_openai_compatible_with_retry(
-                conn,
-                &session.id,
-                step_index,
-                &session.provider_id,
-                &request_config,
-                &messages,
-            )
-            .await
-            {
-                Ok(value) => value,
-                Err(error) => {
-                    if stop_if_cancelled(conn, &session.id, step_index)? {
-                        break;
-                    }
-                    storage::append_event(
-                        conn,
-                        &session.id,
-                        "step.failed",
-                        json!({
-                            "step": step_index,
-                            "error": error
-                        }),
-                    )?;
-                    return Err(error);
-                }
-            }
-        } else {
-            let user_prompt =
-                build_user_prompt(conn, &session.id, &current_prompt, &request_config)?;
-            let completion = match complete_with_retry(
-                conn,
-                &session.id,
-                step_index,
-                &request_config,
-                &system_prompt,
-                &user_prompt,
-            )
-            .await
-            {
-                Ok(value) => value,
-                Err(error) => {
-                    if stop_if_cancelled(conn, &session.id, step_index)? {
-                        break;
-                    }
-                    storage::append_event(
-                        conn,
-                        &session.id,
-                        "step.failed",
-                        json!({
-                            "step": step_index,
-                            "error": error
-                        }),
-                    )?;
-                    return Err(error);
-                }
-            };
-            if let Some(turn) = completion.turn {
-                turn
-            } else {
-                match parse_model_turn(&completion.raw_response) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        storage::append_event(
-                            conn,
-                            &session.id,
-                            "step.failed",
-                            json!({
-                                "step": step_index,
-                                "error": error,
-                                "rawResponse": completion.raw_response
-                            }),
-                        )?;
-                        return Err(error);
-                    }
-                }
-            }
-        };
-
-        if stop_if_cancelled(conn, &session.id, step_index)? {
-            break;
-        }
-
-        if let Some(summary) = turn
-            .summary
-            .as_ref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            storage::append_event(
-                conn,
-                &session.id,
-                "reasoning.summary",
-                json!({
-                    "step": step_index,
-                    "text": summary
-                }),
-            )?;
-        }
-
-        if let Some(message) = turn
-            .message
-            .as_ref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            storage::append_event(
-                conn,
-                &session.id,
-                "assistant.message",
-                json!({
-                    "step": step_index,
-                    "text": message
-                }),
-            )?;
-        }
-
-        match session.mode {
-            AgentMode::Ask => {
-                if turn.tool_calls.is_empty() {
-                    storage::append_event(
-                        conn,
-                        &session.id,
-                        "step.ended",
-                        json!({
-                            "step": step_index,
-                            "done": true
-                        }),
-                    )?;
-                    save_step_checkpoint(conn, &session.id, run_id, step_index, true)?;
-                    break;
-                }
-
-                let mut has_pending = false;
-                let mut stopped = false;
-                for call in &turn.tool_calls {
-                    if stop_if_cancelled(conn, &session.id, step_index)? {
-                        stopped = true;
-                        break;
-                    }
-                    let outcome =
-                        execute_turn_tool(app, conn, session, call, tools::ToolExecutionMode::Ask)
-                            .await?;
-                    has_pending |= outcome.pending;
-                }
-                if stopped {
-                    break;
-                }
-
-                storage::append_event(
-                    conn,
-                    &session.id,
-                    "step.ended",
-                    json!({
-                        "step": step_index,
-                        "done": turn.done
-                    }),
-                )?;
-                save_step_checkpoint(conn, &session.id, run_id, step_index, turn.done)?;
-
-                if has_pending {
-                    break;
-                }
-                if should_continue_after_step_checkpoint(step_index, has_pending) {
-                    current_prompt = step_checkpoint_continuation_prompt(step_index);
-                    step_index += 1;
-                    continue;
-                }
-            }
-            AgentMode::Plan => {
-                if turn.tool_calls.is_empty() {
-                    storage::append_event(
-                        conn,
-                        &session.id,
-                        "step.ended",
-                        json!({
-                            "step": step_index,
-                            "done": true
-                        }),
-                    )?;
-                    save_step_checkpoint(conn, &session.id, run_id, step_index, true)?;
-                    break;
-                }
-
-                let mut has_pending = false;
-                let mut stopped = false;
-                for call in &turn.tool_calls {
-                    if stop_if_cancelled(conn, &session.id, step_index)? {
-                        stopped = true;
-                        break;
-                    }
-                    let outcome =
-                        execute_turn_tool(app, conn, session, call, tools::ToolExecutionMode::Plan)
-                            .await?;
-                    has_pending |= outcome.pending;
-                }
-                if stopped {
-                    break;
-                }
-
-                storage::append_event(
-                    conn,
-                    &session.id,
-                    "step.ended",
-                    json!({
-                        "step": step_index,
-                        "done": has_pending,
-                        "pending": has_pending
-                    }),
-                )?;
-                save_step_checkpoint(conn, &session.id, run_id, step_index, has_pending)?;
-
-                if has_pending {
-                    break;
-                }
-                if should_continue_after_step_checkpoint(step_index, has_pending) {
-                    current_prompt = step_checkpoint_continuation_prompt(step_index);
-                    step_index += 1;
-                    continue;
-                }
-            }
-            AgentMode::Agent => {
-                if turn.tool_calls.is_empty() {
-                    storage::append_event(
-                        conn,
-                        &session.id,
-                        "step.ended",
-                        json!({
-                            "step": step_index,
-                            "done": true
-                        }),
-                    )?;
-                    save_step_checkpoint(conn, &session.id, run_id, step_index, true)?;
-                    break;
-                }
-
-                if stop_if_cancelled(conn, &session.id, step_index)? {
-                    break;
-                }
-                let has_pending =
-                    execute_agent_turn_tools(app, conn, session, &turn.tool_calls).await?;
-
-                storage::append_event(
-                    conn,
-                    &session.id,
-                    "step.ended",
-                    json!({
-                        "step": step_index,
-                        "done": has_pending,
-                        "pending": has_pending
-                    }),
-                )?;
-                save_step_checkpoint(conn, &session.id, run_id, step_index, has_pending)?;
-
-                if has_pending {
-                    break;
-                }
-                if should_continue_after_step_checkpoint(step_index, has_pending) {
-                    current_prompt = step_checkpoint_continuation_prompt(step_index);
-                    step_index += 1;
-                    continue;
-                }
-            }
-        }
-
-        step_index += 1;
-    }
-
-    if step_index > MAX_TOTAL_STEPS {
-        let error = max_total_steps_error();
-        storage::append_event(
-            conn,
-            &session.id,
-            "step.failed",
-            json!({
-                "step": MAX_TOTAL_STEPS,
-                "error": error
-            }),
-        )?;
-        return Err(error);
-    }
-
-    Ok(storage::session_events_response(conn, &session.id)?)
-}
-
-fn should_continue_after_step_checkpoint(step_index: usize, has_pending: bool) -> bool {
-    step_index > 0
-        && step_index < MAX_TOTAL_STEPS
-        && step_index % STEP_CHECKPOINT_INTERVAL == 0
-        && !has_pending
-}
-
-fn step_checkpoint_continuation_prompt(step_index: usize) -> String {
-    format!(
-        "You have reached step checkpoint {step_index}. Inspect the latest tool result and decide whether the user's request is complete. If it is complete, provide the final user-facing answer now. If it is not complete, continue working with the next needed tool call. Do not repeat already completed work."
-    )
-}
-
-fn max_total_steps_error() -> String {
-    format!(
-        "Reached the maximum total step budget ({MAX_TOTAL_STEPS}) without completing the request."
-    )
-}
-
-fn save_step_checkpoint(
-    conn: &Connection,
-    session_id: &str,
-    run_id: Option<&str>,
-    step_index: usize,
-    done: bool,
-) -> Result<(), String> {
-    storage::save_session_checkpoint(
-        conn,
-        session_id,
-        run_id,
-        "step.completed",
-        Some(step_index as i64),
-        "ready",
-        json!({
-            "step": step_index,
-            "done": done
-        }),
-    )?;
-    Ok(())
-}
-
 async fn complete_with_retry(
     conn: &Connection,
     session_id: &str,
     step_index: usize,
     request_config: &ProviderRequestConfig,
     system_prompt: &str,
-    user_prompt: &str,
+    current_prompt: &str,
+    initial_user_prompt: &str,
 ) -> Result<provider::ProviderCompletion, String> {
     let mut last_error = None;
+    let mut compacted_after_context_overflow = false;
+    let mut user_prompt = initial_user_prompt.to_string();
     for attempt in 1..=LLM_RETRY_ATTEMPTS {
-        match provider::complete(request_config, system_prompt, user_prompt).await {
+        match provider::complete(request_config, system_prompt, &user_prompt).await {
             Ok(value) => return Ok(value),
             Err(error) => {
                 let info = AppErrorInfo::from_message(&error);
-                let can_retry = info.retryable && attempt < LLM_RETRY_ATTEMPTS;
+                let can_compact_retry = should_compact_retry_after_context_error(
+                    &info,
+                    compacted_after_context_overflow,
+                    attempt,
+                    false,
+                );
+                let can_retry =
+                    (info.retryable && attempt < LLM_RETRY_ATTEMPTS) || can_compact_retry;
                 storage::append_event(
                     conn,
                     session_id,
@@ -872,6 +572,7 @@ async fn complete_with_retry(
                         "attempt": attempt,
                         "maxAttempts": LLM_RETRY_ATTEMPTS,
                         "retrying": can_retry,
+                        "compacting": can_compact_retry,
                         "error": info.to_value()
                     }),
                 )?;
@@ -879,6 +580,13 @@ async fn complete_with_retry(
                     return Err(error);
                 }
                 last_error = Some(error);
+                if can_compact_retry {
+                    let _ = compact_session_with_provider(conn, session_id, request_config).await?;
+                    user_prompt =
+                        build_user_prompt(conn, session_id, current_prompt, request_config)?;
+                    compacted_after_context_overflow = true;
+                    continue;
+                }
                 let delay_ms = LLM_RETRY_BASE_DELAY_MS * 2_u64.pow((attempt - 1) as u32);
                 sleep(Duration::from_millis(delay_ms)).await;
             }
@@ -893,9 +601,13 @@ async fn stream_openai_compatible_with_retry(
     step_index: usize,
     provider_record_id: &str,
     request_config: &ProviderRequestConfig,
-    messages: &[Value],
+    stream_system_prompt: &str,
+    current_prompt: &str,
+    initial_messages: &[Value],
 ) -> Result<ModelTurn, String> {
     let mut last_error = None;
+    let mut compacted_after_context_overflow = false;
+    let mut messages = initial_messages.to_vec();
     for attempt in 1..=LLM_RETRY_ATTEMPTS {
         let mut sink = StreamEventSink::new(
             conn,
@@ -905,7 +617,7 @@ async fn stream_openai_compatible_with_retry(
             request_config,
         );
         let mut emitted_stream_event = false;
-        let result = provider::stream_openai_compatible(request_config, messages, |event| {
+        let result = provider::stream_openai_compatible(request_config, &messages, |event| {
             emitted_stream_event = true;
             sink.handle(event)
         })
@@ -918,8 +630,14 @@ async fn stream_openai_compatible_with_retry(
             }
             Err(error) => {
                 let info = AppErrorInfo::from_message(&error);
-                let can_retry =
-                    info.retryable && !emitted_stream_event && attempt < LLM_RETRY_ATTEMPTS;
+                let can_compact_retry = should_compact_retry_after_context_error(
+                    &info,
+                    compacted_after_context_overflow,
+                    attempt,
+                    emitted_stream_event,
+                );
+                let can_retry = ((info.retryable && !emitted_stream_event) || can_compact_retry)
+                    && attempt < LLM_RETRY_ATTEMPTS;
                 storage::append_event(
                     conn,
                     session_id,
@@ -929,6 +647,7 @@ async fn stream_openai_compatible_with_retry(
                         "attempt": attempt,
                         "maxAttempts": LLM_RETRY_ATTEMPTS,
                         "retrying": can_retry,
+                        "compacting": can_compact_retry,
                         "error": info.to_value()
                     }),
                 )?;
@@ -936,12 +655,36 @@ async fn stream_openai_compatible_with_retry(
                     return Err(error);
                 }
                 last_error = Some(error);
+                if can_compact_retry {
+                    let _ = compact_session_with_provider(conn, session_id, request_config).await?;
+                    messages = build_stream_messages(
+                        conn,
+                        session_id,
+                        stream_system_prompt,
+                        current_prompt,
+                        request_config,
+                    )?;
+                    compacted_after_context_overflow = true;
+                    continue;
+                }
                 let delay_ms = LLM_RETRY_BASE_DELAY_MS * 2_u64.pow((attempt - 1) as u32);
                 sleep(Duration::from_millis(delay_ms)).await;
             }
         }
     }
     Err(last_error.unwrap_or_else(crate::i18n::ai_request_failed))
+}
+
+fn should_compact_retry_after_context_error(
+    info: &AppErrorInfo,
+    already_compacted: bool,
+    attempt: usize,
+    emitted_stream_event: bool,
+) -> bool {
+    info.kind == ErrorKind::ContextLimit
+        && !already_compacted
+        && !emitted_stream_event
+        && attempt < LLM_RETRY_ATTEMPTS
 }
 
 fn record_agent_failure(
@@ -996,609 +739,6 @@ fn recovery_prompt(checkpoint: &crate::types::SessionCheckpointRecord) -> String
     )
 }
 
-async fn execute_turn_tool(
-    app: &AppHandle,
-    conn: &Connection,
-    session: &crate::types::SessionRecord,
-    call: &ToolCallRequest,
-    mode: tools::ToolExecutionMode,
-) -> Result<tools::ToolOutcome, String> {
-    if normalize_tool_name(&call.name) == "task" {
-        if mode == tools::ToolExecutionMode::Ask {
-            return execute_task_blocked(conn, session, call);
-        }
-        execute_task_tool(app, conn, session, call).await
-    } else {
-        tools::execute_tool_with_mode(conn, session, &session.shell_mode, call, mode)
-    }
-}
-
-fn execute_task_blocked(
-    conn: &Connection,
-    session: &crate::types::SessionRecord,
-    call: &ToolCallRequest,
-) -> Result<tools::ToolOutcome, String> {
-    let called = storage::append_event(
-        conn,
-        &session.id,
-        "tool.called",
-        json!({
-            "toolCallId": call.tool_call_id,
-            "name": call.name,
-            "input": call.input
-        }),
-    )?;
-    storage::append_event(
-        conn,
-        &session.id,
-        "tool.failed",
-        json!({
-            "toolCallEventId": called.id,
-            "name": call.name,
-            "result": {
-                "blocked": true,
-                "reason": crate::i18n::task_blocked_in_current_mode()
-            }
-        }),
-    )?;
-    Ok(tools::ToolOutcome { pending: false })
-}
-
-struct TaskRun {
-    called_event_id: String,
-    call_name: String,
-    child_id: String,
-    description: String,
-    subagent_type: String,
-    handle: tauri::async_runtime::JoinHandle<Result<SessionEventsResponse, String>>,
-}
-
-async fn execute_agent_turn_tools(
-    app: &AppHandle,
-    conn: &Connection,
-    session: &crate::types::SessionRecord,
-    calls: &[ToolCallRequest],
-) -> Result<bool, String> {
-    let mut has_pending = false;
-    let mut task_runs = Vec::new();
-    for call in calls {
-        if normalize_tool_name(&call.name) == "task" {
-            let task = start_task_tool(app, conn, session, call)?;
-            if task_background(&call.input) {
-                if let Some(job) = running_background_task_job(conn, &session.id, &task.child_id)? {
-                    mark_task_tool_background_updated(conn, &session.id, &task, &job.id)?;
-                    detach_task_extension(task);
-                } else {
-                    let job_id = mark_task_tool_background_started(conn, &session.id, &task)?;
-                    detach_task_tool(app.clone(), session.id.clone(), task, job_id);
-                }
-            } else {
-                task_runs.push(task);
-            }
-        } else {
-            let outcome = tools::execute_tool(conn, session, &session.shell_mode, call)?;
-            has_pending |= outcome.pending;
-        }
-    }
-    for task in task_runs {
-        let outcome = finish_task_tool(app, conn, &session.id, task).await?;
-        has_pending |= outcome.pending;
-    }
-    Ok(has_pending)
-}
-
-async fn execute_task_tool(
-    app: &AppHandle,
-    conn: &Connection,
-    session: &crate::types::SessionRecord,
-    call: &ToolCallRequest,
-) -> Result<tools::ToolOutcome, String> {
-    let task = start_task_tool(app, conn, session, call)?;
-    if task_background(&call.input) {
-        if let Some(job) = running_background_task_job(conn, &session.id, &task.child_id)? {
-            mark_task_tool_background_updated(conn, &session.id, &task, &job.id)?;
-            detach_task_extension(task);
-        } else {
-            let job_id = mark_task_tool_background_started(conn, &session.id, &task)?;
-            detach_task_tool(app.clone(), session.id.clone(), task, job_id);
-        }
-        return Ok(tools::ToolOutcome { pending: false });
-    }
-    finish_task_tool(app, conn, &session.id, task).await
-}
-
-fn start_task_tool(
-    app: &AppHandle,
-    conn: &Connection,
-    session: &crate::types::SessionRecord,
-    call: &ToolCallRequest,
-) -> Result<TaskRun, String> {
-    let description =
-        task_string(&call.input, &["description"]).unwrap_or_else(|_| "Subagent task".to_string());
-    let prompt = task_string(&call.input, &["prompt", "task"])?;
-    let subagent_type = task_string(&call.input, &["subagent_type", "subagentType"])
-        .unwrap_or_else(|_| "general".to_string());
-    let requested_child_id = task_optional_string(&call.input, &["task_id", "taskId"]);
-    let child = if let Some(child_id) = requested_child_id {
-        let child = storage::get_session(conn, &child_id)?;
-        if child.parent_session_id.as_deref() != Some(session.id.as_str()) {
-            return Err("task_id 不属于当前父会话。".to_string());
-        }
-        child
-    } else {
-        let child_title = format!("{description} (@{subagent_type} subagent)");
-        storage::create_child_session(conn, session, &child_title)?
-    };
-    let called = storage::append_event(
-        conn,
-        &session.id,
-        "tool.called",
-        json!({
-            "toolCallId": call.tool_call_id,
-            "name": call.name,
-            "input": call.input,
-            "metadata": {
-                "parentSessionId": session.id,
-                "sessionId": child.id,
-                "subagentType": subagent_type
-            }
-        }),
-    )?;
-    storage::append_event(
-        conn,
-        &session.id,
-        if child.parent_session_id.as_deref() == Some(session.id.as_str())
-            && task_optional_string(&call.input, &["task_id", "taskId"]).is_some()
-        {
-            "task.resumed"
-        } else {
-            "task.created"
-        },
-        json!({
-            "toolCallEventId": called.id,
-            "sessionId": child.id,
-            "description": description,
-            "subagentType": subagent_type
-        }),
-    )?;
-
-    let app_handle = app.clone();
-    let child_id = child.id.clone();
-    let child_id_for_task = child_id.clone();
-    let prompt_for_task = prompt.clone();
-    let handle = tauri::async_runtime::spawn_blocking(move || {
-        let child_conn = storage::open_db(&app_handle)?;
-        tauri::async_runtime::block_on(prompt_session(
-            &app_handle,
-            &child_conn,
-            PromptSessionInput {
-                id: None,
-                session_id: child_id_for_task,
-                prompt: prompt_for_task,
-                attachments: Vec::new(),
-                delivery: Some(SessionInputDelivery::Queue),
-                resume: true,
-            },
-        ))
-    });
-
-    Ok(TaskRun {
-        called_event_id: called.id,
-        call_name: call.name.clone(),
-        child_id,
-        description,
-        subagent_type,
-        handle,
-    })
-}
-
-async fn finish_task_tool(
-    app: &AppHandle,
-    conn: &Connection,
-    parent_session_id: &str,
-    mut task: TaskRun,
-) -> Result<tools::ToolOutcome, String> {
-    let child_id = task.child_id.clone();
-    let (promote_sender, promote_receiver) = tokio::sync::oneshot::channel();
-    task_registry::register_promotable(&child_id, promote_sender);
-
-    let result = match select(&mut task.handle, promote_receiver).await {
-        Either::Left((result, _)) => {
-            task_registry::unregister_promotable(&child_id);
-            result.map_err(|error| error.to_string())?
-        }
-        Either::Right((_promoted, _)) => {
-            let job_id = mark_task_tool_background_started(conn, parent_session_id, &task)?;
-            detach_task_tool(app.clone(), parent_session_id.to_string(), task, job_id);
-            return Ok(tools::ToolOutcome { pending: false });
-        }
-    };
-
-    match result {
-        Ok(response) => {
-            let output = task_output_text(&response);
-            storage::set_session_status(conn, &task.child_id, "completed")?;
-            storage::append_event(
-                conn,
-                parent_session_id,
-                "tool.success",
-                json!({
-                    "toolCallEventId": task.called_event_id,
-                    "name": task.call_name,
-                    "result": {
-                        "taskId": task.child_id,
-                        "sessionId": task.child_id,
-                        "description": task.description,
-                        "subagentType": task.subagent_type,
-                        "status": "completed",
-                        "output": output
-                    }
-                }),
-            )?;
-            storage::append_event(
-                conn,
-                parent_session_id,
-                "task.completed",
-                json!({
-                    "toolCallEventId": task.called_event_id,
-                    "sessionId": task.child_id,
-                    "description": task.description
-                }),
-            )?;
-        }
-        Err(error) => {
-            storage::set_session_status(conn, &task.child_id, "failed")?;
-            storage::append_event(
-                conn,
-                parent_session_id,
-                "tool.failed",
-                json!({
-                    "toolCallEventId": task.called_event_id,
-                    "name": task.call_name,
-                    "result": {
-                        "taskId": task.child_id,
-                        "sessionId": task.child_id,
-                        "description": task.description,
-                        "subagentType": task.subagent_type,
-                        "status": "failed",
-                        "error": error
-                    }
-                }),
-            )?;
-            storage::append_event(
-                conn,
-                parent_session_id,
-                "task.failed",
-                json!({
-                    "toolCallEventId": task.called_event_id,
-                    "sessionId": task.child_id,
-                    "description": task.description,
-                    "error": error
-                }),
-            )?;
-        }
-    }
-
-    Ok(tools::ToolOutcome { pending: false })
-}
-
-fn mark_task_tool_background_started(
-    conn: &Connection,
-    parent_session_id: &str,
-    task: &TaskRun,
-) -> Result<String, String> {
-    let parent = storage::get_session(conn, parent_session_id)?;
-    let job = storage::insert_background_job(
-        conn,
-        parent_session_id,
-        &task_registry::task_command(&task.child_id),
-        &parent.project_root,
-        0,
-        None,
-    )?;
-    storage::append_event(
-        conn,
-        parent_session_id,
-        "tool.success",
-        json!({
-            "toolCallEventId": task.called_event_id,
-            "name": task.call_name,
-            "result": {
-                "taskId": task.child_id,
-                "sessionId": task.child_id,
-                "jobId": job.id,
-                "description": task.description,
-                "subagentType": task.subagent_type,
-                "status": "running",
-                "background": true,
-                "output": BACKGROUND_TASK_STARTED
-            }
-        }),
-    )?;
-    storage::append_event(
-        conn,
-        parent_session_id,
-        "task.background.started",
-        json!({
-            "toolCallEventId": task.called_event_id,
-            "sessionId": task.child_id,
-            "jobId": job.id,
-            "description": task.description,
-            "subagentType": task.subagent_type
-        }),
-    )?;
-    task_registry::register(&job.id);
-    Ok(job.id)
-}
-
-fn mark_task_tool_background_updated(
-    conn: &Connection,
-    parent_session_id: &str,
-    task: &TaskRun,
-    job_id: &str,
-) -> Result<(), String> {
-    storage::append_event(
-        conn,
-        parent_session_id,
-        "tool.success",
-        json!({
-            "toolCallEventId": task.called_event_id,
-            "name": task.call_name,
-            "result": {
-                "taskId": task.child_id,
-                "sessionId": task.child_id,
-                "jobId": job_id,
-                "description": task.description,
-                "subagentType": task.subagent_type,
-                "status": "running",
-                "background": true,
-                "updated": true,
-                "output": BACKGROUND_TASK_UPDATED
-            }
-        }),
-    )?;
-    storage::append_event(
-        conn,
-        parent_session_id,
-        "task.background.updated",
-        json!({
-            "toolCallEventId": task.called_event_id,
-            "sessionId": task.child_id,
-            "jobId": job_id,
-            "description": task.description,
-            "subagentType": task.subagent_type
-        }),
-    )?;
-    Ok(())
-}
-
-fn running_background_task_job(
-    conn: &Connection,
-    parent_session_id: &str,
-    child_session_id: &str,
-) -> Result<Option<crate::types::BackgroundJobRecord>, String> {
-    let command = task_registry::task_command(child_session_id);
-    Ok(storage::list_background_jobs(conn, parent_session_id)?
-        .into_iter()
-        .find(|job| job.command == command && job.status == "running"))
-}
-
-fn detach_task_extension(task: TaskRun) {
-    tauri::async_runtime::spawn(async move {
-        if let Err(error) = task
-            .handle
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|inner| inner.map(|_| ()))
-        {
-            log::error!("background task extension failed: {error}");
-        }
-    });
-}
-
-fn detach_task_tool(app: AppHandle, parent_session_id: String, task: TaskRun, job_id: String) {
-    tauri::async_runtime::spawn(async move {
-        let called_event_id = task.called_event_id.clone();
-        let call_name = task.call_name.clone();
-        let child_id = task.child_id.clone();
-        let description = task.description.clone();
-        let subagent_type = task.subagent_type.clone();
-        let result = task.handle.await.map_err(|error| error.to_string());
-        task_registry::unregister(&job_id);
-        let app_for_finish = app.clone();
-        let finish = tauri::async_runtime::spawn_blocking(move || {
-            let conn = storage::open_db(&app_for_finish)?;
-            let notification = finish_background_task_tool(
-                &conn,
-                &parent_session_id,
-                TaskCompletion {
-                    called_event_id,
-                    call_name,
-                    child_id,
-                    description,
-                    subagent_type,
-                    job_id,
-                    result,
-                },
-            )?;
-            if let Some(prompt) = notification {
-                tauri::async_runtime::block_on(prompt_session(
-                    &app_for_finish,
-                    &conn,
-                    PromptSessionInput {
-                        id: None,
-                        session_id: parent_session_id,
-                        prompt,
-                        attachments: Vec::new(),
-                        delivery: Some(SessionInputDelivery::Queue),
-                        resume: true,
-                    },
-                ))
-                .map(|_| ())?;
-            }
-            Ok::<(), String>(())
-        })
-        .await
-        .map_err(|error| error.to_string())
-        .and_then(|inner| inner);
-        if let Err(error) = finish {
-            log::error!("background task completion failed: {error}");
-        }
-    });
-}
-
-struct TaskCompletion {
-    called_event_id: String,
-    call_name: String,
-    child_id: String,
-    description: String,
-    subagent_type: String,
-    job_id: String,
-    result: Result<Result<SessionEventsResponse, String>, String>,
-}
-
-fn finish_background_task_tool(
-    conn: &Connection,
-    parent_session_id: &str,
-    task: TaskCompletion,
-) -> Result<Option<String>, String> {
-    match task.result {
-        Ok(Ok(response)) => {
-            let output = task_output_text(&response);
-            let cancelled = storage::get_background_job(conn, &task.job_id)
-                .map(|job| job.status == "cancelled")
-                .unwrap_or(false);
-            if cancelled {
-                storage::set_session_status(conn, &task.child_id, "cancelled")?;
-                storage::append_event(
-                    conn,
-                    parent_session_id,
-                    "task.failed",
-                    json!({
-                        "toolCallEventId": task.called_event_id,
-                        "name": task.call_name,
-                        "sessionId": task.child_id,
-                        "jobId": task.job_id,
-                        "description": task.description,
-                        "subagentType": task.subagent_type,
-                        "status": "cancelled",
-                        "background": true,
-                        "cancelled": true,
-                        "output": output
-                    }),
-                )?;
-                return Ok(None);
-            }
-            storage::update_background_job_status(conn, &task.job_id, "completed")?;
-            storage::set_session_status(conn, &task.child_id, "completed")?;
-            storage::append_event(
-                conn,
-                parent_session_id,
-                "task.completed",
-                json!({
-                    "toolCallEventId": task.called_event_id,
-                    "sessionId": task.child_id,
-                    "jobId": task.job_id,
-                    "description": task.description,
-                    "subagentType": task.subagent_type,
-                    "background": true,
-                    "output": output
-                }),
-            )?;
-            Ok(Some(render_background_task_prompt(
-                &task.child_id,
-                &task.description,
-                "completed",
-                &output,
-            )))
-        }
-        Ok(Err(error)) | Err(error) => {
-            let cancelled = storage::get_background_job(conn, &task.job_id)
-                .map(|job| job.status == "cancelled")
-                .unwrap_or(false);
-            let status = if cancelled { "cancelled" } else { "failed" };
-            if !cancelled {
-                storage::update_background_job_status(conn, &task.job_id, status)?;
-            }
-            storage::set_session_status(conn, &task.child_id, status)?;
-            storage::append_event(
-                conn,
-                parent_session_id,
-                "task.failed",
-                json!({
-                    "toolCallEventId": task.called_event_id,
-                    "name": task.call_name,
-                    "sessionId": task.child_id,
-                    "jobId": task.job_id,
-                    "description": task.description,
-                    "subagentType": task.subagent_type,
-                    "status": status,
-                    "background": true,
-                    "cancelled": cancelled,
-                    "error": error
-                }),
-            )?;
-            Ok(Some(render_background_task_prompt(
-                &task.child_id,
-                &task.description,
-                status,
-                &error,
-            )))
-        }
-    }
-}
-
-fn render_background_task_prompt(
-    session_id: &str,
-    description: &str,
-    state: &str,
-    text: &str,
-) -> String {
-    format!(
-        "<task id=\"{session_id}\" state=\"{state}\">\n<summary>Background task {state}: {description}</summary>\n<task_result>\n{text}\n</task_result>\n</task>"
-    )
-}
-
-fn task_string(input: &Value, keys: &[&str]) -> Result<String, String> {
-    for key in keys {
-        if let Some(value) = input.get(*key).and_then(Value::as_str) {
-            let value = value.trim();
-            if !value.is_empty() {
-                return Ok(value.to_string());
-            }
-        }
-    }
-    Err(format!("task 缺少必填字段: {}", keys[0]))
-}
-
-fn task_optional_string(input: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|key| input.get(*key).and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-fn task_background(input: &Value) -> bool {
-    input
-        .get("background")
-        .or_else(|| input.get("runInBackground"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
-
-fn task_output_text(response: &SessionEventsResponse) -> String {
-    response
-        .events
-        .iter()
-        .rev()
-        .find(|event| event.event_type == "assistant.message")
-        .and_then(|event| event.data.get("text"))
-        .and_then(Value::as_str)
-        .unwrap_or(crate::i18n::subtask_completed_without_text())
-        .to_string()
-}
-
 fn normalize_tool_name(name: &str) -> String {
     match name.trim().to_ascii_lowercase().as_str() {
         "todowrite" => "todo_write".to_string(),
@@ -1636,204 +776,6 @@ fn stop_if_cancelled(
     )?;
     storage::set_session_status(conn, session_id, "active")?;
     Ok(true)
-}
-
-pub fn compact_session(
-    conn: &Connection,
-    session_id: &str,
-) -> Result<ContextSummaryRecord, String> {
-    let events = storage::list_events(conn, session_id)?;
-    if events.is_empty() {
-        return storage::insert_context_summary(
-            conn,
-            session_id,
-            crate::i18n::session_has_no_events(),
-            0,
-        );
-    }
-
-    let recent_event_seq = events.last().map(|event| event.seq).unwrap_or(0);
-    let text = summarize_events(&events);
-    let summary = storage::insert_context_summary(conn, session_id, text, recent_event_seq)?;
-    storage::append_event(
-        conn,
-        session_id,
-        "context.compacted",
-        json!({
-            "summaryId": summary.id,
-            "recentEventSeq": summary.recent_event_seq
-        }),
-    )?;
-    Ok(summary)
-}
-
-pub async fn compact_session_with_provider(
-    conn: &Connection,
-    session_id: &str,
-    provider: &ProviderRequestConfig,
-) -> Result<ContextSummaryRecord, String> {
-    let events = storage::list_events(conn, session_id)?;
-    if events.is_empty() {
-        return storage::insert_context_summary(
-            conn,
-            session_id,
-            crate::i18n::session_has_no_events(),
-            0,
-        );
-    }
-
-    let context_limit = provider.context_token_limit.unwrap_or(0);
-    let max_output_tokens = provider.output_token_limit.unwrap_or(4096);
-    let (head_events, tail_events) =
-        split_events_for_compaction(&events, context_limit, max_output_tokens);
-    let text = if head_events.is_empty() {
-        crate::i18n::earlier_context_empty_recent_kept()
-    } else {
-        match compact_with_llm(&head_events, provider).await {
-            Ok(summary) if !summary.trim().is_empty() => summary,
-            _ => summarize_events(&head_events),
-        }
-    };
-    let latest_seq = events.last().map(|event| event.seq).unwrap_or(0);
-    let recent_event_seq = tail_events
-        .first()
-        .map(|event| event.seq)
-        .unwrap_or(latest_seq);
-    let prune_before_seq = tail_events
-        .first()
-        .map(|event| event.seq)
-        .unwrap_or_else(|| latest_seq.saturating_add(1));
-    prune_tool_outputs(conn, session_id, prune_before_seq)?;
-    let summary = storage::insert_context_summary(conn, session_id, text, recent_event_seq)?;
-    storage::append_event(
-        conn,
-        session_id,
-        "context.compacted",
-        json!({
-            "summaryId": summary.id,
-            "recentEventSeq": summary.recent_event_seq,
-            "prunedBeforeEventSeq": prune_before_seq
-        }),
-    )?;
-    Ok(summary)
-}
-
-fn is_overflow(usage: &Value, context_limit: u64, max_output_tokens: u64) -> bool {
-    if context_limit == 0 {
-        return false;
-    }
-    let reserved = if max_output_tokens > 0 {
-        max_output_tokens.min(20_000)
-    } else {
-        4096
-    };
-    let usable = context_limit.saturating_sub(reserved);
-    if usable == 0 {
-        return false;
-    }
-    let total = usage_token_sum(usage);
-    total >= usable
-}
-
-fn usage_token_sum(usage: &Value) -> u64 {
-    if let Some(tokens) = usage.get("tokens") {
-        let input = tokens.get("input").and_then(value_as_u64).unwrap_or(0);
-        let output = tokens.get("output").and_then(value_as_u64).unwrap_or(0);
-        let reasoning = tokens.get("reasoning").and_then(value_as_u64).unwrap_or(0);
-        let cache = tokens.get("cache").unwrap_or(&Value::Null);
-        let cache_read = cache.get("read").and_then(value_as_u64).unwrap_or(0);
-        let cache_write = cache.get("write").and_then(value_as_u64).unwrap_or(0);
-        return input + output + reasoning + cache_read + cache_write;
-    }
-
-    let input_tokens = usage_number(
-        usage,
-        &["inputTokens", "prompt_tokens", "input_tokens"],
-        &[],
-    );
-    let output_tokens = usage_number(
-        usage,
-        &["outputTokens", "completion_tokens", "output_tokens"],
-        &[],
-    );
-    let cache_read_tokens = usage_number(
-        usage,
-        &[
-            "cacheReadInputTokens",
-            "cachedInputTokens",
-            "cache_read_input_tokens",
-        ],
-        &[
-            &["inputTokenDetails", "cacheReadTokens"],
-            &["prompt_tokens_details", "cached_tokens"],
-            &["promptTokensDetails", "cachedTokens"],
-        ],
-    );
-    let cache_write_tokens = usage_number(
-        usage,
-        &["cacheWriteInputTokens", "cache_write_input_tokens"],
-        &[
-            &["inputTokenDetails", "cacheWriteTokens"],
-            &["prompt_tokens_details", "cache_write_tokens"],
-            &["promptTokensDetails", "cacheWriteTokens"],
-        ],
-    );
-    let reasoning_tokens = usage_number(
-        usage,
-        &["reasoningTokens", "reasoning_tokens"],
-        &[
-            &["outputTokenDetails", "reasoningTokens"],
-            &["completion_tokens_details", "reasoning_tokens"],
-            &["completionTokensDetails", "reasoningTokens"],
-        ],
-    );
-    let input = input_tokens
-        .saturating_sub(cache_read_tokens)
-        .saturating_sub(cache_write_tokens);
-    let output = output_tokens.saturating_sub(reasoning_tokens);
-    input + output + reasoning_tokens + cache_read_tokens + cache_write_tokens
-}
-
-async fn maybe_auto_compact(
-    conn: &Connection,
-    session_id: &str,
-    provider: Option<&ProviderRequestConfig>,
-    context_token_limit: Option<u64>,
-    output_token_limit: Option<u64>,
-) -> Result<(), String> {
-    let events = storage::list_events(conn, session_id)?;
-    let summaries = storage::list_context_summaries(conn, session_id)?;
-    let latest_seq = events.last().map(|event| event.seq).unwrap_or(0);
-    let latest_summary_seq = summaries
-        .first()
-        .map(|summary| summary.recent_event_seq)
-        .unwrap_or(0);
-
-    if latest_seq.saturating_sub(latest_summary_seq) <= AUTO_COMPACT_EVENT_THRESHOLD as i64 {
-        return Ok(());
-    }
-
-    if let Some(context_limit) = context_token_limit.filter(|limit| *limit > 0) {
-        let latest_usage = events
-            .iter()
-            .rev()
-            .find(|event| event.event_type == "llm.stream.finished")
-            .and_then(|event| event.data.get("usage"));
-
-        if let Some(usage) = latest_usage {
-            let max_output = output_token_limit.unwrap_or(0);
-            if is_overflow(usage, context_limit, max_output) {
-                if let Some(provider) = provider {
-                    let _ = compact_session_with_provider(conn, session_id, provider).await?;
-                } else {
-                    let _ = compact_session(conn, session_id)?;
-                }
-                return Ok(());
-            }
-        }
-    }
-
-    Ok(())
 }
 
 fn build_system_prompt(
@@ -3078,178 +2020,6 @@ fn skip_ascii_ws(bytes: &[u8], mut index: usize) -> usize {
     index
 }
 
-fn split_events_for_compaction(
-    events: &[EventRecord],
-    context_limit: u64,
-    max_output_tokens: u64,
-) -> (Vec<EventRecord>, Vec<EventRecord>) {
-    if events.is_empty() {
-        return (Vec::new(), Vec::new());
-    }
-    let output_budget = if max_output_tokens > 0 {
-        max_output_tokens
-    } else {
-        4096
-    };
-    let context_budget = if context_limit > 0 {
-        context_limit.saturating_mul(15) / 100
-    } else {
-        output_budget
-    };
-    let preserve_budget = output_budget.min(context_budget).max(1);
-    let mut used = 0_u64;
-    let mut split_index = events.len();
-
-    for (index, event) in events.iter().enumerate().rev() {
-        let tokens = estimate_event_tokens(event).max(1);
-        if used > 0 && used.saturating_add(tokens) > preserve_budget {
-            break;
-        }
-        used = used.saturating_add(tokens);
-        split_index = index;
-    }
-
-    (
-        events[..split_index].to_vec(),
-        events[split_index..].to_vec(),
-    )
-}
-
-fn estimate_event_tokens(event: &EventRecord) -> u64 {
-    let text = serde_json::to_string(&event.data).unwrap_or_default();
-    (text.chars().count() as u64 / 4).max(1)
-}
-
-async fn compact_with_llm(
-    events: &[EventRecord],
-    provider: &ProviderRequestConfig,
-) -> Result<String, String> {
-    let messages = events
-        .iter()
-        .filter_map(compaction_event_line)
-        .collect::<Vec<_>>()
-        .join("\n");
-    if messages.trim().is_empty() {
-        return Ok(crate::i18n::compaction_empty_history().to_string());
-    }
-    let user_prompt = crate::i18n::compaction_prompt(&truncate(&messages, 64_000));
-    let mut compaction_provider = provider.clone();
-    compaction_provider.tool_mode = ToolMode::Json;
-    let completion = provider::complete(
-        &compaction_provider,
-        crate::i18n::compaction_system_prompt(),
-        &user_prompt,
-    )
-    .await?;
-    Ok(truncate(completion.raw_response.trim(), 24_000))
-}
-
-fn compaction_event_line(event: &EventRecord) -> Option<String> {
-    let detail = match event.event_type.as_str() {
-        "prompt.submitted" => event
-            .data
-            .get("prompt")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        "assistant.message" | "assistant.message.delta" => event
-            .data
-            .get("text")
-            .and_then(Value::as_str)
-            .map(|text| sanitize_assistant_content(text).text)
-            .unwrap_or_default(),
-        "reasoning.summary" | "reasoning.summary.delta" => event
-            .data
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        "tool.called" => {
-            let name = event.data.get("name").and_then(Value::as_str).unwrap_or("");
-            let input = compact_json(event.data.get("input").unwrap_or(&Value::Null));
-            format!("{name} input={input}")
-        }
-        "tool.success" | "tool.failed" | "tool.pending" | "tool.rejected" => {
-            let name = event.data.get("name").and_then(Value::as_str).unwrap_or("");
-            let result = tool_result_content(event);
-            format!("{name} result={result}")
-        }
-        _ => return None,
-    };
-    let detail = detail.trim();
-    if detail.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "#{} {} {}",
-            event.seq,
-            event.event_type,
-            truncate(detail, 2_000)
-        ))
-    }
-}
-
-fn prune_tool_outputs(
-    conn: &Connection,
-    session_id: &str,
-    before_event_seq: i64,
-) -> Result<(), String> {
-    for event in storage::list_events(conn, session_id)? {
-        if event.seq >= before_event_seq || event.event_type != "tool.success" {
-            continue;
-        }
-        let mut data = event.data.clone();
-        if let Some(object) = data.as_object_mut() {
-            if object.get("result") == Some(&json!("<erased>")) {
-                continue;
-            }
-            object.insert("result".to_string(), json!("<erased>"));
-            storage::update_event_data(conn, &event.id, &data)?;
-        }
-    }
-    Ok(())
-}
-
-fn summarize_events(events: &[crate::types::EventRecord]) -> String {
-    let mut lines = vec![crate::i18n::local_context_summary_header().to_string()];
-    for event in events.iter().rev().take(60).rev() {
-        let detail = match event.event_type.as_str() {
-            "prompt.submitted" => event
-                .data
-                .get("prompt")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            "assistant.message" => event
-                .data
-                .get("text")
-                .and_then(Value::as_str)
-                .map(|text| sanitize_assistant_content(text).text)
-                .unwrap_or_default(),
-            "reasoning.summary" => event
-                .data
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            "tool.success" | "tool.failed" | "tool.pending" => event
-                .data
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            _ => String::new(),
-        };
-        lines.push(format!(
-            "#{} {} {}",
-            event.seq,
-            event.event_type,
-            truncate(&detail, 500)
-        ));
-    }
-    truncate(&lines.join("\n"), 24_000)
-}
-
 fn compact_json(value: &Value) -> String {
     let text = json_text(value);
     truncate(&text, 2_000)
@@ -3271,7 +2041,14 @@ fn truncate(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::run_loop::{
+        should_continue_after_step_checkpoint, step_checkpoint_continuation_prompt,
+    };
     use super::*;
+    use crate::runner::background_task::{
+        running_background_task_job, task_background, task_optional_string,
+    };
+    use crate::runner::compaction::{is_overflow, split_events_for_compaction};
 
     #[test]
     fn system_prompts_prefer_shell_and_read_search() {
@@ -3315,6 +2092,106 @@ mod tests {
             task_optional_string(&json!({}), &["task_id", "taskId"]),
             None
         );
+    }
+
+    #[test]
+    fn running_background_task_job_reuses_only_active_task_job() {
+        let conn = Connection::open_in_memory().unwrap();
+        storage::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, project_root, mode, provider_id, title, status, shell_mode, created_at, updated_at)
+             VALUES ('parent-1', 'E:/oDot', 'agent', 'p1', 'Parent', 'active', 'auto', '1', '1')",
+            [],
+        )
+        .unwrap();
+        let command = task_registry::task_command("child-1");
+        let completed =
+            storage::insert_background_job(&conn, "parent-1", &command, "E:/oDot", 0, None)
+                .unwrap();
+        storage::update_background_job_status(
+            &conn,
+            &completed.id,
+            BackgroundTaskStatus::Completed.as_str(),
+        )
+        .unwrap();
+        let recoverable =
+            storage::insert_background_job(&conn, "parent-1", &command, "E:/oDot", 0, None)
+                .unwrap();
+        storage::update_background_job_status(
+            &conn,
+            &recoverable.id,
+            BackgroundTaskStatus::Recoverable.as_str(),
+        )
+        .unwrap();
+        let running =
+            storage::insert_background_job(&conn, "parent-1", &command, "E:/oDot", 0, None)
+                .unwrap();
+
+        let found = running_background_task_job(&conn, "parent-1", "child-1")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(found.id, running.id);
+    }
+
+    #[test]
+    fn durable_recovery_marks_running_task_job_recoverable_and_notifies_parent() {
+        let conn = Connection::open_in_memory().unwrap();
+        storage::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, project_root, mode, provider_id, title, status, shell_mode, created_at, updated_at)
+             VALUES ('parent-1', 'E:/oDot', 'agent', 'p1', 'Parent', 'active', 'auto', '1', '1'),
+                    ('child-1', 'E:/oDot', 'agent', 'p1', 'Child', 'active', 'auto', '1', '1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE session SET parent_session_id = 'parent-1' WHERE id = 'child-1'",
+            [],
+        )
+        .unwrap();
+        let job = storage::insert_background_job(
+            &conn,
+            "parent-1",
+            &task_registry::task_command("child-1"),
+            "E:/oDot",
+            0,
+            None,
+        )
+        .unwrap();
+
+        let sessions = prepare_durable_recovery(&conn).unwrap();
+        let recovered_job = storage::get_background_job(&conn, &job.id).unwrap();
+        let events = storage::list_events(&conn, "parent-1").unwrap();
+        let inputs = storage::list_session_inputs(&conn, "parent-1").unwrap();
+
+        assert_eq!(sessions, vec!["parent-1".to_string()]);
+        assert_eq!(recovered_job.status, "recoverable");
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "task.recoverable"));
+        assert!(inputs.iter().any(|input| input.status == "pending"));
+    }
+
+    #[test]
+    fn context_limit_errors_trigger_one_compaction_retry_before_stream_output() {
+        let info = AppErrorInfo::from_message("context_length_exceeded: too many tokens");
+
+        assert!(should_compact_retry_after_context_error(
+            &info, false, 1, false
+        ));
+        assert!(!should_compact_retry_after_context_error(
+            &info, true, 1, false
+        ));
+        assert!(!should_compact_retry_after_context_error(
+            &info, false, 1, true
+        ));
+        assert!(!should_compact_retry_after_context_error(
+            &info,
+            false,
+            LLM_RETRY_ATTEMPTS,
+            false
+        ));
     }
 
     #[test]

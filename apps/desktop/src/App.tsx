@@ -50,6 +50,7 @@ import {
   compactSession,
   continueSession,
   createSession,
+  deleteQueuedInput,
   deleteSession,
   fetchProjectFiles,
   findOpencodeConfig,
@@ -64,6 +65,7 @@ import {
   revealProjectPath,
   rejectToolCall,
   replyPermission,
+  recoverBackgroundTask,
   recoverSessionFromCheckpoint,
   rollbackSnapshot,
   saveProviderConfig,
@@ -80,6 +82,7 @@ import {
   type ProviderConfigFileResponse,
   type ProviderRecord,
   type SessionEventsResponse,
+  type SessionInputRecord,
   type SessionRecord,
   type ShellPolicy,
   type ShellMode,
@@ -441,6 +444,14 @@ export function App() {
       ),
     [dismissedJobIds, eventsResponse.jobs]
   );
+  const visibleQueuedInputs = useMemo(
+    () => eventsResponse.inputs.filter((input) => input.status === "pending"),
+    [eventsResponse.inputs]
+  );
+  const activityPause = useMemo(
+    () => latestActivityPause(eventsResponse.events),
+    [eventsResponse.events]
+  );
   const visiblePermissions = useMemo(
     () => visiblePermissionRequests(eventsResponse.permissions),
     [eventsResponse.permissions]
@@ -450,14 +461,20 @@ export function App() {
   useEffect(() => {
     if (
       isRightPaneCollapsed &&
-      (pendingToolEvents.length > 0 || visiblePermissions.length > 0 || visibleJobs.length > 0)
+      (pendingToolEvents.length > 0 ||
+        visiblePermissions.length > 0 ||
+        visibleJobs.length > 0 ||
+        visibleQueuedInputs.length > 0 ||
+        activityPause)
     ) {
       setIsRightPaneCollapsed(false);
     }
   }, [
+    activityPause,
     pendingToolEvents,
     visiblePermissions,
     visibleJobs.length,
+    visibleQueuedInputs.length,
     isRightPaneCollapsed,
   ]);
 
@@ -1243,6 +1260,36 @@ export function App() {
             : [job, ...current.jobs]
         }));
       }
+      reportError(error);
+    } finally {
+      setIsMutating(false);
+    }
+  }
+
+  async function handleDeleteQueuedInput(inputId: string) {
+    setIsMutating(true);
+    try {
+      const response = await deleteQueuedInput(inputId);
+      setEventsResponse(response);
+      setNotice({ tone: "success", text: t("notice.queueUpdated", { defaultValue: "Queue updated" }) });
+    } catch (error) {
+      reportError(error);
+    } finally {
+      setIsMutating(false);
+    }
+  }
+
+  async function handleRecoverBackgroundTask(jobId: string, action: "resumeChild" | "abandon") {
+    setIsMutating(true);
+    try {
+      const response = await recoverBackgroundTask({ jobId, action });
+      setEventsResponse(response);
+      await refreshSessions();
+      setNotice({
+        tone: action === "abandon" ? "info" : "success",
+        text: t("notice.recoveryActionStarted", { defaultValue: "Recovery action started" })
+      });
+    } catch (error) {
       reportError(error);
     } finally {
       setIsMutating(false);
@@ -2185,6 +2232,55 @@ export function App() {
               </section>
             )}
 
+            {activityPause && (
+              <section className="rightSection">
+                <SectionTitle
+                  icon={<AlertTriangle size={16} />}
+                  title={t("nav.activityPaused", { defaultValue: "Activity paused" })}
+                />
+                <div className="activityPauseBox">
+                  <strong>
+                    {activityPause.event.type === "run.activity.limit_reached"
+                      ? t("activity.limitReached", { defaultValue: "Step limit reached" })
+                      : t("activity.earlyStop", { defaultValue: "Repeated action stopped" })}
+                  </strong>
+                  <span>{activityPauseDescription(activityPause.event)}</span>
+                  <button
+                    className="iconTextButton compact"
+                    disabled={!selectedSessionId || isMutating || isPromptLocked}
+                    onClick={() => void handleRecoverAgent("continue")}
+                  >
+                    <Play size={16} />
+                    <span>{t("common.continue")}</span>
+                  </button>
+                </div>
+              </section>
+            )}
+
+            {visibleQueuedInputs.length > 0 && (
+              <section className="rightSection">
+                <SectionTitle
+                  icon={<MessageSquare size={16} />}
+                  title={`${t("nav.queuedInputs", { defaultValue: "Queued inputs" })} (${visibleQueuedInputs.length})`}
+                />
+                <div className="stackList">
+                  {visibleQueuedInputs.map((input) => (
+                    <div className="approvalRow" key={input.id}>
+                      <code>{formatQueuedInput(input)}</code>
+                      <button
+                        className="iconButton danger"
+                        disabled={isMutating}
+                        onClick={() => void handleDeleteQueuedInput(input.id)}
+                        title={t("common.delete", { defaultValue: "Delete" })}
+                      >
+                        <Trash2 size={16} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
+
             {visibleJobs.length > 0 && (
               <section className="rightSection">
                 <SectionTitle icon={<Clock3 size={16} />} title={t("nav.backgroundJobs")} />
@@ -2192,14 +2288,36 @@ export function App() {
                   {visibleJobs.map((job) => (
                     <div className="approvalRow" key={job.id}>
                       <code>{formatBackgroundJob(job)}</code>
-                      <button
-                        className="iconButton danger"
-                        disabled={isMutating || job.status !== "running"}
-                        onClick={() => void handleCancelJob(job.id)}
-                        title={t("nav.stopJob")}
-                      >
-                        <X size={16} />
-                      </button>
+                      <div className="inlineActions">
+                        {isRecoverableBackgroundJob(job) && (
+                          <>
+                            <button
+                              className="iconButton success"
+                              disabled={isMutating}
+                              onClick={() => void handleRecoverBackgroundTask(job.id, "resumeChild")}
+                              title={t("recovery.resumeChild", { defaultValue: "Resume child session" })}
+                            >
+                              <Play size={16} />
+                            </button>
+                            <button
+                              className="iconButton ghost"
+                              disabled={isMutating}
+                              onClick={() => void handleRecoverBackgroundTask(job.id, "abandon")}
+                              title={t("recovery.abandon", { defaultValue: "Abandon task" })}
+                            >
+                              <X size={16} />
+                            </button>
+                          </>
+                        )}
+                        <button
+                          className="iconButton danger"
+                          disabled={isMutating || job.status !== "running"}
+                          onClick={() => void handleCancelJob(job.id)}
+                          title={t("nav.stopJob")}
+                        >
+                          <X size={16} />
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -4509,6 +4627,46 @@ function formatBackgroundJob(job: BackgroundJobRecord) {
   return `${job.status} #${job.pid} ${job.command}`;
 }
 
+function isRecoverableBackgroundJob(job: BackgroundJobRecord) {
+  return job.command.startsWith("task:") && (job.status === "recoverable" || job.status === "orphaned");
+}
+
+function formatQueuedInput(input: SessionInputRecord) {
+  const delivery = input.delivery === "steer" ? "steer" : "queue";
+  const prompt = input.prompt.trim().replace(/\s+/g, " ");
+  return `${delivery} - ${prompt.length > 96 ? `${prompt.slice(0, 96)}...` : prompt}`;
+}
+
+function latestActivityPause(events: EventRecord[]) {
+  for (const event of [...events].reverse()) {
+    if (
+      event.type === "run.activity.started" ||
+      event.type === "prompt.submitted" ||
+      event.type === "session.input.promoted"
+    ) {
+      return null;
+    }
+    if (
+      event.type === "run.activity.limit_reached" ||
+      event.type === "run.activity.early_stop"
+    ) {
+      return { event };
+    }
+  }
+  return null;
+}
+
+function activityPauseDescription(event: EventRecord) {
+  if (event.type === "run.activity.limit_reached") {
+    const step = valueAsNumber(event.data.step);
+    const limit = valueAsNumber(event.data.limit);
+    return `This activity stopped at step ${step ?? limit ?? "the limit"}. Continue to start the next bounded activity.`;
+  }
+  const repeatedCount = valueAsNumber(event.data.repeatedCount);
+  const limit = valueAsNumber(event.data.limit);
+  return `This activity stopped after ${repeatedCount ?? limit ?? "several"} repeated model actions. Continue only if the task still needs another attempt.`;
+}
+
 function sessionResponseIsWorking(response: SessionEventsResponse) {
   const latest = response.events.at(-1);
   if (latest && sessionEventEndsWork(latest)) {
@@ -4528,6 +4686,9 @@ function sessionEventEndsWork(event: EventRecord) {
     event.type === "step.failed" ||
     event.type === "task.completed" ||
     event.type === "tool.pending" ||
+    event.type === "run.activity.ended" ||
+    event.type === "run.activity.limit_reached" ||
+    event.type === "run.activity.early_stop" ||
     (event.type === "session.checkpoint.saved" && event.data.status !== "running") ||
     (event.type === "step.ended" && (event.data.done === true || event.data.pending === true))
   );
@@ -4536,6 +4697,7 @@ function sessionEventEndsWork(event: EventRecord) {
 function sessionEventShowsWork(event: EventRecord) {
   return (
     (event.type === "session.checkpoint.saved" && event.data.status === "running") ||
+    event.type === "run.activity.started" ||
     event.type === "session.input.admitted" ||
     event.type === "prompt.submitted" ||
     event.type === "step.started" ||

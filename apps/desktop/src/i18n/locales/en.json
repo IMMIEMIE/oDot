@@ -6,6 +6,7 @@
     "cancel": "Cancel",
     "save": "Save settings",
     "clear": "Clear",
+    "delete": "Delete",
     "accept": "Accept",
     "acceptAndAllowlist": "Accept & allowlist",
     "reject": "Reject",
@@ -63,6 +64,8 @@
     "runMode": "Run mode",
     "commandApproval": "Command approval",
     "permissionRequests": "Permission requests",
+    "queuedInputs": "Queued inputs",
+    "activityPaused": "Activity paused",
     "backgroundJobs": "Background jobs",
     "planProgress": "Plan progress",
     "stopJob": "Stop job",
@@ -180,6 +183,8 @@
     "commandRejected": "Command rejected",
     "permissionHandled": "Permission handled",
     "jobStopped": "Background job stopped",
+    "queueUpdated": "Queue updated",
+    "recoveryActionStarted": "Recovery action started",
     "snapshotRolledBack": "Snapshot rolled back",
     "noRollbackChanges": "No code changes to roll back",
     "contextCompacted": "Context compacted",
@@ -193,6 +198,14 @@
     "rolledBackBeforePrompt": "Rolled back to before the prompt was sent",
     "rolledBackFileChange": "Rolled back this file change",
     "rolledBackRound": "Rolled back this round of changes"
+  },
+  "recovery": {
+    "resumeChild": "Resume child session",
+    "abandon": "Abandon task"
+  },
+  "activity": {
+    "limitReached": "Step limit reached",
+    "earlyStop": "Repeated action stopped"
   },
   "error": {
     "providerMissing": "AI service config not found. Save JSON and select a service first.",

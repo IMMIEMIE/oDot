@@ -310,6 +310,21 @@ export async function promptSession(input: {
   return invoke<SessionEventsResponse>("prompt_session", { input });
 }
 
+export async function deleteQueuedInput(
+  inputId: string
+): Promise<SessionEventsResponse> {
+  assertTauri();
+  return invoke<SessionEventsResponse>("delete_queued_input", { inputId });
+}
+
+export async function recoverBackgroundTask(input: {
+  jobId: string;
+  action: "resumeChild" | "abandon";
+}): Promise<SessionEventsResponse> {
+  assertTauri();
+  return invoke<SessionEventsResponse>("recover_background_task", { input });
+}
+
 export async function persistPlanFile(input: {
   sessionId: string;
   planText: string;
@@ -343,6 +358,13 @@ export async function continueSession(
 ): Promise<SessionEventsResponse> {
   assertTauri();
   return invoke<SessionEventsResponse>("continue_session", { sessionId });
+}
+
+export async function awaitSessionIdle(
+  sessionId: string
+): Promise<SessionEventsResponse> {
+  assertTauri();
+  return invoke<SessionEventsResponse>("await_session_idle", { sessionId });
 }
 
 export async function recoverSessionFromCheckpoint(input: {

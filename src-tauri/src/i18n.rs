@@ -75,33 +75,53 @@ pub fn compaction_system_prompt() -> &'static str {
 pub fn compaction_prompt(messages: &str) -> String {
     let template = match app_locale() {
         AppLocale::Zh => {
-            r#"请对以下对话历史生成结构化摘要，包含以下部分：
-- Goal: 用户的核心目标
-- Constraints: 已确认的约束和限制
-- Progress: 已完成的工作
-- Decisions: 做出的关键决策及理由
-- Next Steps: 待完成的下一步
+            r#"请对以下对话历史生成结构化摘要。必须严格输出这些 Markdown 章节，顺序不变：
+## Goal
+- [用户的核心目标]
+## Constraints & Preferences
+- [已确认的约束、偏好、限制，或 "(none)"]
+## Progress
+- [已完成的工作，或 "(none)"]
+## Key Decisions
+- [关键决策及理由，或 "(none)"]
+## Next Steps
+- [下一步行动，或 "(none)"]
+## Critical Context
+- [重要错误、状态、开放问题、命令、标识符，或 "(none)"]
+## Relevant Files
+- [文件或目录路径: 重要原因，或 "(none)"]
 
-要求：
+规则：
 - 只保留后续继续任务必需的信息。
-- 保留文件路径、命令、错误、决策和未完成事项。
+- 保留精确文件路径、命令、错误、决策和未完成事项。
 - 不要编造未在历史中出现的事实。
+- 不要提到摘要过程或上下文被压缩。
 
 对话历史：
 {messages}"#
         }
         AppLocale::En => {
-            r#"Summarize the conversation history below with these sections:
-- Goal: the user's core objective
-- Constraints: confirmed constraints and limits
-- Progress: completed work
-- Decisions: key decisions and rationale
-- Next Steps: remaining next steps
+            r#"Summarize the conversation history below. Output exactly these Markdown sections in order:
+## Goal
+- [the user's core objective]
+## Constraints & Preferences
+- [confirmed constraints, preferences, and limits, or "(none)"]
+## Progress
+- [completed work, or "(none)"]
+## Key Decisions
+- [key decisions and rationale, or "(none)"]
+## Next Steps
+- [remaining next steps, or "(none)"]
+## Critical Context
+- [important errors, state, open questions, commands, identifiers, or "(none)"]
+## Relevant Files
+- [file or directory path: why it matters, or "(none)"]
 
-Requirements:
+Rules:
 - Keep only information required to continue the task.
-- Preserve file paths, commands, errors, decisions, and unfinished items.
+- Preserve exact file paths, commands, errors, decisions, and unfinished items.
 - Do not invent facts that never appeared in the history.
+- Do not mention the summary process or that context was compacted.
 
 Conversation history:
 {messages}"#

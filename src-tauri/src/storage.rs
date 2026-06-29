@@ -34,7 +34,7 @@ fn db_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_dir.join("odot.db"))
 }
 
-fn init_db(conn: &Connection) -> Result<(), String> {
+pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         r#"
         PRAGMA journal_mode = WAL;
@@ -883,12 +883,39 @@ pub fn mark_session_input_promoted(
     event_id: &str,
 ) -> Result<(), String> {
     let now = util::now_string();
-    conn.execute(
-        "UPDATE session_input SET status = 'promoted', promoted_event_id = ?1, updated_at = ?2 WHERE id = ?3",
+    let updated = conn.execute(
+        "UPDATE session_input SET status = 'promoted', promoted_event_id = ?1, updated_at = ?2 WHERE id = ?3 AND status = 'pending'",
         params![event_id, &now, input_id],
     )
     .map_err(|error| error.to_string())?;
+    if updated == 0 {
+        let existing = get_session_input(conn, input_id)?;
+        if existing.status == "promoted" && existing.promoted_event_id.as_deref() == Some(event_id)
+        {
+            return Ok(());
+        }
+        if existing.status == "promoted" {
+            return Err("输入已经进入执行队列。".to_string());
+        }
+        return Err("只能提交尚未进入执行队列的输入。".to_string());
+    }
     Ok(())
+}
+
+pub fn delete_pending_session_input(
+    conn: &Connection,
+    input_id: &str,
+) -> Result<SessionInputRecord, String> {
+    let input = get_session_input(conn, input_id)?;
+    if input.status != "pending" {
+        return Err("只能删除尚未进入执行队列的输入。".to_string());
+    }
+    conn.execute(
+        "DELETE FROM session_input WHERE id = ?1 AND status = 'pending'",
+        params![input_id],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(input)
 }
 
 pub fn list_session_inputs(
@@ -1766,6 +1793,36 @@ mod tests {
 
         assert_eq!(first.id, second.id);
         assert_eq!(list_session_inputs(&conn, "s1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn session_input_promotion_is_idempotent_for_same_event_only() {
+        let conn = memory_db();
+        conn.execute(
+            "INSERT INTO session (id, project_root, mode, provider_id, title, status, shell_mode, created_at, updated_at)
+             VALUES ('s1', 'E:/oDot', 'agent', 'p1', 'Test', 'active', 'auto', '1', '1')",
+            [],
+        )
+        .unwrap();
+
+        admit_session_input(
+            &conn,
+            Some("input-1".to_string()),
+            "s1",
+            "hi",
+            &[],
+            SessionInputDelivery::Queue,
+            true,
+        )
+        .unwrap();
+
+        mark_session_input_promoted(&conn, "input-1", "event-1").unwrap();
+        mark_session_input_promoted(&conn, "input-1", "event-1").unwrap();
+        assert!(mark_session_input_promoted(&conn, "input-1", "event-2").is_err());
+
+        let input = get_session_input(&conn, "input-1").unwrap();
+        assert_eq!(input.status, "promoted");
+        assert_eq!(input.promoted_event_id.as_deref(), Some("event-1"));
     }
 
     #[test]
