@@ -2849,6 +2849,9 @@ pre {
   color: var(--text-soft);
   font-size: 12px;
   font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   cursor: pointer;
   transition: border-color 0.15s, background 0.15s;
 }
@@ -3406,8 +3409,8 @@ body.float-window-body {
   inset: 4px;
   z-index: 4;
   border-radius: 50%;
-  background: #22a06b;
-  color: #ffffff;
+  background: var(--accent-hover);
+  color: var(--accent-contrast);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -3497,16 +3500,79 @@ body.float-window-body {
   animation: floatThinkingMeter 1s ease-in-out infinite;
 }
 
-.floatThinkingBubble p {
+.floatThinkingBubbleText,
+.floatThinkingBubbleMarkdown {
+  margin: 0;
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.floatThinkingBubbleText {
   display: -webkit-box;
   -webkit-line-clamp: 5;
   -webkit-box-orient: vertical;
   margin: 0;
   overflow: hidden;
-  color: var(--ink);
-  font-size: 12px;
-  line-height: 1.45;
-  word-break: break-word;
+}
+
+.floatThinkingBubbleMarkdown {
+  max-height: 148px;
+  overflow: hidden;
+}
+
+.floatThinkingBubbleMarkdown > * {
+  margin: 0 0 6px;
+}
+
+.floatThinkingBubbleMarkdown > *:last-child {
+  margin-bottom: 0;
+}
+
+.floatThinkingBubbleMarkdown ul,
+.floatThinkingBubbleMarkdown ol {
+  padding-left: 16px;
+}
+
+.floatThinkingBubbleMarkdown code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--surface-soft);
+  font-family: "JetBrains Mono", "Cascadia Code", monospace;
+  font-size: 11px;
+}
+
+.floatThinkingBubbleMarkdown pre {
+  max-height: 72px;
+  margin: 0 0 6px;
+  padding: 7px;
+  overflow: hidden;
+  border-radius: 6px;
+  background: var(--surface-soft);
+}
+
+.floatThinkingBubbleMarkdown pre code {
+  padding: 0;
+  background: transparent;
+}
+
+.floatMarkdownTableScroll {
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.floatThinkingBubbleMarkdown table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.floatThinkingBubbleMarkdown th,
+.floatThinkingBubbleMarkdown td {
+  padding: 3px 5px;
+  border: 1px solid var(--border);
+  text-align: left;
 }
 
 .floatCompletionBubble {

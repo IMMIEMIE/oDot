@@ -16,6 +16,8 @@ import {
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ClipboardEvent as ReactClipboardEvent, PointerEvent as ReactPointerEvent } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { OdodBotIcon, SleepingOdodBotIcon, WorkingOdodBotIcon } from "./OdodBotIcon";
 import { appT } from "./i18n";
 import {
@@ -66,8 +68,6 @@ export function FloatBall() {
   const [isActionRingVisible, setIsActionRingVisible] = useState(false);
   const [isSleeping, setIsSleeping] = useState(false);
   const [showCompleteCheck, setShowCompleteCheck] = useState(false);
-  const [completionBubbleDirection, setCompletionBubbleDirection] =
-    useState<SideBubbleDirection>("right");
   const [thinkingBubbleDirection, setThinkingBubbleDirection] =
     useState<SideBubbleDirection>("right");
   const [isApprovalPanelOpen, setIsApprovalPanelOpen] = useState(false);
@@ -165,20 +165,31 @@ export function FloatBall() {
   useEffect(() => {
     const previous = previousStatusKind.current;
     previousStatusKind.current = agentStatus.kind;
-    if ((previous === "working" || previous === "thinking") && agentStatus.kind === "complete") {
+    const transitionedToComplete =
+      (previous === "working" || previous === "thinking") && agentStatus.kind === "complete";
+    if (transitionedToComplete) {
       recordFloatMouseEvent();
       setShowCompleteCheck(true);
-      void resolveSideBubbleDirection().then(setCompletionBubbleDirection);
       if (completeCheckTimer.current) {
         window.clearTimeout(completeCheckTimer.current);
       }
       completeCheckTimer.current = window.setTimeout(() => {
         setShowCompleteCheck(false);
+        completeCheckTimer.current = undefined;
       }, COMPLETE_CHECK_DURATION_MS);
+    } else if (agentStatus.kind !== "complete") {
+      // 离开/被打断出「已完成」状态时必须显式复位：否则 <span> 不会卸载，
+      // 下次 working→complete 时 setShowCompleteCheck(true) 是 no-op，CSS 动画无法重放。
+      if (completeCheckTimer.current) {
+        window.clearTimeout(completeCheckTimer.current);
+        completeCheckTimer.current = undefined;
+      }
+      setShowCompleteCheck(false);
     }
     return () => {
       if (completeCheckTimer.current) {
         window.clearTimeout(completeCheckTimer.current);
+        completeCheckTimer.current = undefined;
       }
     };
   }, [agentStatus.kind]);
@@ -426,13 +437,11 @@ export function FloatBall() {
   const isError = agentStatus.kind === "error";
   const showSleepingIcon =
     isSleeping && !isAgentActive && !isApprovalPending && !isError && !showCompleteCheck;
-  const thinkingMessage = agentStatus.message?.trim() || agentStatus.label;
-  const showThinkingBubble = isAgentActive && thinkingMessage.length > 0;
+  const liveMessage = agentStatus.message?.trim() || agentStatus.label;
+  const showThinkingBubble = isAgentActive && liveMessage.length > 0;
+  const shouldRenderMarkdown = agentStatus.kind === "working";
   const showApprovalPanel =
     isApprovalPending && isApprovalPanelOpen && Boolean(agentStatus.pendingApproval);
-  const completionMessage = agentStatus.message?.trim() || "";
-  const showCompletionBubble =
-    agentStatus.kind === "complete" && showCompleteCheck && completionMessage.length > 0;
   const promptPanelClass = promptDirection
     ? `floatPromptPanel floatPromptPanel--${promptDirection}`
     : "floatPromptPanel";
@@ -558,20 +567,24 @@ export function FloatBall() {
           <div className="floatThinkingBubbleHeader">
             <span>{agentStatus.label}</span>
           </div>
-          <p>{thinkingMessage}</p>
-        </section>
-      )}
-
-      {showCompletionBubble && (
-        <section
-          className={`floatCompletionBubble floatCompletionBubble--${completionBubbleDirection}`}
-          aria-live="polite"
-        >
-          <div className="floatCompletionBubbleHeader">
-            <Check size={13} strokeWidth={3} />
-            <span>{agentStatus.label}</span>
-          </div>
-          <p>{completionMessage}</p>
+          {shouldRenderMarkdown ? (
+            <div className="floatThinkingBubbleMarkdown">
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                components={{
+                  table: ({ children, ...props }) => (
+                    <div className="floatMarkdownTableScroll">
+                      <table {...props}>{children}</table>
+                    </div>
+                  )
+                }}
+              >
+                {liveMessage}
+              </ReactMarkdown>
+            </div>
+          ) : (
+            <p className="floatThinkingBubbleText">{liveMessage}</p>
+          )}
         </section>
       )}
 

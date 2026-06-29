@@ -94,13 +94,14 @@ export function deriveFloatAgentStatus({
         latestReasoningMessage
       );
     }
+    const latestAssistantMessage = latestAssistantText(eventsResponse.events);
     return floatAgentStatus(
       "working",
       appT("floatStatus.working"),
       sessionId,
       allowedAttachmentKinds,
       null,
-      latestReasoningMessage
+      latestAssistantMessage
     );
   }
 
@@ -268,27 +269,55 @@ function latestModelOutputIsReasoning(events: EventRecord[]) {
 }
 
 function latestAssistantText(events: EventRecord[]) {
-  const event = [...events].reverse().find((item) => item.type === "assistant.message");
-  return compactMessagePreview(valueAsString(event?.data.text));
+  return markdownMessagePreview(latestStreamText(events, "assistant.message", "assistant.message.delta"));
 }
 
 function latestReasoningText(events: EventRecord[]) {
-  const event = [...events].reverse().find((item) =>
-    item.type === "reasoning.summary" || item.type === "reasoning.summary.delta"
-  );
-  return compactMessagePreview(valueAsString(event?.data.text));
+  return compactMessagePreview(latestStreamText(events, "reasoning.summary", "reasoning.summary.delta"));
+}
+
+function latestStreamText(events: EventRecord[], finalType: string, deltaType: string) {
+  const finalEvent = [...events].reverse().find((item) => item.type === finalType);
+  if (finalEvent) {
+    return valueAsString(finalEvent.data.text);
+  }
+  const latestDelta = [...events].reverse().find((item) => item.type === deltaType);
+  if (!latestDelta) {
+    return "";
+  }
+  const step = Number(latestDelta.data.step ?? 0);
+  if (!Number.isFinite(step) || step <= 0) {
+    return valueAsString(latestDelta.data.text);
+  }
+  return events
+    .filter((item) => item.type === deltaType && Number(item.data.step ?? 0) === step)
+    .map((item) => valueAsString(item.data.text))
+    .join("");
+}
+
+function markdownMessagePreview(value: string) {
+  const cleaned = cleanModelText(value);
+  if (cleaned.length <= 1200) {
+    return cleaned;
+  }
+  return `${cleaned.slice(0, 1197).trimEnd()}...`;
 }
 
 function compactMessagePreview(value: string) {
-  const cleaned = value
-    .replace(/<think>[\s\S]*?<\/think>/gi, "")
-    .replace(/<\/?think>/gi, "")
+  const cleaned = cleanModelText(value)
     .replace(/\s+/g, " ")
     .trim();
   if (cleaned.length <= 260) {
     return cleaned;
   }
   return `${cleaned.slice(0, 257).trimEnd()}...`;
+}
+
+function cleanModelText(value: string) {
+  return value
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/<\/?think>/gi, "")
+    .trim();
 }
 
 function normalizeFloatAgentStatus(value: unknown): FloatAgentStatusRecord {
