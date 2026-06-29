@@ -178,7 +178,6 @@ button:focus-visible {
     linear-gradient(90deg, rgba(255, 255, 255, 0.42), transparent 18%),
     linear-gradient(180deg, transparent, rgba(18, 128, 95, 0.05));
   overflow: hidden;
-  overflow-x: hidden;
   animation: appShellIn 0.28s ease-out both;
 }
 
@@ -2876,6 +2875,56 @@ pre {
 
 .presetButton svg {
   flex-shrink: 0;
+}
+
+.setupToggleRow {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.setupToggleRow input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+
+.providerActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.configFileActions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0 14px;
+}
+
+.configFileActions > div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.configFileActions span,
+.configFileActions small {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.configFileActions strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .setupTextEditor {

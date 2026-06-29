@@ -137,6 +137,23 @@ oDot automatically detects the provider type based on the `api` URL or `npm` fie
 
 Tool mode (`native`, `json`, or `auto`) can be configured per provider or per model.
 
+OpenAI-compatible providers use `/chat/completions` by default. If a provider or
+model supports the OpenAI Responses API, set `request.api` to `responses` at the
+provider or model level:
+
+```json
+{
+  "provider": {
+    "my-provider": {
+      "api": "https://api.example.com/v1",
+      "request": {
+        "api": "responses"
+      }
+    }
+  }
+}
+```
+
 ### API Key Management
 
 API keys are resolved in the following order:

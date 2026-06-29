@@ -32,6 +32,7 @@ export type ProviderRecord = {
   name: string;
   baseUrl?: string | null;
   model: string;
+  configPath?: string | null;
   credentialRef: string;
   createdAt: string;
   updatedAt: string;
@@ -206,22 +207,26 @@ export async function deleteProvider(id: string): Promise<void> {
 }
 
 export async function loadProviderConfig(
-  projectRoot?: string
+  projectRoot?: string,
+  configPath?: string | null
 ): Promise<ProviderConfigFileResponse> {
   assertTauri();
   return invoke<ProviderConfigFileResponse>("load_provider_config", {
-    projectRoot: projectRoot?.trim() || null
+    projectRoot: projectRoot?.trim() || null,
+    configPath: configPath?.trim() || null
   });
 }
 
 export async function saveProviderConfig(
   content: string,
-  projectRoot?: string
+  projectRoot?: string,
+  configPath?: string | null
 ): Promise<ProviderConfigFileResponse> {
   assertTauri();
   return invoke<ProviderConfigFileResponse>("save_provider_config", {
     content,
-    projectRoot: projectRoot?.trim() || null
+    projectRoot: projectRoot?.trim() || null,
+    configPath: configPath?.trim() || null
   });
 }
 
@@ -458,6 +463,18 @@ export async function pickProjectDirectory(): Promise<string | null> {
     directory: true,
     multiple: false,
     title: appT("api.pickProjectTitle")
+  });
+
+  return typeof selected === "string" ? selected : null;
+}
+
+export async function pickProviderConfigFile(): Promise<string | null> {
+  assertTauri();
+  const selected = await open({
+    directory: false,
+    multiple: false,
+    filters: [{ name: "JSON", extensions: ["json"] }],
+    title: appT("api.pickConfigTitle")
   });
 
   return typeof selected === "string" ? selected : null;

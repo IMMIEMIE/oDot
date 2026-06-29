@@ -1,6 +1,11 @@
 use crate::{
-    llm_runtime::{sanitize_assistant_content, LlmStreamEvent, OpenAiChatStreamParser},
-    types::{ModelTurn, ProviderKind, ProviderRequestConfig, ToolCallRequest, ToolMode},
+    llm_runtime::{
+        sanitize_assistant_content, LlmStreamEvent, OpenAiChatStreamParser,
+        OpenAiResponsesStreamParser,
+    },
+    types::{
+        ModelTurn, OpenAiApiMode, ProviderKind, ProviderRequestConfig, ToolCallRequest, ToolMode,
+    },
 };
 use futures_util::StreamExt;
 use reqwest::StatusCode;
@@ -12,6 +17,27 @@ const KEYRING_SERVICE: &str = "dev.odot.desktop";
 pub struct ProviderCompletion {
     pub raw_response: String,
     pub turn: Option<ModelTurn>,
+}
+
+enum OpenAiStreamParser {
+    Chat(OpenAiChatStreamParser),
+    Responses(OpenAiResponsesStreamParser),
+}
+
+impl OpenAiStreamParser {
+    fn push_str(&mut self, chunk: &str) -> Result<Vec<LlmStreamEvent>, String> {
+        match self {
+            Self::Chat(parser) => parser.push_str(chunk),
+            Self::Responses(parser) => parser.push_str(chunk),
+        }
+    }
+
+    fn finish(&mut self) -> Result<Vec<LlmStreamEvent>, String> {
+        match self {
+            Self::Chat(parser) => parser.finish(),
+            Self::Responses(parser) => parser.finish(),
+        }
+    }
 }
 
 pub fn save_api_key(credential_ref: &str, api_key: &str) -> Result<(), String> {
@@ -64,14 +90,19 @@ where
     if !supports_native_tools(provider) {
         return Err("当前 provider 未启用 native streaming runtime。".to_string());
     }
-    let endpoint = to_chat_completions_endpoint(
-        provider
-            .base_url
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or("https://api.openai.com/v1"),
-    );
-    let body = openai_stream_request_body(provider, messages);
+    let base_url = openai_base_url(provider);
+    let (endpoint, body, mut parser) = match provider.openai_api_mode {
+        OpenAiApiMode::ChatCompletions => (
+            to_chat_completions_endpoint(base_url),
+            openai_stream_request_body(provider, messages),
+            OpenAiStreamParser::Chat(OpenAiChatStreamParser::new()),
+        ),
+        OpenAiApiMode::Responses => (
+            to_responses_endpoint(base_url),
+            openai_responses_stream_request_body(provider, messages),
+            OpenAiStreamParser::Responses(OpenAiResponsesStreamParser::new()),
+        ),
+    };
     let client = reqwest::Client::new();
     let mut request = client.post(&endpoint);
     for (key, value) in &provider.headers {
@@ -98,7 +129,6 @@ where
         ));
     }
 
-    let mut parser = OpenAiChatStreamParser::new();
     let mut turn = ModelTurn {
         summary: None,
         message: None,
@@ -155,13 +185,11 @@ async fn complete_openai_compatible(
     system_prompt: &str,
     user_prompt: &str,
 ) -> Result<ProviderCompletion, String> {
-    let endpoint = to_chat_completions_endpoint(
-        provider
-            .base_url
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or("https://api.openai.com/v1"),
-    );
+    if provider.openai_api_mode == OpenAiApiMode::Responses {
+        return complete_openai_responses(provider, system_prompt, user_prompt).await;
+    }
+
+    let endpoint = to_chat_completions_endpoint(openai_base_url(provider));
     let native_tools = supports_native_tools(provider);
     let body = openai_request_body(provider, system_prompt, user_prompt);
 
@@ -190,6 +218,45 @@ async fn complete_openai_compatible(
     } else {
         Ok(ProviderCompletion {
             raw_response: openai_response_content(&payload)?,
+            turn: None,
+        })
+    }
+}
+
+async fn complete_openai_responses(
+    provider: &ProviderRequestConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<ProviderCompletion, String> {
+    let endpoint = to_responses_endpoint(openai_base_url(provider));
+    let native_tools = supports_native_tools(provider);
+    let body = openai_responses_request_body(provider, system_prompt, user_prompt);
+
+    let client = reqwest::Client::new();
+    let mut request = client.post(&endpoint);
+    for (key, value) in &provider.headers {
+        request = request.header(key, value);
+    }
+    let request = request.bearer_auth(provider.api_key.trim()).json(&body);
+
+    let payload = send_json_request(
+        request,
+        &endpoint,
+        "Authorization: Bearer <redacted>",
+        &provider.config_path,
+    )
+    .await?;
+    if native_tools {
+        let turn = parse_openai_responses_turn(&payload)?;
+        let raw_response = if turn.is_some() {
+            raw_response_from_payload(&payload)
+        } else {
+            openai_responses_response_content(&payload)?
+        };
+        Ok(ProviderCompletion { raw_response, turn })
+    } else {
+        Ok(ProviderCompletion {
+            raw_response: openai_responses_response_content(&payload)?,
             turn: None,
         })
     }
@@ -233,6 +300,20 @@ fn openai_base_body(provider: &ProviderRequestConfig) -> serde_json::Map<String,
     body
 }
 
+fn openai_responses_base_body(provider: &ProviderRequestConfig) -> serde_json::Map<String, Value> {
+    let mut body = provider.body.clone();
+    body.remove("messages");
+    body.remove("max_tokens");
+    body.remove("max_completion_tokens");
+    body.insert("model".to_string(), json!(provider.model));
+    body.entry("temperature".to_string()).or_insert(json!(0.2));
+    if let Some(limit) = provider.output_token_limit {
+        body.entry("max_output_tokens".to_string())
+            .or_insert(json!(limit));
+    }
+    body
+}
+
 fn openai_request_body(
     provider: &ProviderRequestConfig,
     system_prompt: &str,
@@ -242,6 +323,26 @@ fn openai_request_body(
     if supports_native_tools(provider) {
         body.entry("tools".to_string())
             .or_insert_with(native_tool_definitions);
+        body.entry("tool_choice".to_string())
+            .or_insert(json!("auto"));
+    } else {
+        body.remove("tools");
+        body.remove("tool_choice");
+    }
+    body
+}
+
+fn openai_responses_request_body(
+    provider: &ProviderRequestConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> serde_json::Map<String, Value> {
+    let mut body = openai_responses_base_body(provider);
+    body.insert("instructions".to_string(), json!(system_prompt));
+    body.insert("input".to_string(), json!(user_prompt));
+    if supports_native_tools(provider) {
+        body.entry("tools".to_string())
+            .or_insert_with(native_responses_tool_definitions);
         body.entry("tool_choice".to_string())
             .or_insert(json!("auto"));
     } else {
@@ -264,6 +365,130 @@ fn openai_stream_request_body(
     body.entry("tool_choice".to_string())
         .or_insert(json!("auto"));
     body
+}
+
+fn openai_responses_stream_request_body(
+    provider: &ProviderRequestConfig,
+    messages: &[Value],
+) -> serde_json::Map<String, Value> {
+    let mut body = openai_responses_base_body(provider);
+    let (instructions, input) = responses_input_from_messages(messages);
+    if let Some(instructions) = instructions {
+        body.insert("instructions".to_string(), json!(instructions));
+    }
+    body.insert("input".to_string(), Value::Array(input));
+    body.insert("stream".to_string(), json!(true));
+    body.entry("tools".to_string())
+        .or_insert_with(native_responses_tool_definitions);
+    body.entry("tool_choice".to_string())
+        .or_insert(json!("auto"));
+    body
+}
+
+fn responses_input_from_messages(messages: &[Value]) -> (Option<String>, Vec<Value>) {
+    let mut instructions = None;
+    let mut input = Vec::new();
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if role == "system" && instructions.is_none() {
+            instructions = message_content_text(message.get("content"));
+            continue;
+        }
+        if role == "tool" {
+            let call_id = message
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if call_id.is_empty() {
+                continue;
+            }
+            input.push(json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": message_content_text(message.get("content")).unwrap_or_default()
+            }));
+            continue;
+        }
+        if role == "assistant" {
+            if let Some(content) = message_content_text(message.get("content"))
+                .filter(|value| !value.trim().is_empty())
+            {
+                input.push(json!({ "role": "assistant", "content": content }));
+            }
+            if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+                for call in calls {
+                    if let Some(item) = chat_tool_call_to_responses_input(call) {
+                        input.push(item);
+                    }
+                }
+            }
+            continue;
+        }
+        if matches!(role, "user" | "developer") {
+            input.push(json!({
+                "role": role,
+                "content": responses_message_content(message.get("content"))
+            }));
+        }
+    }
+    (instructions, input)
+}
+
+fn chat_tool_call_to_responses_input(call: &Value) -> Option<Value> {
+    let name = call
+        .pointer("/function/name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())?;
+    let call_id = call
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())?;
+    Some(json!({
+        "type": "function_call",
+        "call_id": call_id,
+        "name": name,
+        "arguments": call.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("{}")
+    }))
+}
+
+fn responses_message_content(value: Option<&Value>) -> Value {
+    match value {
+        Some(Value::Array(parts)) => Value::Array(
+            parts
+                .iter()
+                .filter_map(|part| {
+                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                        return Some(json!({ "type": "input_text", "text": text }));
+                    }
+                    if let Some(url) = part.pointer("/image_url/url").and_then(Value::as_str) {
+                        return Some(json!({ "type": "input_image", "image_url": url }));
+                    }
+                    Some(part.clone())
+                })
+                .collect(),
+        ),
+        Some(Value::String(text)) => json!(text),
+        Some(value) => value.clone(),
+        None => json!(""),
+    }
+}
+
+fn message_content_text(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(Value::Array(parts)) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("");
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
 }
 
 fn accumulate_stream_event(turn: &mut ModelTurn, event: &LlmStreamEvent) {
@@ -407,6 +632,130 @@ fn openai_response_content(payload: &Value) -> Result<String, String> {
         .ok_or_else(|| "AI 服务返回缺少 choices[0].message。".to_string())?;
     openai_message_content(message.get("content"))
         .ok_or_else(|| "AI 服务返回了空消息。".to_string())
+}
+
+fn parse_openai_responses_turn(payload: &Value) -> Result<Option<ModelTurn>, String> {
+    let content = openai_responses_text(payload);
+    let sanitized = content
+        .as_deref()
+        .map(sanitize_assistant_content)
+        .filter(|value| !value.text.trim().is_empty() || !value.reasoning.trim().is_empty());
+    let tool_calls = parse_openai_responses_tool_calls(payload.get("output"))?;
+    let content = sanitized
+        .as_ref()
+        .and_then(|value| (!value.text.trim().is_empty()).then(|| value.text.clone()));
+    let summary = sanitized
+        .as_ref()
+        .and_then(|value| (!value.reasoning.trim().is_empty()).then(|| value.reasoning.clone()));
+
+    if content.as_deref().unwrap_or_default().trim().is_empty() && tool_calls.is_empty() {
+        return Err("AI 服务返回了空消息。".to_string());
+    }
+
+    Ok(Some(ModelTurn {
+        summary,
+        message: content,
+        done: tool_calls.is_empty(),
+        tool_calls,
+    }))
+}
+
+fn openai_responses_response_content(payload: &Value) -> Result<String, String> {
+    openai_responses_text(payload).ok_or_else(|| "AI 服务返回了空消息。".to_string())
+}
+
+fn openai_responses_text(payload: &Value) -> Option<String> {
+    if let Some(text) = payload
+        .get("output_text")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Some(text.to_string());
+    }
+
+    let text = payload
+        .get("output")
+        .and_then(Value::as_array)?
+        .iter()
+        .flat_map(|item| {
+            item.get("content")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter_map(|part| {
+            part.get("text")
+                .and_then(Value::as_str)
+                .or_else(|| part.pointer("/text/value").and_then(Value::as_str))
+                .map(ToString::to_string)
+        })
+        .collect::<Vec<_>>()
+        .join("");
+
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn parse_openai_responses_tool_calls(
+    value: Option<&Value>,
+) -> Result<Vec<ToolCallRequest>, String> {
+    let Some(items) = value.and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+
+    items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .map(parse_openai_responses_tool_call)
+        .collect()
+}
+
+fn parse_openai_responses_tool_call(call: &Value) -> Result<ToolCallRequest, String> {
+    let original_name = call
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "AI 服务返回的工具调用缺少 name。".to_string())?;
+    let name = normalize_tool_name(original_name);
+    let arguments = call
+        .get("arguments")
+        .and_then(Value::as_str)
+        .unwrap_or("{}");
+    let call_id = call
+        .get("call_id")
+        .or_else(|| call.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let input = match serde_json::from_str(arguments) {
+        Ok(input) => input,
+        Err(error) => {
+            return Ok(ToolCallRequest {
+                tool_call_id: if call_id.is_empty() {
+                    None
+                } else {
+                    Some(call_id.to_string())
+                },
+                name: "invalid".to_string(),
+                input: json!({
+                    "tool": original_name,
+                    "error": error.to_string(),
+                    "arguments": arguments,
+                    "callId": call_id
+                }),
+            });
+        }
+    };
+    Ok(ToolCallRequest {
+        tool_call_id: if call_id.is_empty() {
+            None
+        } else {
+            Some(call_id.to_string())
+        },
+        name,
+        input,
+    })
 }
 
 fn parse_openai_tool_calls(value: Option<&Value>) -> Result<Vec<ToolCallRequest>, String> {
@@ -627,6 +976,30 @@ fn native_tool_definitions() -> Value {
     ])
 }
 
+fn native_responses_tool_definitions() -> Value {
+    let tools = native_tool_definitions();
+    let Some(items) = tools.as_array() else {
+        return json!([]);
+    };
+    Value::Array(
+        items
+            .iter()
+            .filter_map(|tool| {
+                let function = tool.get("function")?;
+                let name = function.get("name")?.clone();
+                let description = function.get("description")?.clone();
+                let parameters = function.get("parameters")?.clone();
+                Some(json!({
+                    "type": "function",
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters
+                }))
+            })
+            .collect(),
+    )
+}
+
 fn object_schema(properties: Value, required: &[&str]) -> Value {
     json!({
         "type": "object",
@@ -705,12 +1078,31 @@ fn provider_error_message(
     )
 }
 
+fn openai_base_url(provider: &ProviderRequestConfig) -> &str {
+    provider
+        .base_url
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("https://api.openai.com/v1")
+}
+
 fn to_chat_completions_endpoint(base_url: &str) -> String {
     let trimmed = base_url.trim().trim_end_matches('/');
     if trimmed.ends_with("/chat/completions") {
         trimmed.to_string()
     } else {
         format!("{trimmed}/chat/completions")
+    }
+}
+
+fn to_responses_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.ends_with("/responses") {
+        trimmed.to_string()
+    } else if let Some(root) = trimmed.strip_suffix("/chat/completions") {
+        format!("{root}/responses")
+    } else {
+        format!("{trimmed}/responses")
     }
 }
 
@@ -731,6 +1123,7 @@ mod tests {
         ProviderRequestConfig {
             kind,
             tool_mode,
+            openai_api_mode: OpenAiApiMode::ChatCompletions,
             base_url: Some("https://example.com/v1".to_string()),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
@@ -753,6 +1146,22 @@ mod tests {
         assert_eq!(
             to_chat_completions_endpoint("https://example.com/v1/"),
             "https://example.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn responses_endpoint_is_not_duplicated() {
+        assert_eq!(
+            to_responses_endpoint("https://example.com/v1/responses"),
+            "https://example.com/v1/responses"
+        );
+        assert_eq!(
+            to_responses_endpoint("https://example.com/v1/"),
+            "https://example.com/v1/responses"
+        );
+        assert_eq!(
+            to_responses_endpoint("https://example.com/v1/chat/completions"),
+            "https://example.com/v1/responses"
         );
     }
 
@@ -781,6 +1190,69 @@ mod tests {
         let body = openai_request_body(&provider, "system", "user");
 
         assert_eq!(body.get("max_tokens"), Some(&json!(2048)));
+    }
+
+    #[test]
+    fn responses_body_uses_input_and_max_output_tokens() {
+        let mut provider = test_provider(ProviderKind::OpenAiCompatible, ToolMode::Native);
+        provider.openai_api_mode = OpenAiApiMode::Responses;
+        provider.output_token_limit = Some(4096);
+        provider.body.insert("max_tokens".to_string(), json!(2048));
+        provider
+            .body
+            .insert("max_completion_tokens".to_string(), json!(2048));
+
+        let body = openai_responses_request_body(&provider, "system", "user");
+
+        assert_eq!(body.get("model"), Some(&json!("test-model")));
+        assert_eq!(body.get("instructions"), Some(&json!("system")));
+        assert_eq!(body.get("input"), Some(&json!("user")));
+        assert_eq!(body.get("max_output_tokens"), Some(&json!(4096)));
+        assert!(!body.contains_key("messages"));
+        assert!(!body.contains_key("max_tokens"));
+        assert!(!body.contains_key("max_completion_tokens"));
+        assert!(body.get("tools").and_then(Value::as_array).is_some());
+    }
+
+    #[test]
+    fn responses_stream_body_converts_tool_messages() {
+        let provider = test_provider(ProviderKind::OpenAiCompatible, ToolMode::Native);
+        let messages = vec![
+            json!({ "role": "system", "content": "system" }),
+            json!({ "role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "arguments": "{\"path\":\"src/main.rs\"}"
+                }
+            }]}),
+            json!({ "role": "tool", "tool_call_id": "call_1", "content": "file" }),
+        ];
+
+        let body = openai_responses_stream_request_body(&provider, &messages);
+        let input = body.get("input").and_then(Value::as_array).unwrap();
+
+        assert_eq!(body.get("instructions"), Some(&json!("system")));
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[0]["call_id"], "call_1");
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(body.get("stream"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn responses_tool_schema_uses_responses_shape() {
+        let tools = native_responses_tool_definitions();
+        let tools = tools.as_array().expect("tool array");
+        let read = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("read"))
+            .expect("read tool");
+
+        assert_eq!(read.get("type"), Some(&json!("function")));
+        assert!(read.get("parameters").is_some());
+        assert!(read.get("function").is_none());
     }
 
     #[test]
@@ -939,6 +1411,58 @@ mod tests {
         assert!(turn.message.is_none());
         assert_eq!(turn.tool_calls[0].name, "search");
         assert!(!turn.done);
+    }
+
+    #[test]
+    fn parses_responses_output_text_and_tool_calls() {
+        let payload = json!({
+            "output_text": "正在读取文件",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "read",
+                "arguments": "{\"path\":\"src/main.rs\"}"
+            }]
+        });
+
+        let turn = parse_openai_responses_turn(&payload)
+            .expect("valid provider payload")
+            .expect("native turn");
+
+        assert_eq!(turn.message.as_deref(), Some("正在读取文件"));
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(turn.tool_calls[0].name, "read");
+        assert_eq!(turn.tool_calls[0].input["path"], "src/main.rs");
+        assert!(!turn.done);
+    }
+
+    #[test]
+    fn parses_responses_content_parts_without_output_text() {
+        let payload = json!({
+            "output": [{
+                "type": "message",
+                "content": [
+                    { "type": "output_text", "text": "完成" },
+                    { "type": "output_text", "text": "了。" }
+                ]
+            }]
+        });
+
+        let turn = parse_openai_responses_turn(&payload)
+            .expect("valid provider payload")
+            .expect("native final turn");
+
+        assert_eq!(turn.message.as_deref(), Some("完成了。"));
+        assert!(turn.done);
+    }
+
+    #[test]
+    fn empty_responses_payload_is_rejected() {
+        let error = parse_openai_responses_turn(&json!({ "output": [] }))
+            .expect_err("empty response should fail");
+
+        assert!(error.contains("空消息"));
     }
 
     #[test]

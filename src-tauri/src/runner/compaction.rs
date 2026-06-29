@@ -580,6 +580,7 @@ mod tests {
         let provider = ProviderRequestConfig {
             kind: ProviderKind::OpenAiCompatible,
             tool_mode: ToolMode::Json,
+            openai_api_mode: crate::types::OpenAiApiMode::ChatCompletions,
             base_url: Some("http://localhost".to_string()),
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),

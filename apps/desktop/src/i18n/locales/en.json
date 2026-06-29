@@ -133,7 +133,14 @@
     "model": "Model",
     "name": "Name",
     "baseUrl": "Base URL",
-    "apiKey": "API Key"
+    "apiKey": "API Key",
+    "supportsResponses": "Supports Responses API",
+    "addProvider": "Add provider",
+    "deleteProvider": "Delete provider",
+    "cannotDeleteLastProvider": "At least one provider must remain; cannot delete",
+    "configFile": "Config file",
+    "switchConfigFile": "Switch JSON",
+    "discardConfigDraft": "Discard unsaved settings edits and switch to another JSON file?"
   },
   "setup": {
     "title": "Initialize API Configuration",
@@ -159,7 +166,8 @@
     "manualImportPlaceholder": "Paste an opencode-format JSON configuration...",
     "invalidJsonFormat": "Please enter a valid opencode-format JSON configuration!",
     "backToForm": "Back to form",
-    "opencodeImported": "Imported from opencode config"
+    "opencodeImported": "Imported from opencode config",
+    "supportsResponses": "Supports Responses API"
   },
   "notice": {
     "ready": "Ready",
@@ -404,6 +412,7 @@
   },
   "api": {
     "pickProjectTitle": "Choose oDot project directory",
+    "pickConfigTitle": "Choose provider JSON configuration",
     "tauriOnly": "oDot desktop API is only available inside the Tauri app."
   },
   "recoverAction": {

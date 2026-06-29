@@ -46,6 +46,7 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
           name TEXT NOT NULL,
           base_url TEXT,
           model TEXT NOT NULL,
+          config_path TEXT,
           credential_ref TEXT NOT NULL,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
@@ -184,6 +185,12 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
     .map_err(|error| error.to_string())?;
     ensure_column(
         conn,
+        "provider",
+        "config_path",
+        "ALTER TABLE provider ADD COLUMN config_path TEXT",
+    )?;
+    ensure_column(
+        conn,
         "session_input",
         "attachments_json",
         "ALTER TABLE session_input ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'",
@@ -260,13 +267,14 @@ pub fn save_provider(conn: &Connection, input: ProviderInput) -> Result<Provider
 
     conn.execute(
         r#"
-        INSERT INTO provider (id, kind, name, base_url, model, credential_ref, created_at, updated_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        INSERT INTO provider (id, kind, name, base_url, model, config_path, credential_ref, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
         ON CONFLICT(id) DO UPDATE SET
           kind = excluded.kind,
           name = excluded.name,
           base_url = excluded.base_url,
           model = excluded.model,
+          config_path = excluded.config_path,
           credential_ref = excluded.credential_ref,
           updated_at = excluded.updated_at
         "#,
@@ -276,6 +284,7 @@ pub fn save_provider(conn: &Connection, input: ProviderInput) -> Result<Provider
             &input.name,
             &input.base_url,
             &input.model,
+            &input.config_path,
             &credential_ref,
             &created_at,
             &now
@@ -289,7 +298,7 @@ pub fn save_provider(conn: &Connection, input: ProviderInput) -> Result<Provider
 pub fn list_providers(conn: &Connection) -> Result<Vec<ProviderRecord>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, kind, name, base_url, model, credential_ref, created_at, updated_at
+            "SELECT id, kind, name, base_url, model, config_path, credential_ref, created_at, updated_at
              FROM provider ORDER BY updated_at DESC",
         )
         .map_err(|error| error.to_string())?;
@@ -301,7 +310,7 @@ pub fn list_providers(conn: &Connection) -> Result<Vec<ProviderRecord>, String> 
 
 pub fn get_provider(conn: &Connection, id: &str) -> Result<ProviderRecord, String> {
     conn.query_row(
-        "SELECT id, kind, name, base_url, model, credential_ref, created_at, updated_at
+        "SELECT id, kind, name, base_url, model, config_path, credential_ref, created_at, updated_at
          FROM provider WHERE id = ?1",
         params![id],
         provider_from_row,
@@ -1465,9 +1474,10 @@ fn provider_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord
         name: row.get(2)?,
         base_url: row.get(3)?,
         model: row.get(4)?,
-        credential_ref: row.get(5)?,
-        created_at: row.get(6)?,
-        updated_at: row.get(7)?,
+        config_path: row.get(5)?,
+        credential_ref: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
     })
 }
 
@@ -1651,6 +1661,30 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn provider_config_path_round_trips() {
+        let conn = memory_db();
+        let provider = save_provider(
+            &conn,
+            ProviderInput {
+                id: Some("p/m".to_string()),
+                kind: ProviderKind::OpenAiCompatible,
+                name: "Provider / Model".to_string(),
+                base_url: Some("https://example.com/v1".to_string()),
+                model: "m".to_string(),
+                api_key: None,
+                config_path: Some("E:/oDot/custom.json".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(provider.config_path.as_deref(), Some("E:/oDot/custom.json"));
+        assert_eq!(
+            get_provider(&conn, "p/m").unwrap().config_path.as_deref(),
+            Some("E:/oDot/custom.json")
+        );
     }
 
     #[test]

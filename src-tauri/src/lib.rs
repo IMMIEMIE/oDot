@@ -148,8 +148,9 @@ fn delete_provider(app: AppHandle, id: String) -> Result<(), String> {
 fn load_provider_config(
     app: AppHandle,
     project_root: Option<String>,
+    config_path: Option<String>,
 ) -> Result<ProviderConfigFileResponse, String> {
-    config_file::load_provider_config_for_project(&app, project_root)
+    config_file::load_provider_config_for_project(&app, project_root, config_path)
 }
 
 #[tauri::command]
@@ -157,8 +158,9 @@ fn save_provider_config(
     app: AppHandle,
     content: String,
     project_root: Option<String>,
+    config_path: Option<String>,
 ) -> Result<ProviderConfigFileResponse, String> {
-    config_file::save_provider_config(&app, content, project_root)
+    config_file::save_provider_config(&app, content, project_root, config_path)
 }
 
 #[tauri::command]

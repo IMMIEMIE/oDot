@@ -137,6 +137,22 @@ oDot 会根据 `api` URL 或 `npm` 字段自动检测 Provider 类型：
 
 可以为每个 Provider 或每个模型单独设置工具模式（`native`、`json` 或 `auto`）。
 
+兼容 OpenAI 的 Provider 默认使用 `/chat/completions`。如果某个 Provider 或模型支持
+OpenAI Responses API，可以在 Provider 或模型级别设置 `request.api` 为 `responses`：
+
+```json
+{
+  "provider": {
+    "my-provider": {
+      "api": "https://api.example.com/v1",
+      "request": {
+        "api": "responses"
+      }
+    }
+  }
+}
+```
+
 ### API Key 管理
 
 API Key 的获取按以下顺序检查：

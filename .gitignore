@@ -13,3 +13,4 @@ Thumbs.db
 /odot.json
 /oDot-build.bat
 src-tauri/nsis-3.11.zip
+/pack.bat

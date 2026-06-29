@@ -60,6 +60,7 @@ import {
   loadShellPolicy,
   loadProviderConfig,
   persistPlanFile,
+  pickProviderConfigFile,
   pickProjectDirectory,
   promoteTask,
   revealProjectPath,
@@ -661,7 +662,8 @@ export function App() {
   async function bootstrap() {
     setIsBooting(true);
     try {
-      const configResult = await loadProviderConfig(projectRoot).catch((configError: unknown) => {
+      const rememberedConfigPath = selectedConfigPathForProject(projectRoot);
+      const configResult = await loadProviderConfig(projectRoot, rememberedConfigPath).catch((configError: unknown) => {
         const msg = errorMessage(configError);
         setSetupError(
           msg.includes("CONFIG_NOT_FOUND")
@@ -706,13 +708,18 @@ export function App() {
     }
   }
 
-  async function saveSettings(content: string, policy: ShellPolicy) {
+  async function saveSettings(
+    content: string,
+    policy: ShellPolicy,
+    targetConfigPath?: string | null
+  ) {
     setIsSavingConfig(true);
     try {
       const [config, savedPolicy] = await Promise.all([
-        saveProviderConfig(content, projectRoot),
+        saveProviderConfig(content, projectRoot, targetConfigPath),
         saveShellPolicy(policy)
       ]);
+      rememberConfigPathForProject(projectRoot, config.path);
       setConfigPath(config.path);
       setConfigContent(config.content);
       setProviders(config.providers);
@@ -736,10 +743,24 @@ export function App() {
     }
   }
 
+  async function loadSettingsConfigFile(path: string) {
+    const config = await loadProviderConfig(projectRoot, path);
+    rememberConfigPathForProject(projectRoot, config.path);
+    setConfigPath(config.path);
+    setConfigContent(config.content);
+    setProviders(config.providers);
+    const preferredProviderId = preferredConfigProviderId(config);
+    if (preferredProviderId) {
+      setSelectedProviderId(preferredProviderId);
+    }
+    return config;
+  }
+
   async function handleSetupComplete(content: string) {
     setIsSetupSaving(true);
     try {
-      const config = await saveProviderConfig(content, projectRoot);
+      const config = await saveProviderConfig(content, projectRoot, configPath || selectedConfigPathForProject(projectRoot));
+      rememberConfigPathForProject(projectRoot, config.path);
       setConfigPath(config.path);
       setConfigContent(config.content);
       setProviders(config.providers);
@@ -767,7 +788,10 @@ export function App() {
   }
 
   async function selectSession(session: SessionRecord) {
-    const config = await loadProviderConfig(session.projectRoot);
+    const config = await loadProviderConfig(
+      session.projectRoot,
+      selectedConfigPathForProject(session.projectRoot)
+    );
     setConfigPath(config.path);
     setConfigContent(config.content);
     setProviders(config.providers);
@@ -865,7 +889,7 @@ export function App() {
       setProjectRoot(selected);
       setSelectedSessionId("");
       setEventsResponse(EMPTY_EVENTS);
-      const config = await loadProviderConfig(selected);
+      const config = await loadProviderConfig(selected, selectedConfigPathForProject(selected));
       setConfigPath(config.path);
       setConfigContent(config.content);
       setProviders(config.providers);
@@ -2344,6 +2368,7 @@ export function App() {
         <SettingsModal
           configPath={configPath}
           configContent={configContent}
+          projectRoot={projectRoot}
           providers={providers}
           selectedProviderId={selectedProviderId}
           shellPolicy={shellPolicy}
@@ -2354,6 +2379,7 @@ export function App() {
           onLocaleChange={(nextLocale) => void setAppLocale(nextLocale)}
           onClose={() => setIsSettingsOpen(false)}
           onSave={saveSettings}
+          onLoadConfigFile={loadSettingsConfigFile}
         />
       )}
       {isSessionsOpen && (
@@ -2406,6 +2432,7 @@ function SessionsModal({
 function SettingsModal({
   configPath,
   configContent,
+  projectRoot,
   providers,
   selectedProviderId,
   shellPolicy,
@@ -2415,10 +2442,12 @@ function SettingsModal({
   onThemeModeChange,
   onLocaleChange,
   onClose,
-  onSave
+  onSave,
+  onLoadConfigFile
 }: {
   configPath: string;
   configContent: string;
+  projectRoot: string;
   providers: ProviderRecord[];
   selectedProviderId: string;
   shellPolicy: ShellPolicy;
@@ -2428,7 +2457,8 @@ function SettingsModal({
   onThemeModeChange: (mode: ThemeMode) => void;
   onLocaleChange: (locale: AppLocale) => void;
   onClose: () => void;
-  onSave: (content: string, policy: ShellPolicy) => Promise<void>;
+  onSave: (content: string, policy: ShellPolicy, configPath?: string | null) => Promise<void>;
+  onLoadConfigFile: (configPath: string) => Promise<ProviderConfigFileResponse>;
 }) {
   const { t } = useTranslation();
   const initial = parseProviderSettings(configContent, selectedProviderId);
@@ -2437,6 +2467,9 @@ function SettingsModal({
   const [name, setName] = useState(initial.name);
   const [baseUrl, setBaseUrl] = useState(initial.baseUrl);
   const [apiKey, setApiKey] = useState(initial.apiKey);
+  const [supportsResponses, setSupportsResponses] = useState(initial.supportsResponses);
+  const [responsesSource, setResponsesSource] = useState(initial.responsesSource);
+  const [selectedConfigPath, setSelectedConfigPath] = useState(configPath);
   const [jsonText, setJsonText] = useState(configContent);
   const [allowlistText, setAllowlistText] = useState(
     shellPolicy.autoAllowlist.join("\n")
@@ -2453,9 +2486,28 @@ function SettingsModal({
     [jsonText, providerId, modelId]
   );
 
+  function currentFields(): ProviderSettingsFields {
+    return {
+      providerId,
+      modelId,
+      name,
+      baseUrl,
+      apiKey,
+      supportsResponses,
+      responsesSource
+    };
+  }
+
+  function flushCurrentProviderDraft() {
+    const next = buildProviderConfigContent(jsonText, currentFields());
+    setJsonText(next);
+    return next;
+  }
+
   function syncFromSelection(nextProviderId: string, nextModelId?: string) {
+    const nextText = flushCurrentProviderDraft();
     const parsed = parseProviderSettings(
-      jsonText,
+      nextText,
       nextModelId ? `${nextProviderId}/${nextModelId}` : `${nextProviderId}/${modelId}`
     );
     setProviderId(parsed.providerId || nextProviderId);
@@ -2463,27 +2515,121 @@ function SettingsModal({
     setName(parsed.name);
     setBaseUrl(parsed.baseUrl);
     setApiKey(parsed.apiKey);
+    setSupportsResponses(parsed.supportsResponses);
+    setResponsesSource(parsed.responsesSource);
   }
 
   async function handleSave() {
     setError("");
     try {
-      const nextContent = buildProviderConfigContent(jsonText, {
-        providerId,
-        modelId,
-        name,
-        baseUrl,
-        apiKey
-      });
+      const nextContent = flushCurrentProviderDraft();
       const nextPolicy = {
         autoAllowlist: allowlistText
           .split("\n")
           .map((item) => item.trim())
           .filter(Boolean)
       };
-      await onSave(nextContent, nextPolicy);
+      await onSave(nextContent, nextPolicy, selectedConfigPath);
     } catch (saveError) {
       setError(errorMessage(saveError));
+    }
+  }
+
+  function syncFromParsed(content: string, selection: string) {
+    const parsed = parseProviderSettings(content, selection);
+    setProviderId(parsed.providerId);
+    setModelId(parsed.modelId);
+    setName(parsed.name);
+    setBaseUrl(parsed.baseUrl);
+    setApiKey(parsed.apiKey);
+    setSupportsResponses(parsed.supportsResponses);
+    setResponsesSource(parsed.responsesSource);
+  }
+
+  function handleAddProvider() {
+    setError("");
+    try {
+      const draft = flushCurrentProviderDraft();
+      const config = JSON.parse(draft) as Record<string, unknown>;
+      const providers = ensureRecord(config, "provider");
+      let newId = "new-provider";
+      let counter = 1;
+      while (providers[newId]) {
+        counter += 1;
+        newId = `new-provider-${counter}`;
+      }
+      const newModelId = "default";
+      providers[newId] = {
+        name: newId,
+        npm: "@ai-sdk/openai-compatible",
+        options: { baseURL: "https://api.openai.com/v1", apiKey: "" },
+        models: { [newModelId]: { name: newModelId } }
+      };
+      if (!valueAsString(config.model)) {
+        config.model = `${newId}/${newModelId}`;
+      }
+      const next = `${JSON.stringify(config, null, 2)}\n`;
+      setJsonText(next);
+      syncFromParsed(next, `${newId}/${newModelId}`);
+    } catch (addError) {
+      setError(errorMessage(addError));
+    }
+  }
+
+  function handleDeleteProvider() {
+    setError("");
+    try {
+      const draft = flushCurrentProviderDraft();
+      const config = JSON.parse(draft) as Record<string, unknown>;
+      const providers = asRecord(config.provider);
+      const keys = Object.keys(providers);
+      if (keys.length <= 1) {
+        setError(t("settings.cannotDeleteLastProvider"));
+        return;
+      }
+      const currentId = providerId;
+      if (currentId && providers[currentId] !== undefined) {
+        delete providers[currentId];
+      }
+      const nextId = keys.find((key) => key !== currentId) ?? "";
+      const nextProvider = asRecord(providers[nextId]);
+      const nextModels = asRecord(nextProvider.models);
+      const nextModelId = Object.keys(nextModels)[0] ?? "default";
+      const modelStr = valueAsString(config.model);
+      if (modelStr && (modelStr === currentId || modelStr.startsWith(`${currentId}/`))) {
+        config.model = `${nextId}/${nextModelId}`;
+      }
+      const next = `${JSON.stringify(config, null, 2)}\n`;
+      setJsonText(next);
+      syncFromParsed(next, `${nextId}/${nextModelId}`);
+    } catch (deleteError) {
+      setError(errorMessage(deleteError));
+    }
+  }
+
+  async function handlePickConfigFile() {
+    setError("");
+    try {
+      let draft = jsonText;
+      try {
+        draft = buildProviderConfigContent(jsonText, currentFields());
+      } catch {
+        draft = jsonText;
+      }
+      const dirty = draft !== configContent || selectedConfigPath !== configPath;
+      if (dirty && !window.confirm(t("settings.discardConfigDraft"))) {
+        return;
+      }
+      const selected = await pickProviderConfigFile();
+      if (!selected) {
+        return;
+      }
+      const config = await onLoadConfigFile(selected);
+      setSelectedConfigPath(config.path);
+      setJsonText(config.content);
+      syncFromParsed(config.content, config.selectedProviderId ?? "");
+    } catch (loadError) {
+      setError(errorMessage(loadError));
     }
   }
 
@@ -2493,7 +2639,7 @@ function SettingsModal({
         <header className="modalHeader">
           <div>
             <strong>{t("settings.title")}</strong>
-            <small>{configPath || t("settings.configNotLoaded")}</small>
+            <small>{selectedConfigPath || configPath || t("settings.configNotLoaded")}</small>
           </div>
           <button className="iconButton ghost" onClick={onClose} aria-label={t("settings.close")}>
             <X size={16} />
@@ -2503,12 +2649,31 @@ function SettingsModal({
         <div className="settingsBody">
           {error && <pre className="modalError">{error}</pre>}
 
+          <div className="configFileActions">
+            <div>
+              <span>{t("settings.configFile")}</span>
+              <strong>{selectedConfigPath || configPath || t("settings.configNotLoaded")}</strong>
+              {projectRoot && <small>{projectRoot}</small>}
+            </div>
+            <button className="presetButton" type="button" onClick={() => void handlePickConfigFile()}>
+              <FileCode2 size={14} />
+              {t("settings.switchConfigFile")}
+            </button>
+          </div>
+
           <div className="settingsGrid">
             <label>
               <span>{t("settings.provider")}</span>
               <select
                 value={providerId}
-                onChange={(event) => syncFromSelection(event.target.value)}
+                onChange={(event) => {
+                  setError("");
+                  try {
+                    syncFromSelection(event.target.value);
+                  } catch (selectionError) {
+                    setError(errorMessage(selectionError));
+                  }
+                }}
               >
                 {providerOptions.map((item) => (
                   <option key={item} value={item}>
@@ -2522,8 +2687,12 @@ function SettingsModal({
               <select
                 value={modelId}
                 onChange={(event) => {
-                  setModelId(event.target.value);
-                  syncFromSelection(providerId, event.target.value);
+                  setError("");
+                  try {
+                    syncFromSelection(providerId, event.target.value);
+                  } catch (selectionError) {
+                    setError(errorMessage(selectionError));
+                  }
                 }}
               >
                 {modelOptions.map((item) => (
@@ -2553,6 +2722,14 @@ function SettingsModal({
                 placeholder="sk-..."
                 type="password"
               />
+            </label>
+            <label className="settingsWide setupToggleRow">
+              <input
+                type="checkbox"
+                checked={supportsResponses}
+                onChange={(event) => setSupportsResponses(event.target.checked)}
+              />
+              <span>{t("settings.supportsResponses")}</span>
             </label>
             <label className="settingsWide">
               <span>{t("locale.label")}</span>
@@ -2588,6 +2765,17 @@ function SettingsModal({
             </label>
           </div>
 
+          <div className="providerActions">
+            <button className="presetButton" type="button" onClick={handleAddProvider}>
+              <Plus size={14} />
+              {t("settings.addProvider")}
+            </button>
+            <button className="presetButton" type="button" onClick={handleDeleteProvider}>
+              <Trash2 size={14} />
+              {t("settings.deleteProvider")}
+            </button>
+          </div>
+
           <button
             className="advancedToggle"
             type="button"
@@ -2608,6 +2796,8 @@ function SettingsModal({
                 setName(parsed.name);
                 setBaseUrl(parsed.baseUrl);
                 setApiKey(parsed.apiKey);
+                setSupportsResponses(parsed.supportsResponses);
+                setResponsesSource(parsed.responsesSource);
               }}
               spellCheck={false}
             />
@@ -4801,6 +4991,20 @@ function preferredConfigProviderId(config: ProviderConfigFileResponse) {
   return config.selectedProviderId ?? config.providers[0]?.id ?? "";
 }
 
+function configPathPreferenceKey(projectRoot: string) {
+  return `odot.selectedConfigPath:${projectRoot.trim() || "__app__"}`;
+}
+
+function selectedConfigPathForProject(projectRoot: string) {
+  return localStorage.getItem(configPathPreferenceKey(projectRoot)) || null;
+}
+
+function rememberConfigPathForProject(projectRoot: string, configPath: string) {
+  if (configPath.trim()) {
+    localStorage.setItem(configPathPreferenceKey(projectRoot), configPath);
+  }
+}
+
 function latestPlanExecutionEvents(events: EventRecord[]) {
   let startIndex = -1;
   for (let index = events.length - 1; index >= 0; index -= 1) {
@@ -5059,6 +5263,8 @@ type ProviderSettingsFields = {
   name: string;
   baseUrl: string;
   apiKey: string;
+  supportsResponses: boolean;
+  responsesSource: "model" | "provider" | "default";
 };
 
 function parseProviderSettings(
@@ -5087,6 +5293,16 @@ function parseProviderSettings(
     const options = asRecord(provider.options);
     const model = asRecord(models?.[modelId]);
     const modelProvider = asRecord(model.provider);
+    const providerRequest = asRecord(provider.request);
+    const modelRequest = asRecord(model.request);
+    const modelApi = valueAsString(modelRequest.api);
+    const providerApi = valueAsString(providerRequest.api);
+    const responsesSource = modelApi
+      ? "model"
+      : providerApi
+        ? "provider"
+        : "default";
+    const supportsResponses = (modelApi || providerApi) === "responses";
     return {
       providerId,
       modelId,
@@ -5100,7 +5316,9 @@ function parseProviderSettings(
       apiKey:
         valueAsString(options.apiKey) ||
         valueAsString(options.api_key) ||
-        valueAsString(options.key)
+        valueAsString(options.key),
+      supportsResponses,
+      responsesSource
     };
   } catch {
     return {
@@ -5108,7 +5326,9 @@ function parseProviderSettings(
       modelId: "",
       name: "",
       baseUrl: "",
-      apiKey: ""
+      apiKey: "",
+      supportsResponses: false,
+      responsesSource: "default"
     };
   }
 }
@@ -5139,6 +5359,26 @@ function buildProviderConfigContent(
   model.name = model.name || modelId;
   config.model = `${providerId}/${modelId}`;
 
+  if (fields.supportsResponses) {
+    const request = ensureRecord(provider, "request");
+    request.api = "responses";
+  } else {
+    const request = asRecord(provider.request);
+    if ("api" in request) {
+      delete request.api;
+    }
+    if (Object.keys(request).length === 0 && "request" in provider) {
+      delete provider.request;
+    }
+  }
+  const modelRequest = asRecord(model.request);
+  if ("api" in modelRequest) {
+    delete modelRequest.api;
+  }
+  if (Object.keys(modelRequest).length === 0 && "request" in model) {
+    delete model.request;
+  }
+
   return `${JSON.stringify(config, null, 2)}\n`;
 }
 
@@ -5148,29 +5388,34 @@ type SetupConfigFields = {
   apiKey: string;
   modelId: string;
   modelDisplayName: string;
+  supportsResponses: boolean;
 };
 
 function generateSetupConfig(fields: SetupConfigFields): string {
   const rawId = fields.providerName.trim().toLowerCase().replace(/\s+/g, "-");
   const providerId = rawId || "openai-compatible";
   const modelId = fields.modelId.trim();
+  const providerEntry: Record<string, unknown> = {
+    name: fields.providerName.trim() || providerId,
+    npm: "@ai-sdk/openai-compatible",
+    options: {
+      baseURL: fields.baseUrl.trim() || "https://api.openai.com/v1",
+      apiKey: fields.apiKey.trim()
+    },
+    models: {
+      [modelId]: {
+        name: fields.modelDisplayName.trim() || modelId
+      }
+    }
+  };
+  if (fields.supportsResponses) {
+    providerEntry.request = { api: "responses" };
+  }
   const config = {
     $schema: "https://opencode.ai/config.json",
     model: `${providerId}/${modelId}`,
     provider: {
-      [providerId]: {
-        name: fields.providerName.trim() || providerId,
-        npm: "@ai-sdk/openai-compatible",
-        options: {
-          baseURL: fields.baseUrl.trim() || "https://api.openai.com/v1",
-          apiKey: fields.apiKey.trim()
-        },
-        models: {
-          [modelId]: {
-            name: fields.modelDisplayName.trim() || modelId
-          }
-        }
-      }
+      [providerId]: providerEntry
     }
   };
   return `${JSON.stringify(config, null, 2)}\n`;
@@ -5182,6 +5427,7 @@ type SetupPreset = {
   baseUrl: string;
   modelId: string;
   modelDisplayName: string;
+  supportsResponses: boolean;
 };
 
 const SETUP_PRESETS: SetupPreset[] = [
@@ -5190,28 +5436,32 @@ const SETUP_PRESETS: SetupPreset[] = [
     providerName: "OpenAI",
     baseUrl: "https://api.openai.com/v1",
     modelId: "gpt-4.1-mini",
-    modelDisplayName: "GPT-4.1 Mini"
+    modelDisplayName: "GPT-4.1 Mini",
+    supportsResponses: true
   },
   {
     label: "DeepSeek",
     providerName: "DeepSeek",
     baseUrl: "https://api.deepseek.com/v1",
     modelId: "deepseek-chat",
-    modelDisplayName: "DeepSeek Chat"
+    modelDisplayName: "DeepSeek Chat",
+    supportsResponses: false
   },
   {
     label: "SiliconFlow",
     providerName: "SiliconFlow",
     baseUrl: "https://api.siliconflow.cn/v1",
     modelId: "deepseek-ai/DeepSeek-V3",
-    modelDisplayName: "DeepSeek V3"
+    modelDisplayName: "DeepSeek V3",
+    supportsResponses: false
   },
   {
     label: "火山引擎",
     providerName: "Volcengine",
     baseUrl: "https://ark.cn-beijing.volces.com/api/coding/v3",
     modelId: "ark-code-latest",
-    modelDisplayName: "ark-code-latest"
+    modelDisplayName: "ark-code-latest",
+    supportsResponses: false
   }
 ];
 
@@ -5234,6 +5484,7 @@ function SetupDialog({
   const [apiKey, setApiKey] = useState("");
   const [modelId, setModelId] = useState("");
   const [modelDisplayName, setModelDisplayName] = useState("");
+  const [supportsResponses, setSupportsResponses] = useState(false);
   const [formError, setFormError] = useState("");
   const [textImport, setTextImport] = useState("");
   const [textError, setTextError] = useState("");
@@ -5251,6 +5502,7 @@ function SetupDialog({
     setBaseUrl(preset.baseUrl);
     setModelId(preset.modelId);
     setModelDisplayName(preset.modelDisplayName);
+    setSupportsResponses(preset.supportsResponses);
   }
 
   function handleGenerate() {
@@ -5268,7 +5520,8 @@ function SetupDialog({
       baseUrl,
       apiKey,
       modelId,
-      modelDisplayName
+      modelDisplayName,
+      supportsResponses
     });
     onComplete(content);
   }
@@ -5395,6 +5648,14 @@ function SetupDialog({
                     onChange={(e) => setModelDisplayName(e.target.value)}
                     placeholder={t("setup.modelDisplayNamePlaceholder")}
                   />
+                </label>
+                <label className="settingsWide setupToggleRow">
+                  <input
+                    type="checkbox"
+                    checked={supportsResponses}
+                    onChange={(e) => setSupportsResponses(e.target.checked)}
+                  />
+                  <span>{t("setup.supportsResponses")}</span>
                 </label>
               </div>
             </>

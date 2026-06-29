@@ -130,7 +130,14 @@
     "model": "Model",
     "name": "Name",
     "baseUrl": "Base URL",
-    "apiKey": "API Key"
+    "apiKey": "API Key",
+    "supportsResponses": "支持 Responses API",
+    "addProvider": "新增服务",
+    "deleteProvider": "删除服务",
+    "cannotDeleteLastProvider": "至少需保留一个服务，无法删除",
+    "configFile": "配置文件",
+    "switchConfigFile": "切换 JSON",
+    "discardConfigDraft": "放弃当前未保存的设置修改，并切换到另一个 JSON 文件？"
   },
   "setup": {
     "title": "初始化 API 配置",
@@ -156,7 +163,8 @@
     "manualImportPlaceholder": "粘贴 opencode 格式的 JSON 配置…",
     "invalidJsonFormat": "请输入 opencode 格式的 JSON 配置！",
     "backToForm": "返回表单填写",
-    "opencodeImported": "已从 opencode 配置导入"
+    "opencodeImported": "已从 opencode 配置导入",
+    "supportsResponses": "支持 Responses API"
   },
   "notice": {
     "ready": "准备就绪",
@@ -391,6 +399,7 @@
   },
   "api": {
     "pickProjectTitle": "选择 oDot 项目目录",
+    "pickConfigTitle": "选择 Provider JSON 配置文件",
     "tauriOnly": "oDot 桌面 API 只能在 Tauri 应用内使用。"
   },
   "recoverAction": {

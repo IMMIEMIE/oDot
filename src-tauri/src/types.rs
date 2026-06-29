@@ -22,6 +22,24 @@ pub enum ToolMode {
     Auto,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OpenAiApiMode {
+    #[serde(
+        rename = "chatCompletions",
+        alias = "chat_completions",
+        alias = "chat-completions"
+    )]
+    ChatCompletions,
+    #[serde(rename = "responses")]
+    Responses,
+}
+
+impl Default for OpenAiApiMode {
+    fn default() -> Self {
+        Self::ChatCompletions
+    }
+}
+
 impl ProviderKind {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -154,6 +172,7 @@ pub struct ProviderInput {
     pub base_url: Option<String>,
     pub model: String,
     pub api_key: Option<String>,
+    pub config_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,6 +192,7 @@ pub struct ProviderRecord {
     pub name: String,
     pub base_url: Option<String>,
     pub model: String,
+    pub config_path: Option<String>,
     pub credential_ref: String,
     pub created_at: String,
     pub updated_at: String,
@@ -190,6 +210,7 @@ pub struct ProviderPricing {
 pub struct ProviderRequestConfig {
     pub kind: ProviderKind,
     pub tool_mode: ToolMode,
+    pub openai_api_mode: OpenAiApiMode,
     pub base_url: Option<String>,
     pub model: String,
     pub api_key: String,

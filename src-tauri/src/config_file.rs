@@ -1,8 +1,8 @@
 use crate::{
     storage,
     types::{
-        ProviderConfigFileResponse, ProviderInput, ProviderKind, ProviderPricing, ProviderRecord,
-        ProviderRequestConfig, ToolMode,
+        OpenAiApiMode, ProviderConfigFileResponse, ProviderInput, ProviderKind, ProviderPricing,
+        ProviderRecord, ProviderRequestConfig, ToolMode,
     },
 };
 use serde::Deserialize;
@@ -82,6 +82,7 @@ struct ModelProvider {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ConfigRequest {
+    api: Option<OpenAiApiMode>,
     #[serde(default)]
     headers: HashMap<String, String>,
     #[serde(default)]
@@ -97,14 +98,16 @@ enum CredentialProblem {
 pub fn load_provider_config_for_project(
     app: &AppHandle,
     project_root: Option<String>,
+    config_path: Option<String>,
 ) -> Result<ProviderConfigFileResponse, String> {
-    let path = config_path(app, project_root.as_deref())?;
+    let path =
+        resolve_config_path_from_input(app, project_root.as_deref(), config_path.as_deref())?;
     if !path.exists() {
         return Err("CONFIG_NOT_FOUND".to_string());
     }
 
     let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    let (providers, selected_provider_id) = sync_provider_config(app, &content)?;
+    let (providers, selected_provider_id) = sync_provider_config(app, &content, &path)?;
     Ok(ProviderConfigFileResponse {
         path: path.to_string_lossy().to_string(),
         content,
@@ -117,15 +120,17 @@ pub fn save_provider_config(
     app: &AppHandle,
     content: String,
     project_root: Option<String>,
+    config_path: Option<String>,
 ) -> Result<ProviderConfigFileResponse, String> {
     parse_provider_inputs(&content)?;
 
-    let path = config_path(app, project_root.as_deref())?;
+    let path =
+        resolve_config_path_from_input(app, project_root.as_deref(), config_path.as_deref())?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     fs::write(&path, &content).map_err(|error| error.to_string())?;
-    let (providers, selected_provider_id) = sync_provider_config(app, &content)?;
+    let (providers, selected_provider_id) = sync_provider_config(app, &content, &path)?;
     Ok(ProviderConfigFileResponse {
         path: path.to_string_lossy().to_string(),
         content,
@@ -139,7 +144,7 @@ pub fn load_provider_request_config(
     project_root: &str,
     provider_record_id: &str,
 ) -> Result<ProviderRequestConfig, String> {
-    let path = config_path(app, Some(project_root))?;
+    let path = provider_config_path(app, project_root, provider_record_id)?;
     ensure_config_file(&path)?;
     let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
     resolve_provider_request_config_with_env(&content, provider_record_id, &path, |name| {
@@ -150,12 +155,15 @@ pub fn load_provider_request_config(
 fn sync_provider_config(
     app: &AppHandle,
     content: &str,
+    config_path: &Path,
 ) -> Result<(Vec<ProviderRecord>, Option<String>), String> {
     let (inputs, selected_provider_id) = parse_provider_inputs(content)?;
     let conn = storage::open_db(app)?;
     let mut records = Vec::with_capacity(inputs.len());
 
-    for input in inputs {
+    let config_path = config_path.to_string_lossy().to_string();
+    for mut input in inputs {
+        input.config_path = Some(config_path.clone());
         records.push(storage::save_provider(&conn, input)?);
     }
 
@@ -210,6 +218,7 @@ fn parse_provider_inputs(content: &str) -> Result<(Vec<ProviderInput>, Option<St
                 base_url: api,
                 model: api_model,
                 api_key: None,
+                config_path: None,
             });
         }
     }
@@ -305,6 +314,12 @@ where
             .or(provider.tool_mode)
             .unwrap_or(ToolMode::Auto),
     );
+    let openai_api_mode = model
+        .request
+        .as_ref()
+        .and_then(|request| request.api)
+        .or_else(|| provider.request.as_ref().and_then(|request| request.api))
+        .unwrap_or_default();
     let base_url = model
         .provider
         .as_ref()
@@ -336,6 +351,7 @@ where
     Ok(ProviderRequestConfig {
         kind,
         tool_mode,
+        openai_api_mode,
         base_url,
         model: model.id.clone().unwrap_or_else(|| model_key.to_string()),
         api_key,
@@ -352,6 +368,95 @@ where
 fn config_path(app: &AppHandle, project_root: Option<&str>) -> Result<PathBuf, String> {
     let fallback = app_config_path(app)?;
     Ok(resolve_config_path(project_root, &fallback))
+}
+
+fn resolve_config_path_from_input(
+    app: &AppHandle,
+    project_root: Option<&str>,
+    selected_config_path: Option<&str>,
+) -> Result<PathBuf, String> {
+    let Some(value) = selected_config_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return config_path(app, project_root);
+    };
+    let path = PathBuf::from(value);
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| !extension.eq_ignore_ascii_case("json"))
+        .unwrap_or(true)
+    {
+        return Err("配置文件必须是 .json 文件。".to_string());
+    }
+
+    let absolute = if path.is_absolute() {
+        path
+    } else if let Some(root) = project_root.map(str::trim).filter(|root| !root.is_empty()) {
+        PathBuf::from(root).join(path)
+    } else {
+        app_config_path(app)?
+            .parent()
+            .map(|parent| parent.join(&path))
+            .unwrap_or(path)
+    };
+    let parent = absolute
+        .parent()
+        .ok_or_else(|| "配置文件路径缺少父目录。".to_string())?;
+    if !parent.exists() {
+        return Err(format!("配置文件父目录不存在: {}", parent.display()));
+    }
+
+    let parent = parent.canonicalize().map_err(|error| error.to_string())?;
+    let filename = absolute
+        .file_name()
+        .ok_or_else(|| "配置文件路径缺少文件名。".to_string())?;
+    let resolved = parent.join(filename);
+    ensure_config_path_allowed(app, project_root, &resolved)?;
+    Ok(resolved)
+}
+
+fn ensure_config_path_allowed(
+    app: &AppHandle,
+    project_root: Option<&str>,
+    path: &Path,
+) -> Result<(), String> {
+    let mut roots = app_config_path(app)?
+        .parent()
+        .map(|path| vec![path.to_path_buf()])
+        .unwrap_or_default();
+    if let Some(root) = project_root.map(str::trim).filter(|root| !root.is_empty()) {
+        roots.push(PathBuf::from(root));
+    }
+    let allowed = roots.into_iter().any(|root| {
+        root.canonicalize()
+            .ok()
+            .map(|root| path.starts_with(root))
+            .unwrap_or(false)
+    });
+    if allowed {
+        Ok(())
+    } else {
+        Err(format!(
+            "配置文件必须位于当前项目目录或应用配置目录内: {}",
+            path.display()
+        ))
+    }
+}
+
+fn provider_config_path(
+    app: &AppHandle,
+    project_root: &str,
+    provider_record_id: &str,
+) -> Result<PathBuf, String> {
+    let conn = storage::open_db(app)?;
+    if let Ok(provider) = storage::get_provider(&conn, provider_record_id) {
+        if let Some(path) = provider.config_path.as_deref() {
+            return resolve_config_path_from_input(app, Some(project_root), Some(path));
+        }
+    }
+    config_path(app, Some(project_root))
 }
 
 fn app_config_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -775,6 +880,7 @@ mod tests {
 
         assert_eq!(request.api_key, "ark-json-key");
         assert_eq!(request.tool_mode, ToolMode::Native);
+        assert_eq!(request.openai_api_mode, OpenAiApiMode::ChatCompletions);
         assert_eq!(request.context_token_limit, Some(256000));
         assert_eq!(request.input_token_limit, Some(240000));
         assert_eq!(request.output_token_limit, Some(4096));
@@ -796,6 +902,74 @@ mod tests {
         .unwrap();
 
         assert_eq!(request.api_key, "ark-env-key");
+    }
+
+    #[test]
+    fn provider_request_api_can_enable_responses() {
+        let config = r#"{
+  "model": "volcengine-plan/ark-code-latest",
+  "provider": {
+    "volcengine-plan": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "https://ark.cn-beijing.volces.com/api/coding/v3",
+        "apiKey": "ark-json-key"
+      },
+      "request": {
+        "api": "responses"
+      },
+      "models": {
+        "ark-code-latest": {}
+      }
+    }
+  }
+}"#;
+
+        let request = resolve_provider_request_config_with_env(
+            config,
+            "volcengine-plan/ark-code-latest",
+            Path::new("C:/Users/test/AppData/Roaming/dev.odot.desktop/odot.json"),
+            |_| None,
+        )
+        .unwrap();
+
+        assert_eq!(request.openai_api_mode, OpenAiApiMode::Responses);
+    }
+
+    #[test]
+    fn model_request_api_overrides_provider_request_api() {
+        let config = r#"{
+  "model": "volcengine-plan/ark-code-latest",
+  "provider": {
+    "volcengine-plan": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "https://ark.cn-beijing.volces.com/api/coding/v3",
+        "apiKey": "ark-json-key"
+      },
+      "request": {
+        "api": "responses"
+      },
+      "models": {
+        "ark-code-latest": {
+          "request": {
+            "api": "chatCompletions"
+          }
+        }
+      }
+    }
+  }
+}"#;
+
+        let request = resolve_provider_request_config_with_env(
+            config,
+            "volcengine-plan/ark-code-latest",
+            Path::new("C:/Users/test/AppData/Roaming/dev.odot.desktop/odot.json"),
+            |_| None,
+        )
+        .unwrap();
+
+        assert_eq!(request.openai_api_mode, OpenAiApiMode::ChatCompletions);
     }
 
     #[test]

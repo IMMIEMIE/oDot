@@ -48,6 +48,16 @@ struct ToolAccumulator {
     emitted: bool,
 }
 
+#[derive(Debug, Default)]
+pub struct OpenAiResponsesStreamParser {
+    buffer: String,
+    content: ReasoningTagSplitter,
+    tools: HashMap<String, ToolAccumulator>,
+    finish_reason: Option<String>,
+    usage: Option<Value>,
+    finished: bool,
+}
+
 impl OpenAiChatStreamParser {
     pub fn new() -> Self {
         Self::default()
@@ -253,6 +263,323 @@ impl OpenAiChatStreamParser {
         events.extend(self.emit_tool_calls()?);
         Ok(events)
     }
+}
+
+impl OpenAiResponsesStreamParser {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push_str(&mut self, chunk: &str) -> Result<Vec<LlmStreamEvent>, String> {
+        self.buffer.push_str(chunk);
+        let mut events = Vec::new();
+        while let Some((block, consumed)) = next_sse_block(&self.buffer) {
+            self.buffer.drain(..consumed);
+            if let Some(data) = sse_data(&block) {
+                events.extend(self.parse_data(&data)?);
+            }
+        }
+        Ok(events)
+    }
+
+    pub fn finish(&mut self) -> Result<Vec<LlmStreamEvent>, String> {
+        let mut events = Vec::new();
+        if !self.buffer.trim().is_empty() {
+            let block = std::mem::take(&mut self.buffer);
+            if let Some(data) = sse_data(&block) {
+                events.extend(self.parse_data(&data)?);
+            }
+        }
+        events.extend(self.emit_terminal_events()?);
+        events.extend(self.emit_finish());
+        Ok(events)
+    }
+
+    fn parse_data(&mut self, data: &str) -> Result<Vec<LlmStreamEvent>, String> {
+        let trimmed = data.trim();
+        if trimmed.is_empty() {
+            return Ok(Vec::new());
+        }
+        if trimmed == "[DONE]" {
+            let mut events = self.emit_terminal_events()?;
+            events.extend(self.emit_finish());
+            return Ok(events);
+        }
+
+        let payload: Value = serde_json::from_str(trimmed)
+            .map_err(|error| format!("AI 服务返回了无效 streaming JSON: {error}"))?;
+        self.parse_payload(&payload)
+    }
+
+    fn parse_payload(&mut self, payload: &Value) -> Result<Vec<LlmStreamEvent>, String> {
+        let mut events = Vec::new();
+        if let Some(usage) = payload
+            .pointer("/response/usage")
+            .or_else(|| payload.get("usage"))
+            .filter(|value| !value.is_null())
+            .cloned()
+        {
+            self.usage = Some(usage);
+        }
+
+        match payload
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
+            "response.output_text.delta" => {
+                if let Some(text) = payload.get("delta").and_then(Value::as_str) {
+                    events.extend(self.content.push(text).into_iter().map(content_delta_event));
+                }
+            }
+            "response.reasoning_summary_text.delta"
+            | "response.reasoning_text.delta"
+            | "response.reasoning.delta" => {
+                if let Some(text) = payload
+                    .get("delta")
+                    .or_else(|| payload.get("text"))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                {
+                    events.push(LlmStreamEvent::ReasoningDelta {
+                        part_id: payload
+                            .get("item_id")
+                            .or_else(|| payload.get("output_index"))
+                            .and_then(value_to_part_id)
+                            .unwrap_or_else(|| "reasoning-0".to_string()),
+                        text: text.to_string(),
+                    });
+                }
+            }
+            "response.output_item.added" | "response.output_item.done" => {
+                if let Some(item) = payload.get("item") {
+                    self.ingest_response_item(item);
+                    if payload.get("type").and_then(Value::as_str)
+                        == Some("response.output_item.done")
+                    {
+                        events.extend(self.emit_tool_call_for_item(item)?);
+                    }
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                if let Some(event) = self.push_function_arguments_delta(payload) {
+                    events.push(event);
+                }
+            }
+            "response.function_call_arguments.done" => {
+                self.ingest_function_arguments_done(payload);
+                if let Some(item_id) = responses_item_key(payload) {
+                    events.extend(self.emit_tool_call_by_key(&item_id)?);
+                }
+            }
+            "response.completed" => {
+                self.finish_reason = Some("stop".to_string());
+                if let Some(output) = payload
+                    .pointer("/response/output")
+                    .and_then(Value::as_array)
+                {
+                    for item in output {
+                        self.ingest_response_item(item);
+                    }
+                }
+                events.extend(self.emit_terminal_events()?);
+                events.extend(self.emit_finish());
+            }
+            "response.incomplete" => {
+                self.finish_reason = payload
+                    .pointer("/response/incomplete_details/reason")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .or_else(|| Some("incomplete".to_string()));
+                events.extend(self.emit_terminal_events()?);
+                events.extend(self.emit_finish());
+            }
+            "response.failed" => {
+                let message = payload
+                    .pointer("/response/error/message")
+                    .or_else(|| payload.pointer("/error/message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("Responses streaming 请求失败");
+                return Err(format!("AI 服务 streaming 请求失败: {message}"));
+            }
+            _ => {}
+        }
+
+        Ok(events)
+    }
+
+    fn ingest_response_item(&mut self, item: &Value) {
+        if item.get("type").and_then(Value::as_str) != Some("function_call") {
+            return;
+        }
+        let Some(key) = responses_item_key(item) else {
+            return;
+        };
+        let entry = self.tools.entry(key).or_default();
+        if let Some(id) = item
+            .get("call_id")
+            .or_else(|| item.get("id"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            entry.id = Some(id.to_string());
+        }
+        if let Some(name) = item
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            entry.name = Some(name.to_string());
+        }
+        if let Some(arguments) = item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            entry.arguments = arguments.to_string();
+        }
+    }
+
+    fn push_function_arguments_delta(&mut self, payload: &Value) -> Option<LlmStreamEvent> {
+        let key = responses_item_key(payload)?;
+        let delta = payload
+            .get("delta")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if delta.is_empty() {
+            return None;
+        }
+        let item = self.tools.entry(key.clone()).or_default();
+        item.arguments.push_str(delta);
+        Some(LlmStreamEvent::ToolInputDelta {
+            tool_call_id: item.id.clone().unwrap_or(key),
+            name: item.name.clone(),
+            text: delta.to_string(),
+        })
+    }
+
+    fn ingest_function_arguments_done(&mut self, payload: &Value) {
+        let Some(key) = responses_item_key(payload) else {
+            return;
+        };
+        let Some(arguments) = payload
+            .get("arguments")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            return;
+        };
+        self.tools.entry(key).or_default().arguments = arguments.to_string();
+    }
+
+    fn emit_tool_call_for_item(&mut self, item: &Value) -> Result<Vec<LlmStreamEvent>, String> {
+        let Some(key) = responses_item_key(item) else {
+            return Ok(Vec::new());
+        };
+        self.emit_tool_call_by_key(&key)
+    }
+
+    fn emit_tool_call_by_key(&mut self, key: &str) -> Result<Vec<LlmStreamEvent>, String> {
+        let Some(item) = self.tools.get_mut(key) else {
+            return Ok(Vec::new());
+        };
+        if item.emitted {
+            return Ok(Vec::new());
+        }
+        let Some(name) = item.name.clone() else {
+            return Ok(Vec::new());
+        };
+        item.emitted = true;
+        Ok(vec![tool_call_event(key, item, name)])
+    }
+
+    fn emit_tool_calls(&mut self) -> Vec<LlmStreamEvent> {
+        let mut events = Vec::new();
+        let mut keys = self.tools.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        for key in keys {
+            let Some(item) = self.tools.get_mut(&key) else {
+                continue;
+            };
+            if item.emitted {
+                continue;
+            }
+            let Some(name) = item.name.clone() else {
+                continue;
+            };
+            item.emitted = true;
+            events.push(tool_call_event(&key, item, name));
+        }
+        events
+    }
+
+    fn emit_finish(&mut self) -> Vec<LlmStreamEvent> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
+        vec![LlmStreamEvent::Finish {
+            finish_reason: self.finish_reason.clone(),
+            usage: self.usage.clone(),
+        }]
+    }
+
+    fn emit_terminal_events(&mut self) -> Result<Vec<LlmStreamEvent>, String> {
+        let mut events = self
+            .content
+            .finish()
+            .into_iter()
+            .map(content_delta_event)
+            .collect::<Vec<_>>();
+        events.extend(self.emit_tool_calls());
+        Ok(events)
+    }
+}
+
+fn value_to_part_id(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .or_else(|| value.as_u64().map(|value| value.to_string()))
+}
+
+fn responses_item_key(value: &Value) -> Option<String> {
+    value
+        .get("item_id")
+        .or_else(|| value.get("id"))
+        .or_else(|| value.get("call_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            value
+                .get("output_index")
+                .and_then(value_to_part_id)
+                .map(|index| format!("output-{index}"))
+        })
+}
+
+fn tool_call_event(key: &str, item: &ToolAccumulator, original_name: String) -> LlmStreamEvent {
+    let (name, input) = match serde_json::from_str(&item.arguments) {
+        Ok(value) => (normalize_tool_name(&original_name), value),
+        Err(error) => {
+            let call_id = item.id.clone().unwrap_or_else(|| key.to_string());
+            (
+                "invalid".to_string(),
+                serde_json::json!({
+                    "tool": original_name,
+                    "error": error.to_string(),
+                    "arguments": item.arguments,
+                    "callId": call_id
+                }),
+            )
+        }
+    };
+    LlmStreamEvent::ToolCall(ToolCallRequest {
+        tool_call_id: item.id.clone().or_else(|| Some(key.to_string())),
+        name,
+        input,
+    })
 }
 
 #[derive(Debug, Default)]
@@ -578,6 +905,75 @@ mod tests {
     #[test]
     fn rejects_invalid_json() {
         let mut parser = OpenAiChatStreamParser::new();
+        let error = parser
+            .push_str("data: {not-json}\n\n")
+            .expect_err("invalid json");
+
+        assert!(error.contains("无效 streaming JSON"));
+    }
+
+    #[test]
+    fn responses_parser_streams_text_and_finish() {
+        let mut parser = OpenAiResponsesStreamParser::new();
+        let events = parser
+            .push_str(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"完成\"}\n\n\
+                 data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+            )
+            .expect("stream events");
+
+        assert!(events.contains(&LlmStreamEvent::TextDelta {
+            part_id: "text-0".to_string(),
+            text: "完成".to_string()
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                LlmStreamEvent::Finish {
+                    finish_reason: Some(reason),
+                    usage: Some(_)
+                } if reason == "stop"
+            )
+        }));
+    }
+
+    #[test]
+    fn responses_parser_streams_tool_arguments_and_call() {
+        let mut parser = OpenAiResponsesStreamParser::new();
+        let events = parser
+            .push_str(
+                "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"read\",\"arguments\":\"\"}}\n\n\
+                 data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{\\\"path\\\":\"}\n\n\
+                 data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"\\\"src/main.rs\\\"}\"}\n\n\
+                 data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_1\",\"arguments\":\"{\\\"path\\\":\\\"src/main.rs\\\"}\"}\n\n",
+            )
+            .expect("stream events");
+
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                LlmStreamEvent::ToolInputDelta {
+                    tool_call_id,
+                    name: Some(name),
+                    text,
+                } if tool_call_id == "call_1" && name == "read" && text.contains("path")
+            )
+        }));
+        let tool = events
+            .iter()
+            .find_map(|event| match event {
+                LlmStreamEvent::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .expect("tool call");
+        assert_eq!(tool.tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(tool.name, "read");
+        assert_eq!(tool.input["path"], "src/main.rs");
+    }
+
+    #[test]
+    fn responses_parser_rejects_invalid_json() {
+        let mut parser = OpenAiResponsesStreamParser::new();
         let error = parser
             .push_str("data: {not-json}\n\n")
             .expect_err("invalid json");
