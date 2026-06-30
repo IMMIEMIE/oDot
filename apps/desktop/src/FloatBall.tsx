@@ -154,8 +154,8 @@ export function FloatBall() {
   }, []);
 
   useEffect(() => {
-    function pauseFloatSleep() {
-      setIsSleeping(false);
+    function enterFloatSleep() {
+      setIsSleeping(true);
       if (sleepTimer.current) {
         window.clearTimeout(sleepTimer.current);
         sleepTimer.current = undefined;
@@ -166,7 +166,7 @@ export function FloatBall() {
       if (document.visibilityState === "visible") {
         recordFloatMouseEvent();
       } else {
-        pauseFloatSleep();
+        enterFloatSleep();
       }
     }
 
@@ -174,7 +174,10 @@ export function FloatBall() {
     document.addEventListener("visibilitychange", syncFloatSleepWithVisibility);
     return () => {
       document.removeEventListener("visibilitychange", syncFloatSleepWithVisibility);
-      pauseFloatSleep();
+      if (sleepTimer.current) {
+        window.clearTimeout(sleepTimer.current);
+        sleepTimer.current = undefined;
+      }
     };
   }, []);
 

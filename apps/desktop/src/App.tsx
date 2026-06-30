@@ -2935,8 +2935,8 @@ function SettingsModal({
   async function handleMcpSave() {
     setError("");
     const server = mcpFormToServer();
-    if (!server.id) { setError("Server ID 不能为空"); return; }
-    if (!server.command) { setError("Command 不能为空"); return; }
+    if (!server.id) { setError(t("settings.mcpServerIdRequired")); return; }
+    if (!server.command) { setError(t("settings.mcpCommandRequired")); return; }
     if (mcpIsNew && mcpServers.some((s) => s.id === server.id)) {
       setError(t("settings.mcpDuplicateId", { id: server.id })); return;
     }
@@ -2963,7 +2963,7 @@ function SettingsModal({
   async function handleMcpTest() {
     setError("");
     const server = mcpFormToServer();
-    if (!server.command) { setError("Command 不能为空"); return; }
+    if (!server.command) { setError(t("settings.mcpCommandRequired")); return; }
     setMcpTesting(true);
     setMcpTestResult(null);
     try {
@@ -2995,7 +2995,7 @@ function SettingsModal({
         serversMap = parsed as Record<string, Record<string, unknown>>;
       }
       const entries = Object.entries(serversMap);
-      if (entries.length === 0) { setError("未找到有效的 MCP 服务器配置"); return; }
+      if (entries.length === 0) { setError(t("settings.mcpImportNoServers")); return; }
       let updated = mcpServers;
       for (const [id, config] of entries) {
         const server: McpServerConfig = {
