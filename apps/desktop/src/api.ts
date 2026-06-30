@@ -53,6 +53,51 @@ export type PromptAttachmentInput = {
   content: string;
 };
 
+export type LoadedSkill = {
+  name: string;
+  path: string;
+};
+
+export type SkillRecord = {
+  name: string;
+  description: string;
+  path: string;
+};
+
+export type McpServerConfig = {
+  id: string;
+  enabled: boolean;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  cwd?: string | null;
+  timeoutSeconds: number;
+  requireApproval: boolean;
+  readOnly: boolean;
+};
+
+export type McpToolDefinition = {
+  serverId: string;
+  name: string;
+  displayName: string;
+  description: string;
+  inputSchema: unknown;
+  requireApproval: boolean;
+  readOnly: boolean;
+};
+
+export type ProjectCapabilityError = {
+  source: string;
+  message: string;
+};
+
+export type ProjectCapabilities = {
+  skills: SkillRecord[];
+  mcpServers: McpServerConfig[];
+  mcpTools: McpToolDefinition[];
+  errors: ProjectCapabilityError[];
+};
+
 export type CreateSessionInput = {
   projectRoot: string;
   mode: AgentMode;
@@ -110,6 +155,7 @@ export type SessionInputRecord = {
   sessionId: string;
   prompt: string;
   attachments: Omit<PromptAttachmentInput, "content">[];
+  loadedSkills: LoadedSkill[];
   delivery: SessionInputDelivery;
   resume: boolean;
   status: string;
@@ -239,6 +285,87 @@ export async function findOpencodeConfig(
   });
 }
 
+export async function listProjectCapabilities(
+  projectRoot: string,
+  configPath?: string | null
+): Promise<ProjectCapabilities> {
+  assertTauri();
+  return invoke<ProjectCapabilities>("list_project_capabilities", {
+    projectRoot,
+    configPath: configPath?.trim() || null
+  });
+}
+
+export async function saveMcpServer(
+  projectRoot: string,
+  server: McpServerConfig,
+  configPath?: string | null
+): Promise<McpServerConfig[]> {
+  assertTauri();
+  return invoke<McpServerConfig[]>("save_mcp_server", {
+    projectRoot,
+    configPath: configPath?.trim() || null,
+    server
+  });
+}
+
+export async function deleteMcpServer(
+  projectRoot: string,
+  serverId: string,
+  configPath?: string | null
+): Promise<McpServerConfig[]> {
+  assertTauri();
+  return invoke<McpServerConfig[]>("delete_mcp_server", {
+    projectRoot,
+    configPath: configPath?.trim() || null,
+    serverId
+  });
+}
+
+export async function testMcpConnection(
+  projectRoot: string,
+  server: McpServerConfig
+): Promise<McpToolDefinition[]> {
+  assertTauri();
+  return invoke<McpToolDefinition[]>("test_mcp_connection", {
+    projectRoot,
+    server
+  });
+}
+
+export async function importSkill(
+  projectRoot: string,
+  sourcePath: string
+): Promise<SkillRecord> {
+  assertTauri();
+  return invoke<SkillRecord>("import_skill", {
+    projectRoot,
+    sourcePath
+  });
+}
+
+export async function deleteSkill(
+  projectRoot: string,
+  skillPath: string
+): Promise<void> {
+  assertTauri();
+  return invoke<void>("delete_skill", {
+    projectRoot,
+    skillPath
+  });
+}
+
+export async function pickSkillFile(): Promise<string | null> {
+  assertTauri();
+  const selected = await open({
+    directory: false,
+    multiple: false,
+    filters: [{ name: "Markdown", extensions: ["md"] }],
+    title: appT("api.pickSkillTitle")
+  });
+  return typeof selected === "string" ? selected : null;
+}
+
 export async function createSession(
   input: CreateSessionInput
 ): Promise<SessionRecord> {
@@ -298,6 +425,7 @@ export async function submitPrompt(input: {
   sessionId: string;
   prompt: string;
   attachments?: PromptAttachmentInput[];
+  loadedSkills?: LoadedSkill[];
 }): Promise<SessionEventsResponse> {
   assertTauri();
   return invoke<SessionEventsResponse>("submit_prompt", { input });
@@ -308,6 +436,7 @@ export async function promptSession(input: {
   sessionId: string;
   prompt: string;
   attachments?: PromptAttachmentInput[];
+  loadedSkills?: LoadedSkill[];
   delivery?: SessionInputDelivery;
   resume?: boolean;
 }): Promise<SessionEventsResponse> {

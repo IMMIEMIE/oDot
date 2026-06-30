@@ -3,10 +3,12 @@ mod error_model;
 mod event_bus;
 mod i18n;
 mod llm_runtime;
+mod mcp;
 mod mutation;
 mod provider;
 mod runner;
 mod session_coordinator;
+mod skills;
 mod storage;
 mod task_registry;
 mod tools;
@@ -24,11 +26,12 @@ use std::{
 };
 use tauri::{AppHandle, Emitter};
 use types::{
-    ContextSummaryRecord, CreateSessionInput, EventRecord, PersistPlanInput, ProjectFile,
+    ContextSummaryRecord, CreateSessionInput, EventRecord, McpServerConfig, McpToolDefinition,
+    PersistPlanInput, ProjectCapabilities, ProjectCapabilityError, ProjectFile,
     PromptSessionInput, ProviderConfigFileResponse, ProviderInput, ProviderRecord,
     RecoverBackgroundTaskInput, RecoverSessionInput, ReplyPermissionInput, RevealPathInput,
-    SessionEventsResponse, SessionRecord, ShellPolicy, SnapshotRecord, SubmitPromptInput,
-    TailSessionEventsInput, UpdateSessionModeInput, UpdateSessionTitleInput,
+    SessionEventsResponse, SessionRecord, ShellPolicy, SkillRecord, SnapshotRecord,
+    SubmitPromptInput, TailSessionEventsInput, UpdateSessionModeInput, UpdateSessionTitleInput,
 };
 
 const FLOAT_WINDOW_LABEL: &str = "float";
@@ -166,6 +169,110 @@ fn save_provider_config(
 #[tauri::command]
 fn find_opencode_config(project_root: Option<String>) -> Result<Option<String>, String> {
     config_file::find_opencode_config(project_root.as_deref())
+}
+
+#[tauri::command]
+async fn list_project_capabilities(
+    app: AppHandle,
+    project_root: String,
+    config_path: Option<String>,
+) -> Result<ProjectCapabilities, String> {
+    let mut errors = Vec::new();
+    let skills = match skills::list_project_skills(&project_root) {
+        Ok(value) => value,
+        Err(error) => {
+            errors.push(ProjectCapabilityError {
+                source: "skills".to_string(),
+                message: error,
+            });
+            Vec::new()
+        }
+    };
+    let mcp_servers =
+        match config_file::load_mcp_server_configs(&app, &project_root, config_path.as_deref()) {
+            Ok(value) => value,
+            Err(error) => {
+                errors.push(ProjectCapabilityError {
+                    source: "mcp".to_string(),
+                    message: error,
+                });
+                Vec::new()
+            }
+        };
+    let mut mcp_tools = Vec::new();
+    for server in &mcp_servers {
+        match mcp::list_server_tools(&project_root, server).await {
+            Ok(tools) => mcp_tools.extend(tools),
+            Err(error) => errors.push(ProjectCapabilityError {
+                source: format!("mcp:{}", server.id),
+                message: error,
+            }),
+        }
+    }
+    Ok(ProjectCapabilities {
+        skills,
+        mcp_servers,
+        mcp_tools,
+        errors,
+    })
+}
+
+#[tauri::command]
+fn save_mcp_server(
+    app: AppHandle,
+    project_root: String,
+    config_path: Option<String>,
+    server: McpServerConfig,
+) -> Result<Vec<McpServerConfig>, String> {
+    config_file::save_mcp_server_entry(&app, &project_root, config_path.as_deref(), &server)
+}
+
+#[tauri::command]
+fn delete_mcp_server(
+    app: AppHandle,
+    project_root: String,
+    config_path: Option<String>,
+    server_id: String,
+) -> Result<Vec<McpServerConfig>, String> {
+    config_file::remove_mcp_server_entry(&app, &project_root, config_path.as_deref(), &server_id)
+}
+
+#[tauri::command]
+async fn test_mcp_connection(
+    project_root: String,
+    server: McpServerConfig,
+) -> Result<Vec<McpToolDefinition>, String> {
+    mcp::list_server_tools(&project_root, &server).await
+}
+
+#[tauri::command]
+fn import_skill(
+    project_root: String,
+    source_path: String,
+) -> Result<SkillRecord, String> {
+    skills::import_skill(&project_root, &source_path)
+}
+
+#[tauri::command]
+fn delete_skill(
+    project_root: String,
+    skill_path: String,
+) -> Result<(), String> {
+    skills::delete_skill(&project_root, &skill_path)
+}
+
+#[tauri::command]
+fn read_skill_content(
+    project_root: String,
+    name_or_path: String,
+) -> Result<serde_json::Value, String> {
+    let (skill, content) = skills::read_project_skill(&project_root, &name_or_path)?;
+    Ok(serde_json::json!({
+        "name": skill.name,
+        "description": skill.description,
+        "path": skill.path,
+        "content": content
+    }))
 }
 
 #[tauri::command]
@@ -341,7 +448,7 @@ fn promote_task(
 async fn approve_tool_call(app: AppHandle, event_id: String) -> Result<EventRecord, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let conn = storage::open_db(&app)?;
-        tools::approve_tool_call(&conn, &event_id)
+        tauri::async_runtime::block_on(tools::approve_tool_call(&app, &conn, &event_id))
     })
     .await
     .map_err(|error| error.to_string())?
@@ -617,6 +724,13 @@ pub fn run() {
             load_provider_config,
             save_provider_config,
             find_opencode_config,
+            list_project_capabilities,
+            save_mcp_server,
+            delete_mcp_server,
+            test_mcp_connection,
+            import_skill,
+            delete_skill,
+            read_skill_content,
             create_session,
             list_sessions,
             delete_session,

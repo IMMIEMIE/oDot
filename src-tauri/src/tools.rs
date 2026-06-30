@@ -1,5 +1,5 @@
 use crate::{
-    mutation, storage, task_registry,
+    config_file, mcp, mutation, skills, storage, task_registry,
     types::{
         AgentMode, EventRecord, PromptAttachment, SessionInputDelivery, SessionRecord, ShellMode,
         ShellPolicy, TodoRecord, ToolCallRequest,
@@ -20,6 +20,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use tauri::AppHandle;
 
 const DEFAULT_SHELL_TIMEOUT_SECONDS: u64 = 60;
 const MAX_SHELL_TIMEOUT_SECONDS: u64 = 600;
@@ -36,16 +37,18 @@ pub enum ToolExecutionMode {
     Plan,
 }
 
-pub fn execute_tool(
+pub async fn execute_tool(
+    app: &AppHandle,
     conn: &Connection,
     session: &SessionRecord,
     shell_mode: &ShellMode,
     call: &ToolCallRequest,
 ) -> Result<ToolOutcome, String> {
-    execute_tool_with_mode(conn, session, shell_mode, call, ToolExecutionMode::Agent)
+    execute_tool_with_mode(app, conn, session, shell_mode, call, ToolExecutionMode::Agent).await
 }
 
-pub fn execute_tool_with_mode(
+pub async fn execute_tool_with_mode(
+    app: &AppHandle,
     conn: &Connection,
     session: &SessionRecord,
     shell_mode: &ShellMode,
@@ -65,6 +68,7 @@ pub fn execute_tool_with_mode(
     )?;
 
     match execute_tool_inner(
+        app,
         conn,
         session,
         shell_mode,
@@ -72,7 +76,9 @@ pub fn execute_tool_with_mode(
         call,
         &called,
         execution_mode,
-    ) {
+    )
+    .await
+    {
         Ok(ToolRun::Success(data)) => {
             storage::append_event(
                 conn,
@@ -129,7 +135,11 @@ pub fn execute_tool_with_mode(
     }
 }
 
-pub fn approve_tool_call(conn: &Connection, event_id: &str) -> Result<EventRecord, String> {
+pub async fn approve_tool_call(
+    app: &AppHandle,
+    conn: &Connection,
+    event_id: &str,
+) -> Result<EventRecord, String> {
     let event = storage::get_event(conn, event_id)?;
     if event.event_type != "tool.pending" {
         return Err("只能批准等待确认的工具事件。".to_string());
@@ -145,8 +155,11 @@ pub fn approve_tool_call(conn: &Connection, event_id: &str) -> Result<EventRecor
     if tool_name == "plan_exit" {
         return approve_plan_exit(conn, &session, &event);
     }
+    if tool_name.starts_with("mcp__") {
+        return approve_mcp_tool_call(app, conn, &session, &event).await;
+    }
     if tool_name != "shell" {
-        return Err("当前版本只支持确认等待中的 shell/bash 命令或计划退出。".to_string());
+        return Err("当前版本只支持确认等待中的 shell/bash、MCP 工具或计划退出。".to_string());
     }
 
     let command = event
@@ -218,6 +231,7 @@ fn approve_plan_exit(
         &session.id,
         &prompt,
         &Vec::<PromptAttachment>::new(),
+        &[],
         SessionInputDelivery::Queue,
         true,
     )?;
@@ -246,6 +260,62 @@ fn approve_plan_exit(
     )
 }
 
+async fn approve_mcp_tool_call(
+    app: &AppHandle,
+    conn: &Connection,
+    session: &SessionRecord,
+    event: &EventRecord,
+) -> Result<EventRecord, String> {
+    let server_id = event
+        .data
+        .pointer("/pending/mcp/serverId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "等待确认的 MCP 事件中没有 serverId。".to_string())?;
+    let tool_name = event
+        .data
+        .pointer("/pending/mcp/toolName")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "等待确认的 MCP 事件中没有 toolName。".to_string())?;
+    let arguments = event
+        .data
+        .pointer("/pending/mcp/arguments")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let server = find_mcp_server(app, &session.project_root, server_id)?;
+    storage::append_event(
+        conn,
+        &session.id,
+        "tool.approved",
+        json!({
+            "pendingEventId": event.id,
+            "name": event.data.get("name").cloned().unwrap_or(Value::Null),
+            "mcp": {
+                "serverId": server_id,
+                "toolName": tool_name
+            }
+        }),
+    )?;
+    let result = mcp::call_tool(&session.project_root, &server, tool_name, arguments).await;
+    let (event_type, data) = match result {
+        Ok(value) => ("tool.success", json!({ "result": value })),
+        Err(error) => ("tool.failed", json!({ "error": error })),
+    };
+    storage::append_event(
+        conn,
+        &session.id,
+        event_type,
+        json!({
+            "pendingEventId": event.id,
+            "name": event.data.get("name").cloned().unwrap_or(Value::Null),
+            "mcp": {
+                "serverId": server_id,
+                "toolName": tool_name
+            },
+            "result": data
+        }),
+    )
+}
+
 pub fn reject_tool_call(conn: &Connection, event_id: &str) -> Result<EventRecord, String> {
     let event = storage::get_event(conn, event_id)?;
     if event.event_type != "tool.pending" {
@@ -270,7 +340,8 @@ enum ToolRun {
     Failure(Value),
 }
 
-fn execute_tool_inner(
+async fn execute_tool_inner(
+    app: &AppHandle,
     conn: &Connection,
     session: &SessionRecord,
     shell_mode: &ShellMode,
@@ -280,8 +351,16 @@ fn execute_tool_inner(
     execution_mode: ToolExecutionMode,
 ) -> Result<ToolRun, String> {
     let tool_name = normalize_tool_name(&call.name);
+    if let Some(run) = execute_mcp_tool_if_matched(app, session, call, execution_mode).await? {
+        return Ok(run);
+    }
     match tool_name.as_str() {
         "invalid" => Ok(ToolRun::Failure(invalid_tool_result(&call.input))),
+        "skill_list" => Ok(ToolRun::Success(skills::skill_list_result(&session.project_root))),
+        "skill_read" => {
+            let name = required_string(&call.input, "name")?;
+            Ok(ToolRun::Success(skills::skill_read_result(&session.project_root, &name)))
+        }
         "read" => {
             let path = required_string(&call.input, "path")?;
             let root = PathBuf::from(&session.project_root);
@@ -432,6 +511,73 @@ fn execute_tool_inner(
         }
         other => Err(format!("未知工具: {other}")),
     }
+}
+
+async fn execute_mcp_tool_if_matched(
+    app: &AppHandle,
+    session: &SessionRecord,
+    call: &ToolCallRequest,
+    execution_mode: ToolExecutionMode,
+) -> Result<Option<ToolRun>, String> {
+    if !call.name.starts_with("mcp__") {
+        return Ok(None);
+    }
+    let servers = config_file::load_mcp_server_configs(app, &session.project_root, None)?;
+    for server in servers.iter().filter(|server| server.enabled) {
+        let tools = match mcp::list_server_tools(&session.project_root, server).await {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(Some(ToolRun::Failure(json!({
+                    "error": error,
+                    "serverId": server.id
+                }))));
+            }
+        };
+        let Some(tool) = tools.iter().find(|tool| tool.display_name == call.name) else {
+            continue;
+        };
+        if execution_mode != ToolExecutionMode::Agent && !tool.read_only {
+            return Ok(Some(read_only_mode_mutation_blocked(execution_mode, &call.name)));
+        }
+        if tool.require_approval {
+            return Ok(Some(ToolRun::Pending(json!({
+                "command": format!("{} / {}", server.id, tool.name),
+                "mcp": {
+                    "serverId": server.id,
+                    "toolName": tool.name,
+                    "arguments": call.input
+                },
+                "reason": "MCP tool requires approval"
+            }))));
+        }
+        let result = mcp::call_tool(&session.project_root, server, &tool.name, call.input.clone()).await;
+        return Ok(Some(match result {
+            Ok(value) => ToolRun::Success(json!({
+                "serverId": server.id,
+                "toolName": tool.name,
+                "content": value
+            })),
+            Err(error) => ToolRun::Failure(json!({
+                "serverId": server.id,
+                "toolName": tool.name,
+                "error": error
+            })),
+        }));
+    }
+    Ok(Some(ToolRun::Failure(json!({
+        "error": format!("Unknown MCP tool: {}", call.name)
+    }))))
+}
+
+fn find_mcp_server(
+    app: &AppHandle,
+    project_root: &str,
+    server_id: &str,
+) -> Result<crate::types::McpServerConfig, String> {
+    config_file::load_mcp_server_configs(app, project_root, None)?
+        .into_iter()
+        .find(|server| server.id == server_id)
+        .ok_or_else(|| format!("未找到 MCP server: {server_id}"))
 }
 
 fn normalize_tool_name(name: &str) -> String {

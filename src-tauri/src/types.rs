@@ -313,12 +313,21 @@ pub struct SessionInputRecord {
     pub prompt: String,
     #[serde(default)]
     pub attachments: Vec<PromptAttachment>,
+    #[serde(default)]
+    pub loaded_skills: Vec<LoadedSkill>,
     pub delivery: SessionInputDelivery,
     pub resume: bool,
     pub status: String,
     pub promoted_event_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadedSkill {
+    pub name: String,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -442,6 +451,8 @@ pub struct SubmitPromptInput {
     pub prompt: String,
     #[serde(default)]
     pub attachments: Vec<PromptAttachment>,
+    #[serde(default)]
+    pub loaded_skills: Vec<LoadedSkill>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -452,9 +463,63 @@ pub struct PromptSessionInput {
     pub prompt: String,
     #[serde(default)]
     pub attachments: Vec<PromptAttachment>,
+    #[serde(default)]
+    pub loaded_skills: Vec<LoadedSkill>,
     pub delivery: Option<SessionInputDelivery>,
     #[serde(default = "default_resume")]
     pub resume: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillRecord {
+    pub name: String,
+    pub description: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerConfig {
+    pub id: String,
+    pub enabled: bool,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    pub cwd: Option<String>,
+    pub timeout_seconds: u64,
+    pub require_approval: bool,
+    pub read_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpToolDefinition {
+    pub server_id: String,
+    pub name: String,
+    pub display_name: String,
+    pub description: String,
+    pub input_schema: Value,
+    pub require_approval: bool,
+    pub read_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectCapabilityError {
+    pub source: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectCapabilities {
+    pub skills: Vec<SkillRecord>,
+    pub mcp_servers: Vec<McpServerConfig>,
+    pub mcp_tools: Vec<McpToolDefinition>,
+    pub errors: Vec<ProjectCapabilityError>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

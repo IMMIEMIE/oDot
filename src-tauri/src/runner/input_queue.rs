@@ -23,6 +23,7 @@ pub(crate) fn admit(conn: &Connection, input: PromptSessionInput) -> Result<Admi
         &input.session_id,
         &input.prompt,
         &input.attachments,
+        &input.loaded_skills,
         input.delivery.unwrap_or(SessionInputDelivery::Queue),
         input.resume,
     )?;
@@ -55,6 +56,7 @@ pub(crate) fn promote_next(
             "inputId": input.id,
             "prompt": input.prompt,
             "attachments": summarize_attachments(&input.attachments),
+            "loadedSkills": input.loaded_skills,
             "delivery": input.delivery
         }),
     )?;
@@ -113,6 +115,7 @@ mod tests {
             session_id: "s1".to_string(),
             prompt: text.to_string(),
             attachments: Vec::new(),
+            loaded_skills: Vec::new(),
             delivery: Some(delivery),
             resume: true,
         }

@@ -2,12 +2,12 @@ use crate::{
     config_file,
     error_model::{AppErrorInfo, ErrorKind},
     llm_runtime::{sanitize_assistant_content, LlmStreamEvent},
-    provider, session_coordinator, storage, task_registry, tools,
+    mcp, provider, session_coordinator, skills, storage, task_registry, tools,
     types::{
         AgentMode, ContextSummaryRecord, EventRecord, ModelTurn, PromptAttachment,
         PromptAttachmentKind, PromptSessionInput, ProviderPricing, ProviderRequestConfig,
         RecoverBackgroundTaskAction, RecoverBackgroundTaskInput, SessionEventsResponse,
-        SessionInputDelivery, SubmitPromptInput, ToolCallRequest, ToolMode,
+        SessionInputDelivery, SubmitPromptInput, ToolCallRequest, ToolMode, McpToolDefinition,
     },
     util,
 };
@@ -62,6 +62,7 @@ pub async fn submit_prompt(
             session_id: input.session_id,
             prompt: input.prompt,
             attachments: input.attachments,
+            loaded_skills: input.loaded_skills,
             delivery: Some(SessionInputDelivery::Queue),
             resume: true,
         },
@@ -419,6 +420,7 @@ pub fn prepare_durable_recovery(conn: &Connection) -> Result<Vec<String>, String
             &job.session_id,
             &prompt,
             &[],
+            &[],
             SessionInputDelivery::Queue,
             true,
         )?;
@@ -601,6 +603,7 @@ async fn stream_openai_compatible_with_retry(
     step_index: usize,
     provider_record_id: &str,
     request_config: &ProviderRequestConfig,
+    mcp_tools: &[McpToolDefinition],
     stream_system_prompt: &str,
     current_prompt: &str,
     initial_messages: &[Value],
@@ -617,7 +620,7 @@ async fn stream_openai_compatible_with_retry(
             request_config,
         );
         let mut emitted_stream_event = false;
-        let result = provider::stream_openai_compatible(request_config, &messages, |event| {
+        let result = provider::stream_openai_compatible(request_config, &messages, mcp_tools, |event| {
             emitted_stream_event = true;
             sink.handle(event)
         })
@@ -807,6 +810,8 @@ Tool guidance:
 - question: ask the user when blocked on an important choice.
 - todo_write: create and maintain a structured task list for visible progress. Use content, status (pending|in_progress|completed|cancelled), and priority (high|medium|low).
 - task: launch an isolated subagent session for focused work. Use multiple task calls in one turn for independent parallel subtasks. Use task_id to continue an existing subagent. Use background=true only for independent long-running work; the result will be injected when ready.
+- skill_list / skill_read: list and read project skills from .odot/skills.
+- mcp__server__tool: call a project-configured MCP tool when available.
 - plan_exit: in plan mode, request user approval to switch from planning to execution after the plan file is complete.
 Use read for file contents and search for project text. Do not read project files with shell commands such as Get-Content, more, cat, grep, or sed when read/search can do it.
 
@@ -830,7 +835,7 @@ JSON schema:
   "message": "user-facing response or progress note",
   "toolCalls": [
     {{
-      "name": "read|search|grep|edit|write|delete|shell|question|todo_write|task|plan_exit",
+      "name": "read|search|grep|edit|write|delete|shell|question|todo_write|task|skill_list|skill_read|mcp__server__tool|plan_exit",
       "input": {{}}
     }}
   ],
@@ -847,6 +852,9 @@ Tool inputs:
 - question: {{"question":"short question"}}
 - todo_write: {{"todos":[{{"content":"task","status":"pending|in_progress|completed|cancelled","priority":"high|medium|low"}}]}}
 - task: {{"description":"short label","prompt":"detailed subtask","subagent_type":"general","task_id":"optional existing task session id","background":false}}
+- skill_list: {{}}
+- skill_read: {{"name":"skill name or .odot/skills/.../SKILL.md path"}}
+- mcp__server__tool: use the exposed MCP tool name exactly and pass the tool's JSON arguments as input.
 - plan_exit: {{}}
 Use read for file contents and search for project text. Do not read project files with shell commands such as Get-Content, more, cat, grep, or sed when read/search can do it.
 
@@ -895,6 +903,22 @@ fn shell_environment_prompt() -> &'static str {
     }
 }
 
+async fn runtime_mcp_tools(app: &AppHandle, project_root: &str) -> (Vec<McpToolDefinition>, Vec<String>) {
+    let servers = match config_file::load_mcp_server_configs(app, project_root, None) {
+        Ok(value) => value,
+        Err(error) => return (Vec::new(), vec![error]),
+    };
+    let mut tools = Vec::new();
+    let mut errors = Vec::new();
+    for server in servers.iter().filter(|server| server.enabled) {
+        match mcp::list_server_tools(project_root, server).await {
+            Ok(mut value) => tools.append(&mut value),
+            Err(error) => errors.push(format!("{}: {error}", server.id)),
+        }
+    }
+    (tools, errors)
+}
+
 fn build_stream_system_prompt(
     conn: &Connection,
     session: &crate::types::SessionRecord,
@@ -909,7 +933,7 @@ fn build_stream_system_prompt(
         .map(|summary| summary.text.as_str())
         .unwrap_or(crate::i18n::no_compressed_context_yet());
     Ok(format!(
-        "{}\n\nProject context:\n{}\n\nCompressed context:\n{}",
+        "{}\n\nProject context:\n{}\n\n{}\n\nCompressed context:\n{}",
         build_system_prompt(
             mode,
             native_tools,
@@ -923,6 +947,7 @@ fn build_stream_system_prompt(
             .as_deref()
         ),
         project_context_text(&session.project_root),
+        skills::skill_catalog_prompt(&session.project_root),
         summary
     ))
 }
@@ -1049,13 +1074,16 @@ fn build_stream_messages(
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 let attachments = prompt_event_attachments(conn, event)?;
-                if prompt.trim().is_empty() && attachments.is_empty() {
+                let loaded_skills = prompt_event_loaded_skills(conn, event)?;
+                let loaded_skill_context =
+                    skills::loaded_skills_context(&storage::get_session(conn, session_id)?.project_root, &loaded_skills);
+                if prompt.trim().is_empty() && attachments.is_empty() && loaded_skills.is_empty() {
                     continue;
                 }
                 included_current_prompt |= prompt == current_prompt;
                 messages.push(json!({
                     "role": "user",
-                    "content": user_message_content(prompt, &attachments)
+                    "content": user_message_content(prompt, &attachments, &loaded_skill_context)
                 }));
             }
             "assistant.message" => {
@@ -1135,8 +1163,21 @@ fn prompt_event_attachments(
     }
 }
 
-fn user_message_content(prompt: &str, attachments: &[PromptAttachment]) -> Value {
-    if attachments.is_empty() {
+fn prompt_event_loaded_skills(
+    conn: &Connection,
+    event: &EventRecord,
+) -> Result<Vec<crate::types::LoadedSkill>, String> {
+    let Some(input_id) = event.data.get("inputId").and_then(Value::as_str) else {
+        return Ok(Vec::new());
+    };
+    match storage::get_session_input(conn, input_id) {
+        Ok(input) => Ok(input.loaded_skills),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+fn user_message_content(prompt: &str, attachments: &[PromptAttachment], loaded_skill_context: &str) -> Value {
+    if attachments.is_empty() && loaded_skill_context.trim().is_empty() {
         return json!(prompt);
     }
 
@@ -1150,6 +1191,12 @@ fn user_message_content(prompt: &str, attachments: &[PromptAttachment]) -> Value
         "type": "text",
         "text": base_prompt
     }));
+    if !loaded_skill_context.trim().is_empty() {
+        parts.push(json!({
+            "type": "text",
+            "text": loaded_skill_context
+        }));
+    }
 
     for attachment in attachments {
         match &attachment.kind {
@@ -1708,7 +1755,8 @@ fn build_user_prompt(
     let project_context = project_context_text(&session.project_root);
 
     let event_lines = recent_event_timeline(&events);
-    let current_prompt = text_runtime_prompt_with_attachments(conn, &events, current_prompt)?;
+    let current_prompt =
+        text_runtime_prompt_with_attachments(conn, &events, current_prompt, &session.project_root)?;
 
     Ok(format!(
         "Current user prompt:\n{current_prompt}\n\nProject context:\n{project_context}\n\nCompressed context:\n{summary}\n\nRecent event timeline:\n{event_lines}"
@@ -1719,6 +1767,7 @@ fn text_runtime_prompt_with_attachments(
     conn: &Connection,
     events: &[EventRecord],
     current_prompt: &str,
+    project_root: &str,
 ) -> Result<String, String> {
     let Some(event) = events.iter().rev().find(|event| {
         event.event_type == "prompt.submitted"
@@ -1732,7 +1781,9 @@ fn text_runtime_prompt_with_attachments(
         return Ok(current_prompt.to_string());
     };
     let attachments = prompt_event_attachments(conn, event)?;
-    if attachments.is_empty() {
+    let loaded_skills = prompt_event_loaded_skills(conn, event)?;
+    let loaded_skill_context = skills::loaded_skills_context(project_root, &loaded_skills);
+    if attachments.is_empty() && loaded_skills.is_empty() {
         return Ok(current_prompt.to_string());
     }
     let mut lines = vec![if current_prompt.trim().is_empty() {
@@ -1753,6 +1804,9 @@ fn text_runtime_prompt_with_attachments(
                 attachment.size,
             )),
         }
+    }
+    if !loaded_skill_context.trim().is_empty() {
+        lines.push(loaded_skill_context);
     }
     Ok(lines.join("\n\n"))
 }

@@ -67,7 +67,7 @@ pub(super) async fn execute_turn_tool(
         }
         execute_task_tool(app, conn, session, call).await
     } else {
-        tools::execute_tool_with_mode(conn, session, &session.shell_mode, call, mode)
+        tools::execute_tool_with_mode(app, conn, session, &session.shell_mode, call, mode).await
     }
 }
 
@@ -134,7 +134,7 @@ pub(super) async fn execute_agent_turn_tools(
                 task_runs.push(task);
             }
         } else {
-            let outcome = tools::execute_tool(conn, session, &session.shell_mode, call)?;
+            let outcome = tools::execute_tool(app, conn, session, &session.shell_mode, call).await?;
             has_pending |= outcome.pending;
         }
     }
@@ -234,6 +234,7 @@ fn start_task_tool(
                 session_id: child_id_for_task,
                 prompt: prompt_for_task,
                 attachments: Vec::new(),
+                loaded_skills: Vec::new(),
                 delivery: Some(SessionInputDelivery::Queue),
                 resume: true,
             },
@@ -488,6 +489,7 @@ fn detach_task_tool(app: AppHandle, parent_session_id: String, task: TaskRun, jo
                         session_id: parent_session_id,
                         prompt,
                         attachments: Vec::new(),
+                        loaded_skills: Vec::new(),
                         delivery: Some(SessionInputDelivery::Queue),
                         resume: true,
                     },

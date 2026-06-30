@@ -1116,6 +1116,11 @@ button:focus-visible {
   color: var(--accent);
 }
 
+.timelineItem.mcpTool .timelineItemIcon {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+}
+
 .timelineItem.failed .timelineItemIcon {
   background: var(--danger-soft);
   color: var(--red);
@@ -1135,6 +1140,7 @@ button:focus-visible {
 
 .timelineItem.userPrompt .timelineItemBody,
 .timelineItem.assistantReply .timelineItemBody,
+.timelineItem.mcpTool .timelineItemBody,
 .timelineItem.codeChange .timelineItemBody,
 .timelineItem.codeChangeSummary .timelineItemBody {
   padding: 14px;
@@ -1156,6 +1162,13 @@ button:focus-visible {
 .timelineItem.assistantReply .timelineItemBody {
   background:
     linear-gradient(180deg, var(--surface), var(--surface-elevated));
+}
+
+.timelineItem.mcpTool .timelineItemBody {
+  border-color: var(--accent-border);
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--accent) 8%, transparent), transparent 55%),
+    var(--surface);
 }
 
 .timelineItem.statusSummary .timelineItemBody,
@@ -1476,6 +1489,105 @@ pre {
   gap: 7px;
 }
 
+.mcpToolCard {
+  min-width: 0;
+  display: grid;
+  gap: 9px;
+}
+
+.mcpToolMeta {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.mcpToolBadge,
+.mcpToolMeta span,
+.mcpToolMeta code {
+  min-height: 24px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  box-shadow: var(--inset-line);
+}
+
+.mcpToolBadge {
+  color: var(--accent);
+  background: var(--accent-soft);
+  font-weight: 800;
+}
+
+.mcpToolMeta code {
+  max-width: min(100%, 280px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-soft);
+  background: var(--surface-strong);
+  font-family:
+    "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  white-space: nowrap;
+}
+
+.mcpToolMeta span:not(.mcpToolBadge) {
+  color: var(--muted);
+  background: var(--surface-strong);
+  font-weight: 700;
+}
+
+.mcpToolSummary {
+  margin: 0;
+  color: var(--text-soft);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.mcpPayloadDetail {
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.mcpPayloadDetail summary {
+  min-height: 24px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  color: var(--muted);
+  font-weight: 750;
+  list-style: none;
+}
+
+.mcpPayloadDetail summary::-webkit-details-marker {
+  display: none;
+}
+
+.mcpPayloadDetail[open] summary svg {
+  transform: rotate(90deg);
+}
+
+.mcpPayloadList {
+  display: grid;
+  gap: 8px;
+  margin-top: 7px;
+}
+
+.mcpPayloadList section {
+  display: grid;
+  gap: 5px;
+}
+
+.mcpPayloadList strong {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
 .errorRecoveryCard {
   display: grid;
   gap: 10px;
@@ -1766,6 +1878,7 @@ pre {
 }
 
 .promptComposer {
+  position: relative;
   width: 100%;
   min-width: 0;
   margin: 0;
@@ -1793,7 +1906,17 @@ pre {
     var(--inset-line);
 }
 
+.promptInputRow {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  min-width: 0;
+}
+
 .promptInput {
+  flex: 1 1 120px;
+  min-width: 120px;
   min-height: 30px;
   max-height: 118px;
   padding: 3px 2px;
@@ -1827,6 +1950,137 @@ pre {
   display: none;
 }
 
+.skillSlashMenu {
+  width: min(360px, 100%);
+  max-height: 238px;
+  overflow: auto;
+  padding: 6px;
+  border: 1px solid var(--accent-border);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 18px 44px rgba(20, 35, 31, 0.18);
+  display: grid;
+  gap: 4px;
+}
+
+.skillSlashOption {
+  width: 100%;
+  min-height: 40px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink);
+  display: grid;
+  grid-template-columns: 18px minmax(0, auto) minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  text-align: left;
+}
+
+.skillSlashOption.active,
+.skillSlashOption:hover {
+  background: var(--accent-soft);
+}
+
+.skillSlashOption span,
+.skillSlashOption small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skillSlashOption span {
+  font-weight: 800;
+}
+
+.skillSlashOption small,
+.skillSlashEmpty {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.skillSlashEmpty {
+  padding: 9px;
+}
+
+.skillSlashOverlay {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  z-index: 40;
+  padding: 0 clamp(10px, 1.4vw, 14px) 6px clamp(12px, 1.6vw, 18px);
+  pointer-events: none;
+}
+
+.skillSlashOverlay > .skillSlashMenu {
+  pointer-events: auto;
+}
+
+.promptSkillTags {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+  flex-shrink: 0;
+}
+
+.promptSkillTag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px 2px 6px;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 20px;
+  max-width: min(240px, 100%);
+}
+
+.promptSkillTag > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.promptSkillTag > svg {
+  flex-shrink: 0;
+  color: var(--accent);
+  opacity: 0.7;
+}
+
+.promptSkillTag button {
+  all: unset;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 3px;
+  color: var(--accent);
+  opacity: 0.6;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: opacity 0.15s ease, background 0.15s ease;
+}
+
+.promptSkillTag button:hover:not(:disabled) {
+  opacity: 1;
+  background: var(--accent);
+  color: #fff;
+}
+
+.promptSkillTag button:disabled {
+  cursor: not-allowed;
+  opacity: 0.3;
+}
+
 .promptAttachmentList {
   display: flex;
   align-items: center;
@@ -1848,6 +2102,12 @@ pre {
   align-items: center;
   gap: 6px;
   box-shadow: var(--inset-line);
+}
+
+.promptAttachmentChip.skillChip {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 .promptAttachmentChip span {
@@ -2880,20 +3140,75 @@ pre {
   flex-shrink: 0;
 }
 
-.setupToggleRow {
-  display: inline-flex;
+.settingSwitchRow {
+  min-height: 38px;
+  display: flex;
   align-items: center;
-  gap: 8px;
-  cursor: pointer;
-  font-weight: 700;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  box-shadow: var(--inset-line);
 }
 
-.setupToggleRow input[type="checkbox"] {
+.settingSwitchRow > span {
+  min-width: 0;
+  color: var(--text-soft);
+  font-size: 13px;
+  font-weight: 760;
+  line-height: 1.35;
+}
+
+.switchControl {
+  position: relative;
+  flex: 0 0 auto;
+  width: 44px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-strong);
+  box-shadow: var(--inset-line);
+  cursor: pointer;
+  transition:
+    background-color 0.16s ease,
+    border-color 0.16s ease,
+    box-shadow 0.16s ease;
+}
+
+.switchControl > span {
+  position: absolute;
+  top: 3px;
+  left: 3px;
   width: 16px;
   height: 16px;
-  margin: 0;
-  cursor: pointer;
-  accent-color: var(--accent);
+  border-radius: 999px;
+  background: var(--muted);
+  box-shadow: 0 2px 5px rgba(20, 35, 31, 0.22);
+  transition:
+    transform 0.16s ease,
+    background-color 0.16s ease;
+}
+
+.switchControl[aria-checked="true"] {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+
+.switchControl[aria-checked="true"] > span {
+  transform: translateX(20px);
+  background: var(--accent);
+}
+
+.switchControl:hover:not(:disabled) {
+  border-color: var(--accent-border);
+}
+
+.switchControl:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .providerActions {
@@ -2928,6 +3243,26 @@ pre {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.capabilitySummary {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.capabilitySummary span,
+.capabilitySummary small {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.capabilitySummary strong {
+  color: var(--text);
+  font-size: 13px;
 }
 
 .setupTextEditor {
@@ -4137,4 +4472,280 @@ body.float-window-body {
 
 .floatApprovalActions > button {
   flex: 1;
+}
+
+/* ── Settings Tabs ── */
+
+.settingsTabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 4px;
+}
+
+.settingsTabs button {
+  flex: 1;
+  padding: 8px 10px;
+  border: none;
+  background: transparent;
+  color: var(--text-soft);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.settingsTabs button:hover {
+  color: var(--text);
+}
+
+.settingsTabs button.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+.settingsTabPanel {
+  display: grid;
+  gap: 12px;
+}
+
+.settingsEmptyHint {
+  color: var(--muted);
+  font-size: 13px;
+  text-align: center;
+  padding: 24px 0;
+  margin: 0;
+}
+
+/* ── Config List (MCP servers + Skills) ── */
+
+.configList {
+  display: grid;
+  gap: 6px;
+}
+
+.configListItem {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-soft);
+}
+
+.configListInfo {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+  flex: 1;
+}
+
+.configListInfo strong {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.configListInfo small {
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.configListBadge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  width: fit-content;
+}
+
+.configListBadge.on {
+  color: #1a7f37;
+  background: rgba(26, 127, 55, 0.12);
+}
+
+.configListBadge.off {
+  color: var(--muted);
+  background: var(--surface);
+}
+
+.configListActions {
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+/* ── MCP Form ── */
+
+.mcpForm {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.mcpForm label {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+  color: var(--text-soft);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.mcpFormActions {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding-top: 4px;
+}
+
+.mcpArgsEditor {
+  min-height: 60px;
+  max-height: 140px;
+  font-family:
+    "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  resize: vertical;
+}
+
+.mcpEnvList {
+  display: grid;
+  gap: 6px;
+}
+
+.mcpEnvRow {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.mcpEnvRow input {
+  flex: 1;
+  min-width: 0;
+}
+
+.mcpEnvRow input:first-child {
+  flex: 0.8;
+}
+
+/* ── MCP Toolbar & JSON Import ── */
+
+.mcpToolbar {
+  display: flex;
+  gap: 8px;
+}
+
+.mcpJsonImport {
+  display: grid;
+  gap: 8px;
+}
+
+.mcpJsonImport .settingsJsonEditor {
+  min-height: 160px;
+  max-height: 260px;
+}
+
+/* ── MCP Test Results ── */
+
+.mcpTestSuccess,
+.mcpTestError {
+  grid-column: 1 / -1;
+  padding: 10px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.mcpTestSuccess {
+  border: 1px solid rgba(26, 127, 55, 0.3);
+  background: rgba(26, 127, 55, 0.08);
+  color: #1a7f37;
+}
+
+.mcpTestError {
+  border: 1px solid rgba(189, 58, 45, 0.3);
+  background: var(--danger-soft);
+  color: var(--danger-text);
+}
+
+.mcpToolList {
+  margin: 8px 0 0;
+  padding: 0 0 0 16px;
+  list-style: none;
+  display: grid;
+  gap: 4px;
+}
+
+.mcpToolList li {
+  display: grid;
+  gap: 1px;
+}
+
+.mcpToolList li strong {
+  font-size: 12px;
+}
+
+.mcpToolList li small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/* ── Skill Items ── */
+
+.skillNameBtn {
+  all: unset;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skillNameBtn:hover {
+  color: var(--accent);
+}
+
+.skillPath {
+  font-family:
+    "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 11px !important;
+}
+
+.skillContentPreview {
+  max-height: 280px;
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-soft);
+  font-family:
+    "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+}
+
+.presetButton.small {
+  height: 26px;
+  padding: 0 8px;
+  font-size: 11px;
 }

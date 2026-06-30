@@ -134,6 +134,18 @@ where
                 return Err(error);
             }
         };
+        let (mcp_tools, capability_errors) = runtime_mcp_tools(app, &session.project_root).await;
+        for error in capability_errors {
+            let _ = storage::append_event(
+                conn,
+                &session.id,
+                "mcp.capability.error",
+                json!({
+                    "step": step_index,
+                    "error": error
+                }),
+            );
+        }
         let native_runtime = provider::supports_native_tools(&request_config);
         let provider_id_str = provider_id_from_record(&session.provider_id);
         let plan_path = if matches!(session.mode, AgentMode::Plan) {
@@ -181,6 +193,7 @@ where
                 step_index,
                 &session.provider_id,
                 &request_config,
+                &mcp_tools,
                 &stream_system_prompt,
                 &current_prompt,
                 &messages,

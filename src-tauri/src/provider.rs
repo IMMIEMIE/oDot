@@ -4,7 +4,8 @@ use crate::{
         OpenAiResponsesStreamParser,
     },
     types::{
-        ModelTurn, OpenAiApiMode, ProviderKind, ProviderRequestConfig, ToolCallRequest, ToolMode,
+        McpToolDefinition, ModelTurn, OpenAiApiMode, ProviderKind, ProviderRequestConfig,
+        ToolCallRequest, ToolMode,
     },
 };
 use futures_util::StreamExt;
@@ -82,6 +83,7 @@ pub fn supports_native_tools(provider: &ProviderRequestConfig) -> bool {
 pub async fn stream_openai_compatible<F>(
     provider: &ProviderRequestConfig,
     messages: &[Value],
+    mcp_tools: &[McpToolDefinition],
     mut on_event: F,
 ) -> Result<ModelTurn, String>
 where
@@ -94,12 +96,12 @@ where
     let (endpoint, body, mut parser) = match provider.openai_api_mode {
         OpenAiApiMode::ChatCompletions => (
             to_chat_completions_endpoint(base_url),
-            openai_stream_request_body(provider, messages),
+            openai_stream_request_body(provider, messages, mcp_tools),
             OpenAiStreamParser::Chat(OpenAiChatStreamParser::new()),
         ),
         OpenAiApiMode::Responses => (
             to_responses_endpoint(base_url),
-            openai_responses_stream_request_body(provider, messages),
+            openai_responses_stream_request_body(provider, messages, mcp_tools),
             OpenAiStreamParser::Responses(OpenAiResponsesStreamParser::new()),
         ),
     };
@@ -355,13 +357,14 @@ fn openai_responses_request_body(
 fn openai_stream_request_body(
     provider: &ProviderRequestConfig,
     messages: &[Value],
+    mcp_tools: &[McpToolDefinition],
 ) -> serde_json::Map<String, Value> {
     let mut body = openai_messages_body(provider, messages);
     body.insert("stream".to_string(), json!(true));
     body.entry("stream_options".to_string())
         .or_insert(json!({ "include_usage": true }));
     body.entry("tools".to_string())
-        .or_insert_with(native_tool_definitions);
+        .or_insert_with(|| native_tool_definitions_for(mcp_tools));
     body.entry("tool_choice".to_string())
         .or_insert(json!("auto"));
     body
@@ -370,6 +373,7 @@ fn openai_stream_request_body(
 fn openai_responses_stream_request_body(
     provider: &ProviderRequestConfig,
     messages: &[Value],
+    mcp_tools: &[McpToolDefinition],
 ) -> serde_json::Map<String, Value> {
     let mut body = openai_responses_base_body(provider);
     let (instructions, input) = responses_input_from_messages(messages);
@@ -379,7 +383,7 @@ fn openai_responses_stream_request_body(
     body.insert("input".to_string(), Value::Array(input));
     body.insert("stream".to_string(), json!(true));
     body.entry("tools".to_string())
-        .or_insert_with(native_responses_tool_definitions);
+        .or_insert_with(|| native_responses_tool_definitions_for(mcp_tools));
     body.entry("tool_choice".to_string())
         .or_insert(json!("auto"));
     body
@@ -968,6 +972,27 @@ fn native_tool_definitions() -> Value {
         {
             "type": "function",
             "function": {
+                "name": "skill_list",
+                "description": "List project skills from .odot/skills.",
+                "parameters": object_schema(json!({}), &[])
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "skill_read",
+                "description": "Read a project skill SKILL.md by name or relative path.",
+                "parameters": object_schema(
+                    json!({
+                        "name": { "type": "string", "description": "Skill name or .odot/skills/.../SKILL.md path." }
+                    }),
+                    &["name"]
+                )
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "plan_exit",
                 "description": "Use at the end of plan mode after the plan file is complete to request user approval to switch to execution.",
                 "parameters": object_schema(json!({}), &[])
@@ -976,8 +1001,27 @@ fn native_tool_definitions() -> Value {
     ])
 }
 
+fn native_tool_definitions_for(mcp_tools: &[McpToolDefinition]) -> Value {
+    let mut tools = native_tool_definitions().as_array().cloned().unwrap_or_default();
+    tools.extend(mcp_tools.iter().map(|tool| {
+        json!({
+            "type": "function",
+            "function": {
+                "name": tool.display_name,
+                "description": tool.description,
+                "parameters": tool.input_schema
+            }
+        })
+    }));
+    Value::Array(tools)
+}
+
 fn native_responses_tool_definitions() -> Value {
-    let tools = native_tool_definitions();
+    native_responses_tool_definitions_for(&[])
+}
+
+fn native_responses_tool_definitions_for(mcp_tools: &[McpToolDefinition]) -> Value {
+    let tools = native_tool_definitions_for(mcp_tools);
     let Some(items) = tools.as_array() else {
         return json!([]);
     };

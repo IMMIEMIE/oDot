@@ -154,11 +154,27 @@ export function FloatBall() {
   }, []);
 
   useEffect(() => {
-    recordFloatMouseEvent();
-    return () => {
+    function pauseFloatSleep() {
+      setIsSleeping(false);
       if (sleepTimer.current) {
         window.clearTimeout(sleepTimer.current);
+        sleepTimer.current = undefined;
       }
+    }
+
+    function syncFloatSleepWithVisibility() {
+      if (document.visibilityState === "visible") {
+        recordFloatMouseEvent();
+      } else {
+        pauseFloatSleep();
+      }
+    }
+
+    syncFloatSleepWithVisibility();
+    document.addEventListener("visibilitychange", syncFloatSleepWithVisibility);
+    return () => {
+      document.removeEventListener("visibilitychange", syncFloatSleepWithVisibility);
+      pauseFloatSleep();
     };
   }, []);
 
@@ -166,7 +182,7 @@ export function FloatBall() {
     const previous = previousStatusKind.current;
     previousStatusKind.current = agentStatus.kind;
     const transitionedToComplete =
-      (previous === "working" || previous === "thinking") && agentStatus.kind === "complete";
+      previous !== "complete" && agentStatus.kind === "complete";
     if (transitionedToComplete) {
       recordFloatMouseEvent();
       setShowCompleteCheck(true);

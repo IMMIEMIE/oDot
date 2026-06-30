@@ -2,6 +2,7 @@ use crate::{
     event_bus, provider,
     types::{
         AgentMode, BackgroundJobRecord, ContextSummaryRecord, CreateSessionInput, EventRecord,
+        LoadedSkill,
         PermissionReply, PermissionRequestRecord, PromptAttachment, ProviderInput, ProviderKind,
         ProviderRecord, SessionCheckpointRecord, SessionEventsResponse, SessionInputDelivery,
         SessionInputRecord, SessionRecord, SessionRunRecord, ShellMode, ShellPolicy,
@@ -110,6 +111,7 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
           session_id TEXT NOT NULL,
           prompt TEXT NOT NULL,
           attachments_json TEXT NOT NULL DEFAULT '[]',
+          loaded_skills_json TEXT NOT NULL DEFAULT '[]',
           delivery TEXT NOT NULL,
           resume INTEGER NOT NULL,
           status TEXT NOT NULL,
@@ -194,6 +196,12 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
         "session_input",
         "attachments_json",
         "ALTER TABLE session_input ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column(
+        conn,
+        "session_input",
+        "loaded_skills_json",
+        "ALTER TABLE session_input ADD COLUMN loaded_skills_json TEXT NOT NULL DEFAULT '[]'",
     )?;
     ensure_column(
         conn,
@@ -818,6 +826,7 @@ pub fn admit_session_input(
     session_id: &str,
     prompt: &str,
     attachments: &[PromptAttachment],
+    loaded_skills: &[LoadedSkill],
     delivery: SessionInputDelivery,
     resume: bool,
 ) -> Result<SessionInputRecord, String> {
@@ -826,6 +835,7 @@ pub fn admit_session_input(
         if existing.session_id == session_id
             && existing.prompt == prompt
             && existing.attachments == attachments
+            && existing.loaded_skills == loaded_skills
             && existing.delivery.as_str() == delivery.as_str()
             && existing.resume == resume
         {
@@ -837,18 +847,21 @@ pub fn admit_session_input(
     get_session(conn, session_id)?;
     let now = util::now_string();
     let attachments_json = serde_json::to_string(attachments).map_err(|error| error.to_string())?;
+    let loaded_skills_json =
+        serde_json::to_string(loaded_skills).map_err(|error| error.to_string())?;
     conn.execute(
         r#"
         INSERT INTO session_input
-          (id, session_id, prompt, attachments_json, delivery, resume, status, promoted_event_id, created_at, updated_at)
+          (id, session_id, prompt, attachments_json, loaded_skills_json, delivery, resume, status, promoted_event_id, created_at, updated_at)
         VALUES
-          (?1, ?2, ?3, ?4, ?5, ?6, 'pending', NULL, ?7, ?8)
+          (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', NULL, ?8, ?9)
         "#,
         params![
             &id,
             session_id,
             prompt,
             attachments_json,
+            loaded_skills_json,
             delivery.as_str(),
             resume as i64,
             &now,
@@ -861,7 +874,7 @@ pub fn admit_session_input(
 
 pub fn get_session_input(conn: &Connection, id: &str) -> Result<SessionInputRecord, String> {
     conn.query_row(
-        "SELECT id, session_id, prompt, attachments_json, delivery, resume, status, promoted_event_id, created_at, updated_at
+        "SELECT id, session_id, prompt, attachments_json, loaded_skills_json, delivery, resume, status, promoted_event_id, created_at, updated_at
          FROM session_input WHERE id = ?1",
         params![id],
         session_input_from_row,
@@ -875,7 +888,7 @@ pub fn next_pending_session_input(
 ) -> Result<Option<SessionInputRecord>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, session_id, prompt, attachments_json, delivery, resume, status, promoted_event_id, created_at, updated_at
+            "SELECT id, session_id, prompt, attachments_json, loaded_skills_json, delivery, resume, status, promoted_event_id, created_at, updated_at
              FROM session_input WHERE session_id = ?1 AND status = 'pending'
              ORDER BY CASE delivery WHEN 'steer' THEN 0 ELSE 1 END, created_at ASC LIMIT 1",
         )
@@ -933,7 +946,7 @@ pub fn list_session_inputs(
 ) -> Result<Vec<SessionInputRecord>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, session_id, prompt, attachments_json, delivery, resume, status, promoted_event_id, created_at, updated_at
+            "SELECT id, session_id, prompt, attachments_json, loaded_skills_json, delivery, resume, status, promoted_event_id, created_at, updated_at
              FROM session_input WHERE session_id = ?1 ORDER BY created_at ASC",
         )
         .map_err(|error| error.to_string())?;
@@ -1540,19 +1553,21 @@ fn context_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Context
 
 fn session_input_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionInputRecord> {
     let attachments_json: String = row.get(3)?;
-    let delivery: String = row.get(4)?;
-    let resume: i64 = row.get(5)?;
+    let loaded_skills_json: String = row.get(4)?;
+    let delivery: String = row.get(5)?;
+    let resume: i64 = row.get(6)?;
     Ok(SessionInputRecord {
         id: row.get(0)?,
         session_id: row.get(1)?,
         prompt: row.get(2)?,
         attachments: serde_json::from_str(&attachments_json).unwrap_or_default(),
+        loaded_skills: serde_json::from_str(&loaded_skills_json).unwrap_or_default(),
         delivery: SessionInputDelivery::from_str(&delivery).unwrap_or(SessionInputDelivery::Queue),
         resume: resume != 0,
-        status: row.get(6)?,
-        promoted_event_id: row.get(7)?,
-        created_at: row.get(8)?,
-        updated_at: row.get(9)?,
+        status: row.get(7)?,
+        promoted_event_id: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
     })
 }
 
@@ -1810,6 +1825,7 @@ mod tests {
             "s1",
             "hi",
             &[],
+            &[],
             SessionInputDelivery::Queue,
             true,
         )
@@ -1819,6 +1835,7 @@ mod tests {
             Some("input-1".to_string()),
             "s1",
             "hi",
+            &[],
             &[],
             SessionInputDelivery::Queue,
             true,
@@ -1844,6 +1861,7 @@ mod tests {
             Some("input-1".to_string()),
             "s1",
             "hi",
+            &[],
             &[],
             SessionInputDelivery::Queue,
             true,
@@ -1914,6 +1932,7 @@ mod tests {
                 kind: crate::types::PromptAttachmentKind::Image,
                 content: "data:image/png;base64,abc".to_string(),
             }],
+            &[],
             SessionInputDelivery::Queue,
             true,
         )
@@ -2040,6 +2059,7 @@ mod tests {
             Some("input-1".to_string()),
             "s1",
             "resume me",
+            &[],
             &[],
             SessionInputDelivery::Queue,
             true,

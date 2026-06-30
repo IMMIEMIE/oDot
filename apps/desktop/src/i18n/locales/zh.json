@@ -137,7 +137,51 @@
     "cannotDeleteLastProvider": "至少需保留一个服务，无法删除",
     "configFile": "配置文件",
     "switchConfigFile": "切换 JSON",
-    "discardConfigDraft": "放弃当前未保存的设置修改，并切换到另一个 JSON 文件？"
+    "discardConfigDraft": "放弃当前未保存的设置修改，并切换到另一个 JSON 文件？",
+    "capabilities": "项目能力",
+    "capabilityCounts": "{{skills}} 个 Skill / {{servers}} 个 MCP 服务 / {{tools}} 个 MCP 工具",
+    "tabAi": "AI 服务",
+    "tabMcp": "MCP 服务器",
+    "tabSkills": "Skill",
+    "mcpAdd": "添加 MCP 服务器",
+    "mcpImportJson": "从 JSON 导入",
+    "mcpImportJsonPlaceholder": "粘贴 MCP 服务器 JSON 配置…\n支持格式：\n• { \"mcp\": { \"servers\": { ... } } }\n• { \"servers\": { ... } }\n• { \"server-id\": { \"command\": \"...\" } }\n• 单个服务器 { \"command\": \"...\", \"args\": [...] }",
+    "mcpImportJsonSubmit": "导入",
+    "mcpEdit": "编辑",
+    "mcpDelete": "删除",
+    "mcpServerId": "Server ID",
+    "mcpCommand": "Command",
+    "mcpArgs": "参数（每行一个）",
+    "mcpEnv": "环境变量",
+    "mcpEnvKey": "变量名",
+    "mcpEnvValue": "变量值",
+    "mcpCwd": "工作目录",
+    "mcpTimeout": "超时（秒）",
+    "mcpRequireApproval": "需要审批",
+    "mcpReadOnly": "只读",
+    "mcpEnabled": "启用",
+    "mcpTest": "测试连接",
+    "mcpTesting": "连接中…",
+    "mcpTestSuccess": "连接成功，发现 {{count}} 个工具",
+    "mcpTestFail": "连接失败",
+    "mcpNoServers": "暂无 MCP 服务器，点击下方按钮添加。",
+    "mcpConfirmDelete": "确定删除 MCP 服务器「{{id}}」？",
+    "mcpDuplicateId": "Server ID「{{id}}」已存在",
+    "mcpSave": "保存",
+    "mcpCancel": "取消",
+    "mcpToolsLabel": "可用工具",
+    "skillImport": "导入 Skill",
+    "skillDelete": "删除",
+    "skillNoSkills": "暂无 Skill，点击下方按钮导入 .md 文件。",
+    "skillConfirmDelete": "确定删除 Skill「{{name}}」？",
+    "skillViewContent": "查看内容",
+    "skillHideContent": "收起内容"
+  },
+  "skills": {
+    "menuLabel": "项目 Skill",
+    "empty": "没有匹配的 Skill",
+    "loaded": "已加载 Skill",
+    "removeLoaded": "移除已加载 Skill {{name}}"
   },
   "setup": {
     "title": "初始化 API 配置",
@@ -273,6 +317,14 @@
     "detail": "{{events}} 条事件 · {{changes}} 个文件变更",
     "execFailed": "执行失败"
   },
+  "mcp": {
+    "toolCall": "MCP 工具调用",
+    "input": "输入",
+    "output": "输出",
+    "error": "错误",
+    "unknownServer": "未知服务",
+    "unknownTool": "未知工具"
+  },
   "todo": {
     "progress": "步骤 {{completed}} / {{total}}",
     "waiting": "等待 TodoWrite",
@@ -400,6 +452,7 @@
   "api": {
     "pickProjectTitle": "选择 oDot 项目目录",
     "pickConfigTitle": "选择 Provider JSON 配置文件",
+    "pickSkillTitle": "选择 Skill 文件（SKILL.md）",
     "tauriOnly": "oDot 桌面 API 只能在 Tauri 应用内使用。"
   },
   "recoverAction": {

@@ -16,6 +16,7 @@ import {
   KeyRound,
   Loader2,
   MessageSquare,
+  Network,
   Pencil,
   Plus,
   Play,
@@ -26,6 +27,7 @@ import {
   Settings,
   Terminal,
   Trash2,
+  Upload,
   Wrench,
   X
 } from "lucide-react";
@@ -50,18 +52,23 @@ import {
   compactSession,
   continueSession,
   createSession,
+  deleteMcpServer,
   deleteQueuedInput,
   deleteSession,
+  deleteSkill,
   fetchProjectFiles,
   findOpencodeConfig,
   getSessionEvents,
+  importSkill,
   tailSessionEvents,
+  listProjectCapabilities,
   listSessions,
   loadShellPolicy,
   loadProviderConfig,
   persistPlanFile,
   pickProviderConfigFile,
   pickProjectDirectory,
+  pickSkillFile,
   promoteTask,
   revealProjectPath,
   rejectToolCall,
@@ -69,23 +76,30 @@ import {
   recoverBackgroundTask,
   recoverSessionFromCheckpoint,
   rollbackSnapshot,
+  saveMcpServer,
   saveProviderConfig,
   saveShellPolicy,
   promptSession,
+  testMcpConnection,
   updateSessionMode,
   updateSessionTitle,
   type AgentMode,
   type BackgroundJobRecord,
   type EventRecord,
+  type LoadedSkill,
+  type McpServerConfig,
+  type McpToolDefinition,
   type PermissionRequestRecord,
   type PermissionReply,
   type ProjectFile,
+  type ProjectCapabilities,
   type ProviderConfigFileResponse,
   type ProviderRecord,
   type SessionEventsResponse,
   type SessionInputRecord,
   type SessionRecord,
   type ShellPolicy,
+  type SkillRecord,
   type ShellMode,
   type SnapshotRecord,
   type TodoRecord
@@ -130,6 +144,8 @@ type ResolvedTheme = "light" | "dark";
 
 type PromptAttachmentSummary = Omit<PromptAttachment, "id" | "content">;
 
+const PROJECT_ROOT_STORAGE_KEY = "odot.projectRoot";
+
 type TreeNode = {
   type: "dir" | "file";
   name: string;
@@ -144,7 +160,9 @@ export function App() {
   const [configPath, setConfigPath] = useState("");
   const [configContent, setConfigContent] = useState("");
   const [selectedProviderId, setSelectedProviderId] = useState("");
-  const [projectRoot, setProjectRoot] = useState("");
+  const [projectRoot, setProjectRoot] = useState(
+    () => localStorage.getItem(PROJECT_ROOT_STORAGE_KEY) ?? ""
+  );
   const [files, setFiles] = useState<ProjectFile[]>([]);
   const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
   const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set());
@@ -204,6 +222,16 @@ export function App() {
   const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
   const [isShellModeMenuOpen, setIsShellModeMenuOpen] = useState(false);
   const [promptAttachments, setPromptAttachments] = useState<PromptAttachment[]>([]);
+  const [projectCapabilities, setProjectCapabilities] =
+    useState<ProjectCapabilities | null>(null);
+  const [loadedSkills, setLoadedSkills] = useState<LoadedSkill[]>([]);
+  const [skillMenu, setSkillMenu] = useState<{
+    open: boolean;
+    query: string;
+    start: number;
+    end: number;
+    activeIndex: number;
+  }>({ open: false, query: "", start: 0, end: 0, activeIndex: 0 });
   const [leftWidth, setLeftWidth] = useState(() => {
     const stored = Number(localStorage.getItem("odot.leftWidth"));
     return Number.isFinite(stored) && stored >= 300 ? stored : 420;
@@ -227,6 +255,14 @@ export function App() {
   useEffect(() => {
     localStorage.setItem("odot.themeMode", themeMode);
   }, [themeMode]);
+
+  useEffect(() => {
+    if (projectRoot.trim()) {
+      localStorage.setItem(PROJECT_ROOT_STORAGE_KEY, projectRoot);
+    } else {
+      localStorage.removeItem(PROJECT_ROOT_STORAGE_KEY);
+    }
+  }, [projectRoot]);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -340,6 +376,24 @@ export function App() {
     [allowedAttachmentKinds]
   );
   const canUploadAttachments = allowedAttachmentKinds.length > 0;
+  const skillOptions = useMemo(() => {
+    const query = skillMenu.query.trim().toLowerCase();
+    const skills = projectCapabilities?.skills ?? [];
+    const selected = new Set(loadedSkills.map((skill) => skill.path));
+    return skills
+      .filter((skill) => !selected.has(skill.path))
+      .filter((skill) => {
+        if (!query) {
+          return true;
+        }
+        return (
+          skill.name.toLowerCase().includes(query) ||
+          skill.description.toLowerCase().includes(query) ||
+          skill.path.toLowerCase().includes(query)
+        );
+      })
+      .slice(0, 8);
+  }, [loadedSkills, projectCapabilities?.skills, skillMenu.query]);
 
   const selectedSession = useMemo(
     () => sessions.find((session) => session.id === selectedSessionId),
@@ -417,6 +471,28 @@ export function App() {
       current.filter((attachment) => allowedAttachmentKinds.includes(attachment.kind))
     );
   }, [allowedAttachmentKinds]);
+
+  useEffect(() => {
+    let disposed = false;
+    if (!projectRoot) {
+      setProjectCapabilities(null);
+      return;
+    }
+    void listProjectCapabilities(projectRoot, configPath || selectedConfigPathForProject(projectRoot))
+      .then((capabilities) => {
+        if (!disposed) {
+          setProjectCapabilities(capabilities);
+        }
+      })
+      .catch(() => {
+        if (!disposed) {
+          setProjectCapabilities(null);
+        }
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [configPath, projectRoot]);
 
   const filteredFiles = useMemo(() => {
     const query = fileFilter.trim().toLowerCase();
@@ -1007,8 +1083,51 @@ export function App() {
     );
   }
 
+  function handlePromptChange(event: ChangeEvent<HTMLTextAreaElement>) {
+    const value = event.target.value;
+    setPrompt(value);
+    syncSkillMenu(value, event.target.selectionStart ?? value.length);
+  }
+
+  function syncSkillMenu(value: string, cursor: number) {
+    const token = slashTokenAtCursor(value, cursor);
+    if (!token) {
+      setSkillMenu((current) => ({ ...current, open: false }));
+      return;
+    }
+    setSkillMenu({
+      open: true,
+      query: token.query,
+      start: token.start,
+      end: token.end,
+      activeIndex: 0
+    });
+  }
+
+  function selectSkill(skill: SkillRecord) {
+    setLoadedSkills((current) =>
+      current.some((item) => item.path === skill.path)
+        ? current
+        : [...current, { name: skill.name, path: skill.path }]
+    );
+    const before = prompt.slice(0, skillMenu.start);
+    const after = prompt.slice(skillMenu.end);
+    const next = `${before}${after}`.replace(/[ \t]{2,}/g, " ");
+    const nextCursor = before.length;
+    setPrompt(next);
+    setSkillMenu((current) => ({ ...current, open: false }));
+    window.setTimeout(() => {
+      promptInputRef.current?.focus();
+      promptInputRef.current?.setSelectionRange(nextCursor, nextCursor);
+    }, 0);
+  }
+
+  function removeLoadedSkill(path: string) {
+    setLoadedSkills((current) => current.filter((skill) => skill.path !== path));
+  }
+
   async function handleSubmitPrompt() {
-    if ((!prompt.trim() && !promptAttachments.length) || isPromptLocked) {
+    if ((!prompt.trim() && !promptAttachments.length && !loadedSkills.length) || isPromptLocked) {
       return;
     }
     shouldStickToTimelineBottomRef.current = true;
@@ -1027,6 +1146,7 @@ export function App() {
         sessionId: session.id,
         prompt: finalPrompt,
         attachments: promptAttachments.map(toPromptAttachmentInput),
+        loadedSkills,
         delivery: "queue",
         resume: true
       });
@@ -1044,6 +1164,8 @@ export function App() {
       await refreshSessions();
       setPrompt("");
       setPromptAttachments([]);
+      setLoadedSkills([]);
+      setSkillMenu((current) => ({ ...current, open: false }));
       setNotice({
         tone: "success",
         text: hasUnresolvedPendingTools(response.events)
@@ -1878,34 +2000,111 @@ export function App() {
                 accept={attachmentAccept}
                 onChange={(event) => void handleAttachmentInputChange(event)}
               />
-              <textarea
-                ref={promptInputRef}
-                className="promptInput"
-                rows={1}
-                value={prompt}
-                disabled={isPromptLocked}
-                onChange={(event) => setPrompt(event.target.value)}
-                onPaste={handlePromptPaste}
-                placeholder={
-                  isAgentWorking
-                    ? t("prompt.agentWorking")
-                    : isStopping
-                      ? t("prompt.agentStopping")
-                      : pendingToolEvents.length
-                        ? t("prompt.pendingCommands")
-                        : t("prompt.followUp")
-                }
-                onKeyDown={(event) => {
-                  if (
-                    event.key === "Enter" &&
-                    !event.shiftKey &&
-                    (!event.nativeEvent.isComposing || event.ctrlKey || event.metaKey)
-                  ) {
-                    event.preventDefault();
-                    void handleSubmitPrompt();
+              <div className="promptInputRow">
+                {loadedSkills.length > 0 && (
+                  <div className="promptSkillTags">
+                    {loadedSkills.map((skill) => (
+                      <span className="promptSkillTag" key={skill.path}>
+                        <BrainCircuit size={12} />
+                        <span>{skill.name}</span>
+                        <button
+                          type="button"
+                          aria-label={t("skills.removeLoaded", { name: skill.name })}
+                          disabled={isPromptLocked}
+                          onClick={() => removeLoadedSkill(skill.path)}
+                        >
+                          <X size={11} />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+                <textarea
+                  ref={promptInputRef}
+                  className="promptInput"
+                  rows={1}
+                  value={prompt}
+                  disabled={isPromptLocked}
+                  onChange={handlePromptChange}
+                  onPaste={handlePromptPaste}
+                  placeholder={
+                    isAgentWorking
+                      ? t("prompt.agentWorking")
+                      : isStopping
+                        ? t("prompt.agentStopping")
+                        : pendingToolEvents.length
+                          ? t("prompt.pendingCommands")
+                          : t("prompt.followUp")
                   }
-                }}
-              />
+                  onKeyDown={(event) => {
+                    if (skillMenu.open) {
+                      if (event.key === "ArrowDown") {
+                        event.preventDefault();
+                        setSkillMenu((current) => ({
+                          ...current,
+                          activeIndex: skillOptions.length
+                            ? (current.activeIndex + 1) % skillOptions.length
+                            : 0
+                        }));
+                        return;
+                      }
+                      if (event.key === "ArrowUp") {
+                        event.preventDefault();
+                        setSkillMenu((current) => ({
+                          ...current,
+                          activeIndex: skillOptions.length
+                            ? (current.activeIndex - 1 + skillOptions.length) % skillOptions.length
+                            : 0
+                        }));
+                        return;
+                      }
+                      if (event.key === "Escape") {
+                        event.preventDefault();
+                        setSkillMenu((current) => ({ ...current, open: false }));
+                        return;
+                      }
+                      if (event.key === "Enter" && skillOptions[skillMenu.activeIndex]) {
+                        event.preventDefault();
+                        selectSkill(skillOptions[skillMenu.activeIndex]);
+                        return;
+                      }
+                    }
+                    if (
+                      event.key === "Enter" &&
+                      !event.shiftKey &&
+                      (!event.nativeEvent.isComposing || event.ctrlKey || event.metaKey)
+                    ) {
+                      event.preventDefault();
+                      void handleSubmitPrompt();
+                    }
+                  }}
+                />
+              </div>
+              {skillMenu.open && !isPromptLocked && (
+                <div className="skillSlashOverlay">
+                  <div className="skillSlashMenu" role="listbox" aria-label={t("skills.menuLabel")}>
+                    {skillOptions.length ? (
+                      skillOptions.map((skill, index) => (
+                        <button
+                          type="button"
+                          key={skill.path}
+                          className={`skillSlashOption ${index === skillMenu.activeIndex ? "active" : ""}`}
+                          role="option"
+                          aria-selected={index === skillMenu.activeIndex}
+                          onMouseDown={(event) => event.preventDefault()}
+                          onClick={() => selectSkill(skill)}
+                        >
+                          <BrainCircuit size={14} />
+                          <span>{skill.name}</span>
+                          <small>{skill.description || skill.path}</small>
+                        </button>
+                      ))
+                    ) : (
+                      <div className="skillSlashEmpty">{t("skills.empty")}</div>
+                    )}
+                  </div>
+                </div>
+              )}
               {promptAttachments.length > 0 && (
                 <div className="promptAttachmentList" aria-label={t("nav.uploadedAttachments")}>
                   {promptAttachments.map((attachment) => (
@@ -2080,7 +2279,7 @@ export function App() {
                     disabled={
                       isAgentWorking
                         ? false
-                        : (!prompt.trim() && !promptAttachments.length) ||
+                        : (!prompt.trim() && !promptAttachments.length && !loadedSkills.length) ||
                           isPromptLocked ||
                           !selectedProviderId
                     }
@@ -2369,6 +2568,7 @@ export function App() {
           configPath={configPath}
           configContent={configContent}
           projectRoot={projectRoot}
+          projectCapabilities={projectCapabilities}
           providers={providers}
           selectedProviderId={selectedProviderId}
           shellPolicy={shellPolicy}
@@ -2380,6 +2580,13 @@ export function App() {
           onClose={() => setIsSettingsOpen(false)}
           onSave={saveSettings}
           onLoadConfigFile={loadSettingsConfigFile}
+          onRefreshCapabilities={async () => {
+            if (!projectRoot) return;
+            try {
+              const caps = await listProjectCapabilities(projectRoot, configPath || null);
+              setProjectCapabilities(caps);
+            } catch { /* ignore */ }
+          }}
         />
       )}
       {isSessionsOpen && (
@@ -2433,6 +2640,7 @@ function SettingsModal({
   configPath,
   configContent,
   projectRoot,
+  projectCapabilities,
   providers,
   selectedProviderId,
   shellPolicy,
@@ -2443,11 +2651,13 @@ function SettingsModal({
   onLocaleChange,
   onClose,
   onSave,
-  onLoadConfigFile
+  onLoadConfigFile,
+  onRefreshCapabilities
 }: {
   configPath: string;
   configContent: string;
   projectRoot: string;
+  projectCapabilities: ProjectCapabilities | null;
   providers: ProviderRecord[];
   selectedProviderId: string;
   shellPolicy: ShellPolicy;
@@ -2459,6 +2669,7 @@ function SettingsModal({
   onClose: () => void;
   onSave: (content: string, policy: ShellPolicy, configPath?: string | null) => Promise<void>;
   onLoadConfigFile: (configPath: string) => Promise<ProviderConfigFileResponse>;
+  onRefreshCapabilities: () => Promise<void>;
 }) {
   const { t } = useTranslation();
   const initial = parseProviderSettings(configContent, selectedProviderId);
@@ -2476,6 +2687,42 @@ function SettingsModal({
   );
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [error, setError] = useState("");
+  const [activeTab, setActiveTab] = useState<"ai" | "mcp" | "skills">("ai");
+
+  // MCP tab state
+  const [mcpServers, setMcpServers] = useState<McpServerConfig[]>(
+    projectCapabilities?.mcpServers ?? []
+  );
+  const [mcpEditing, setMcpEditing] = useState<McpServerConfig | null>(null);
+  const [mcpIsNew, setMcpIsNew] = useState(false);
+  const [mcpFormId, setMcpFormId] = useState("");
+  const [mcpFormCommand, setMcpFormCommand] = useState("");
+  const [mcpFormArgs, setMcpFormArgs] = useState("");
+  const [mcpFormEnvPairs, setMcpFormEnvPairs] = useState<{ key: string; value: string }[]>([{ key: "", value: "" }]);
+  const [mcpFormCwd, setMcpFormCwd] = useState("");
+  const [mcpFormTimeout, setMcpFormTimeout] = useState(60);
+  const [mcpFormRequireApproval, setMcpFormRequireApproval] = useState(true);
+  const [mcpFormReadOnly, setMcpFormReadOnly] = useState(false);
+  const [mcpFormEnabled, setMcpFormEnabled] = useState(true);
+  const [mcpShowJsonImport, setMcpShowJsonImport] = useState(false);
+  const [mcpJsonText, setMcpJsonText] = useState("");
+  const [mcpTestResult, setMcpTestResult] = useState<{ ok: boolean; tools: McpToolDefinition[]; error?: string } | null>(null);
+  const [mcpTesting, setMcpTesting] = useState(false);
+
+  // Skill tab state
+  const [skills, setSkills] = useState<SkillRecord[]>(projectCapabilities?.skills ?? []);
+  const [skillExpanded, setSkillExpanded] = useState<string | null>(null);
+  const [skillContents, setSkillContents] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    setMcpServers(projectCapabilities?.mcpServers ?? []);
+    setSkills(projectCapabilities?.skills ?? []);
+    setSkillExpanded((current) =>
+      current && projectCapabilities?.skills.some((skill) => skill.path === current)
+        ? current
+        : null
+    );
+  }, [projectCapabilities]);
 
   const providerOptions = useMemo(
     () => providerChoices(jsonText, providers, providerId),
@@ -2633,6 +2880,186 @@ function SettingsModal({
     }
   }
 
+  function openMcpNewForm() {
+    setMcpEditing({
+      id: "", enabled: true, command: "", args: [], env: {},
+      cwd: null, timeoutSeconds: 60, requireApproval: true, readOnly: false
+    });
+    setMcpIsNew(true);
+    setMcpFormId("");
+    setMcpFormCommand("");
+    setMcpFormArgs("");
+    setMcpFormEnvPairs([{ key: "", value: "" }]);
+    setMcpFormCwd("");
+    setMcpFormTimeout(60);
+    setMcpFormRequireApproval(true);
+    setMcpFormReadOnly(false);
+    setMcpFormEnabled(true);
+    setMcpTestResult(null);
+  }
+
+  function openMcpEditForm(server: McpServerConfig) {
+    setMcpEditing(server);
+    setMcpIsNew(false);
+    setMcpFormId(server.id);
+    setMcpFormCommand(server.command);
+    setMcpFormArgs(server.args.join("\n"));
+    const pairs = Object.entries(server.env).map(([key, value]) => ({ key, value }));
+    setMcpFormEnvPairs(pairs.length > 0 ? pairs : [{ key: "", value: "" }]);
+    setMcpFormCwd(server.cwd ?? "");
+    setMcpFormTimeout(server.timeoutSeconds);
+    setMcpFormRequireApproval(server.requireApproval);
+    setMcpFormReadOnly(server.readOnly);
+    setMcpFormEnabled(server.enabled);
+    setMcpTestResult(null);
+  }
+
+  function mcpFormToServer(): McpServerConfig {
+    const env: Record<string, string> = {};
+    for (const pair of mcpFormEnvPairs) {
+      if (pair.key.trim()) env[pair.key.trim()] = pair.value;
+    }
+    return {
+      id: mcpFormId.trim(),
+      enabled: mcpFormEnabled,
+      command: mcpFormCommand.trim(),
+      args: mcpFormArgs.split("\n").map((a) => a.trim()).filter(Boolean),
+      env,
+      cwd: mcpFormCwd.trim() || null,
+      timeoutSeconds: mcpFormTimeout || 60,
+      requireApproval: mcpFormRequireApproval,
+      readOnly: mcpFormReadOnly
+    };
+  }
+
+  async function handleMcpSave() {
+    setError("");
+    const server = mcpFormToServer();
+    if (!server.id) { setError("Server ID 不能为空"); return; }
+    if (!server.command) { setError("Command 不能为空"); return; }
+    if (mcpIsNew && mcpServers.some((s) => s.id === server.id)) {
+      setError(t("settings.mcpDuplicateId", { id: server.id })); return;
+    }
+    try {
+      const updated = await saveMcpServer(projectRoot, server, selectedConfigPath || null);
+      setMcpServers(updated);
+      setMcpEditing(null);
+      setMcpShowJsonImport(false);
+      await onRefreshCapabilities();
+    } catch (e) { setError(errorMessage(e)); }
+  }
+
+  async function handleMcpDelete(id: string) {
+    setError("");
+    if (!window.confirm(t("settings.mcpConfirmDelete", { id }))) return;
+    try {
+      const updated = await deleteMcpServer(projectRoot, id, selectedConfigPath || null);
+      setMcpServers(updated);
+      if (mcpEditing?.id === id) setMcpEditing(null);
+      await onRefreshCapabilities();
+    } catch (e) { setError(errorMessage(e)); }
+  }
+
+  async function handleMcpTest() {
+    setError("");
+    const server = mcpFormToServer();
+    if (!server.command) { setError("Command 不能为空"); return; }
+    setMcpTesting(true);
+    setMcpTestResult(null);
+    try {
+      const tools = await testMcpConnection(projectRoot, server);
+      setMcpTestResult({ ok: true, tools });
+    } catch (e) {
+      setMcpTestResult({ ok: false, tools: [], error: errorMessage(e) });
+    } finally { setMcpTesting(false); }
+  }
+
+  async function handleMcpJsonImport() {
+    setError("");
+    const text = mcpJsonText.trim();
+    if (!text) return;
+    try {
+      const parsed = JSON.parse(text) as Record<string, unknown>;
+      let serversMap: Record<string, Record<string, unknown>> = {};
+      if (parsed.mcp && typeof parsed.mcp === "object") {
+        const mcpObj = parsed.mcp as Record<string, unknown>;
+        if (mcpObj.servers && typeof mcpObj.servers === "object") {
+          serversMap = mcpObj.servers as Record<string, Record<string, unknown>>;
+        }
+      } else if (parsed.servers && typeof parsed.servers === "object") {
+        serversMap = parsed.servers as Record<string, Record<string, unknown>>;
+      } else if (parsed.command && typeof parsed.command === "string") {
+        const id = (parsed.id as string) || "imported-server";
+        serversMap = { [id]: parsed };
+      } else {
+        serversMap = parsed as Record<string, Record<string, unknown>>;
+      }
+      const entries = Object.entries(serversMap);
+      if (entries.length === 0) { setError("未找到有效的 MCP 服务器配置"); return; }
+      let updated = mcpServers;
+      for (const [id, config] of entries) {
+        const server: McpServerConfig = {
+          id,
+          enabled: (config.enabled as boolean) ?? true,
+          command: (config.command as string) || "",
+          args: (config.args as string[]) || [],
+          env: (config.env as Record<string, string>) || {},
+          cwd: (config.cwd as string) || null,
+          timeoutSeconds: (config.timeoutSeconds as number) || 60,
+          requireApproval: (config.requireApproval as boolean) ?? true,
+          readOnly: (config.readOnly as boolean) ?? false
+        };
+        if (!server.command) continue;
+        updated = await saveMcpServer(projectRoot, server, selectedConfigPath || null);
+      }
+      setMcpServers(updated);
+      setMcpJsonText("");
+      setMcpShowJsonImport(false);
+      await onRefreshCapabilities();
+    } catch (e) { setError(errorMessage(e)); }
+  }
+
+  async function handleSkillImport() {
+    setError("");
+    try {
+      const filePath = await pickSkillFile();
+      if (!filePath) return;
+      const record = await importSkill(projectRoot, filePath);
+      setSkills((prev) => {
+        const filtered = prev.filter((s) => s.path !== record.path);
+        return [...filtered, record];
+      });
+      await onRefreshCapabilities();
+    } catch (e) { setError(errorMessage(e)); }
+  }
+
+  async function handleSkillDelete(skill: SkillRecord) {
+    setError("");
+    if (!window.confirm(t("settings.skillConfirmDelete", { name: skill.name }))) return;
+    try {
+      await deleteSkill(projectRoot, skill.path);
+      setSkills((prev) => prev.filter((s) => s.path !== skill.path));
+      if (skillExpanded === skill.path) setSkillExpanded(null);
+      await onRefreshCapabilities();
+    } catch (e) { setError(errorMessage(e)); }
+  }
+
+  async function handleSkillToggleContent(skill: SkillRecord) {
+    if (skillExpanded === skill.path) { setSkillExpanded(null); return; }
+    setSkillExpanded(skill.path);
+    if (!skillContents[skill.path]) {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        const result = await invoke<{ name: string; description: string; path: string; content: string }>(
+          "read_skill_content", { projectRoot, nameOrPath: skill.name }
+        );
+        setSkillContents((prev) => ({ ...prev, [skill.path]: result.content }));
+      } catch {
+        setSkillContents((prev) => ({ ...prev, [skill.path]: "(无法加载内容)" }));
+      }
+    }
+  }
+
   return (
     <div className="modalBackdrop" role="presentation">
       <section className="settingsModal" role="dialog" aria-modal="true">
@@ -2661,6 +3088,39 @@ function SettingsModal({
             </button>
           </div>
 
+          {projectCapabilities && (
+            <div className="capabilitySummary">
+              <span>{t("settings.capabilities")}</span>
+              <strong>
+                {t("settings.capabilityCounts", {
+                  skills: projectCapabilities.skills.length,
+                  servers: projectCapabilities.mcpServers.filter((server) => server.enabled).length,
+                  tools: projectCapabilities.mcpTools.length
+                })}
+              </strong>
+              {projectCapabilities.errors.length > 0 && (
+                <small>
+                  {projectCapabilities.errors
+                    .map((item) => `${item.source}: ${item.message}`)
+                    .join(" · ")}
+                </small>
+              )}
+            </div>
+          )}
+
+          <div className="settingsTabs">
+            <button type="button" className={activeTab === "ai" ? "active" : ""} onClick={() => setActiveTab("ai")}>
+              {t("settings.tabAi")}
+            </button>
+            <button type="button" className={activeTab === "mcp" ? "active" : ""} onClick={() => setActiveTab("mcp")}>
+              {t("settings.tabMcp")}
+            </button>
+            <button type="button" className={activeTab === "skills" ? "active" : ""} onClick={() => setActiveTab("skills")}>
+              {t("settings.tabSkills")}
+            </button>
+          </div>
+
+          {activeTab === "ai" && (<>
           <div className="settingsGrid">
             <label>
               <span>{t("settings.provider")}</span>
@@ -2723,14 +3183,12 @@ function SettingsModal({
                 type="password"
               />
             </label>
-            <label className="settingsWide setupToggleRow">
-              <input
-                type="checkbox"
-                checked={supportsResponses}
-                onChange={(event) => setSupportsResponses(event.target.checked)}
-              />
-              <span>{t("settings.supportsResponses")}</span>
-            </label>
+            <ToggleSwitch
+              className="settingsWide"
+              label={t("settings.supportsResponses")}
+              checked={supportsResponses}
+              onChange={setSupportsResponses}
+            />
             <label className="settingsWide">
               <span>{t("locale.label")}</span>
               <Segmented
@@ -2801,6 +3259,251 @@ function SettingsModal({
               }}
               spellCheck={false}
             />
+          )}
+          </>)}
+
+          {activeTab === "mcp" && (
+            <div className="settingsTabPanel">
+              {mcpServers.length === 0 && !mcpEditing && (
+                <p className="settingsEmptyHint">{t("settings.mcpNoServers")}</p>
+              )}
+
+              {mcpServers.length > 0 && !mcpEditing && (
+                <div className="configList">
+                  {mcpServers.map((server) => (
+                    <div key={server.id} className="configListItem">
+                      <div className="configListInfo">
+                        <strong>{server.id}</strong>
+                        <small>{server.command} {server.args.join(" ")}</small>
+                        <span className={`configListBadge ${server.enabled ? "on" : "off"}`}>
+                          {server.enabled ? "ON" : "OFF"}
+                        </span>
+                      </div>
+                      <div className="configListActions">
+                        <button className="iconButton ghost" type="button" onClick={() => openMcpEditForm(server)}>
+                          <Pencil size={14} />
+                        </button>
+                        <button className="iconButton ghost" type="button" onClick={() => void handleMcpDelete(server.id)}>
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {mcpEditing && (
+                <div className="mcpForm">
+                  <label>
+                    <span>{t("settings.mcpServerId")}</span>
+                    <input
+                      value={mcpFormId}
+                      onChange={(e) => setMcpFormId(e.target.value)}
+                      disabled={!mcpIsNew}
+                      placeholder="my-server"
+                    />
+                  </label>
+                  <label>
+                    <span>{t("settings.mcpCommand")}</span>
+                    <input
+                      value={mcpFormCommand}
+                      onChange={(e) => setMcpFormCommand(e.target.value)}
+                      placeholder="npx"
+                    />
+                  </label>
+                  <label className="settingsWide">
+                    <span>{t("settings.mcpArgs")}</span>
+                    <textarea
+                      className="mcpArgsEditor"
+                      value={mcpFormArgs}
+                      onChange={(e) => setMcpFormArgs(e.target.value)}
+                      placeholder={"-y\n@modelcontextprotocol/server-filesystem\n."}
+                      rows={3}
+                      spellCheck={false}
+                    />
+                  </label>
+                  <label className="settingsWide">
+                    <span>{t("settings.mcpEnv")}</span>
+                    <div className="mcpEnvList">
+                      {mcpFormEnvPairs.map((pair, idx) => (
+                        <div key={idx} className="mcpEnvRow">
+                          <input
+                            value={pair.key}
+                            onChange={(e) => {
+                              const next = [...mcpFormEnvPairs];
+                              next[idx] = { ...next[idx], key: e.target.value };
+                              setMcpFormEnvPairs(next);
+                            }}
+                            placeholder={t("settings.mcpEnvKey")}
+                          />
+                          <input
+                            value={pair.value}
+                            onChange={(e) => {
+                              const next = [...mcpFormEnvPairs];
+                              next[idx] = { ...next[idx], value: e.target.value };
+                              setMcpFormEnvPairs(next);
+                            }}
+                            placeholder={t("settings.mcpEnvValue")}
+                          />
+                          <button className="iconButton ghost" type="button" onClick={() => {
+                            setMcpFormEnvPairs(mcpFormEnvPairs.filter((_, i) => i !== idx));
+                          }}>
+                            <X size={14} />
+                          </button>
+                        </div>
+                      ))}
+                      <button className="presetButton small" type="button" onClick={() => {
+                        setMcpFormEnvPairs([...mcpFormEnvPairs, { key: "", value: "" }]);
+                      }}>
+                        <Plus size={12} />
+                      </button>
+                    </div>
+                  </label>
+                  <label>
+                    <span>{t("settings.mcpCwd")}</span>
+                    <input
+                      value={mcpFormCwd}
+                      onChange={(e) => setMcpFormCwd(e.target.value)}
+                      placeholder="."
+                    />
+                  </label>
+                  <label>
+                    <span>{t("settings.mcpTimeout")}</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={600}
+                      value={mcpFormTimeout}
+                      onChange={(e) => setMcpFormTimeout(Number(e.target.value))}
+                    />
+                  </label>
+                  <ToggleSwitch
+                    className="settingsWide"
+                    label={t("settings.mcpEnabled")}
+                    checked={mcpFormEnabled}
+                    onChange={setMcpFormEnabled}
+                  />
+                  <ToggleSwitch
+                    className="settingsWide"
+                    label={t("settings.mcpRequireApproval")}
+                    checked={mcpFormRequireApproval}
+                    onChange={setMcpFormRequireApproval}
+                  />
+                  <ToggleSwitch
+                    className="settingsWide"
+                    label={t("settings.mcpReadOnly")}
+                    checked={mcpFormReadOnly}
+                    onChange={setMcpFormReadOnly}
+                  />
+
+                  <div className="mcpFormActions">
+                    <button className="presetButton" type="button" onClick={() => void handleMcpTest()} disabled={mcpTesting}>
+                      {mcpTesting ? <Loader2 className="spin" size={14} /> : <Play size={14} />}
+                      {mcpTesting ? t("settings.mcpTesting") : t("settings.mcpTest")}
+                    </button>
+                    <button className="commandButton modalSaveButton" type="button" onClick={() => void handleMcpSave()}>
+                      <Save size={14} />
+                      {t("settings.mcpSave")}
+                    </button>
+                    <button className="iconTextButton" type="button" onClick={() => { setMcpEditing(null); setMcpTestResult(null); }}>
+                      {t("settings.mcpCancel")}
+                    </button>
+                  </div>
+
+                  {mcpTestResult && (
+                    <div className={mcpTestResult.ok ? "mcpTestSuccess" : "mcpTestError"}>
+                      {mcpTestResult.ok ? (
+                        <>
+                          <strong>{t("settings.mcpTestSuccess", { count: mcpTestResult.tools.length })}</strong>
+                          {mcpTestResult.tools.length > 0 && (
+                            <ul className="mcpToolList">
+                              {mcpTestResult.tools.map((tool) => (
+                                <li key={tool.name}>
+                                  <strong>{tool.name}</strong>
+                                  {tool.description && <small>{tool.description}</small>}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </>
+                      ) : (
+                        <span>{t("settings.mcpTestFail")}: {mcpTestResult.error}</span>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {!mcpEditing && (
+                <div className="mcpToolbar">
+                  <button className="presetButton" type="button" onClick={openMcpNewForm}>
+                    <Plus size={14} />
+                    {t("settings.mcpAdd")}
+                  </button>
+                  <button className="presetButton" type="button" onClick={() => { setMcpShowJsonImport(!mcpShowJsonImport); setMcpJsonText(""); }}>
+                    <FileCode2 size={14} />
+                    {t("settings.mcpImportJson")}
+                  </button>
+                </div>
+              )}
+
+              {mcpShowJsonImport && !mcpEditing && (
+                <div className="mcpJsonImport">
+                  <textarea
+                    className="settingsJsonEditor"
+                    value={mcpJsonText}
+                    onChange={(e) => setMcpJsonText(e.target.value)}
+                    placeholder={t("settings.mcpImportJsonPlaceholder")}
+                    rows={8}
+                    spellCheck={false}
+                  />
+                  <button className="commandButton modalSaveButton" type="button" onClick={() => void handleMcpJsonImport()}>
+                    {t("settings.mcpImportJsonSubmit")}
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {activeTab === "skills" && (
+            <div className="settingsTabPanel">
+              {skills.length === 0 && (
+                <p className="settingsEmptyHint">{t("settings.skillNoSkills")}</p>
+              )}
+
+              {skills.length > 0 && (
+                <div className="configList">
+                  {skills.map((skill) => (
+                    <div key={skill.path} className="configListItem skillItem">
+                      <div className="configListInfo">
+                        <button className="skillNameBtn" type="button" onClick={() => void handleSkillToggleContent(skill)}>
+                          {skillExpanded === skill.path ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                          <strong>{skill.name}</strong>
+                        </button>
+                        {skill.description && <small>{skill.description}</small>}
+                        <small className="skillPath">{skill.path}</small>
+                      </div>
+                      <div className="configListActions">
+                        <button className="iconButton ghost" type="button" onClick={() => void handleSkillDelete(skill)}>
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {skillExpanded && skillContents[skillExpanded] && (
+                <pre className="skillContentPreview">{skillContents[skillExpanded]}</pre>
+              )}
+
+              <div className="mcpToolbar">
+                <button className="presetButton" type="button" onClick={() => void handleSkillImport()}>
+                  <Upload size={14} />
+                  {t("settings.skillImport")}
+                </button>
+              </div>
+            </div>
           )}
         </div>
 
@@ -2887,6 +3590,7 @@ type TimelineItemKind =
   | "userPrompt"
   | "assistantReply"
   | "reasoning"
+  | "mcpTool"
   | "codeChange"
   | "codeChangeSummary"
   | "statusSummary"
@@ -2933,6 +3637,17 @@ type TimelineErrorInfo = {
   suggestedActions: RecoveryAction[];
 };
 
+type TimelineMcpTool = {
+  serverId: string;
+  toolName: string;
+  displayName: string;
+  statusText: string;
+  summary: string;
+  input?: unknown;
+  output?: unknown;
+  error?: string;
+};
+
 type TimelineItem = {
   id: string;
   kind: TimelineItemKind;
@@ -2944,6 +3659,7 @@ type TimelineItem = {
   details: EventRecord[];
   hiddenSummary?: string;
   errorInfo?: TimelineErrorInfo;
+  mcpTool?: TimelineMcpTool;
   codeChange?: TimelineCodeChange;
   codeChangeGroup?: TimelineCodeChangeGroup;
   rollbackSnapshotIds?: string[];
@@ -3164,6 +3880,10 @@ function TimelineItemView({
             </summary>
             <MarkdownText text={item.text ?? ""} />
           </details>
+        )}
+
+        {item.kind === "mcpTool" && item.mcpTool && (
+          <McpToolCard tool={item.mcpTool} />
         )}
 
         {item.kind === "codeChange" && item.codeChange && (
@@ -3454,6 +4174,54 @@ function HiddenDetails({ events }: { events: EventRecord[] }) {
             </details>
           ))}
         </div>
+      )}
+    </div>
+  );
+}
+
+function McpToolCard({ tool }: { tool: TimelineMcpTool }) {
+  const { t } = useTranslation();
+  const hasPayload =
+    tool.input !== undefined || tool.output !== undefined || Boolean(tool.error);
+  return (
+    <div className="mcpToolCard">
+      <div className="mcpToolMeta">
+        <span className="mcpToolBadge">
+          <Network size={14} />
+          MCP
+        </span>
+        <code>{tool.serverId}</code>
+        <code>{tool.toolName}</code>
+        <span>{tool.statusText}</span>
+      </div>
+      {tool.summary && <p className="mcpToolSummary">{tool.summary}</p>}
+      {hasPayload && (
+        <details className="mcpPayloadDetail">
+          <summary>
+            <ChevronRight size={13} />
+            {t("common.viewDetails")}
+          </summary>
+          <div className="mcpPayloadList">
+            {tool.input !== undefined && (
+              <section>
+                <strong>{t("mcp.input")}</strong>
+                <pre>{formatJson(tool.input)}</pre>
+              </section>
+            )}
+            {tool.error && (
+              <section>
+                <strong>{t("mcp.error")}</strong>
+                <pre>{tool.error}</pre>
+              </section>
+            )}
+            {tool.output !== undefined && (
+              <section>
+                <strong>{t("mcp.output")}</strong>
+                <pre>{formatJson(tool.output)}</pre>
+              </section>
+            )}
+          </div>
+        </details>
       )}
     </div>
   );
@@ -3845,6 +4613,9 @@ function buildTimelineItems(
   const items: TimelineItem[] = [];
   const hiddenBuffer: EventRecord[] = [];
   const callById = new Map<string, EventRecord>();
+  const pendingById = new Map<string, EventRecord>();
+  const resultByToolCall = new Map<string, EventRecord>();
+  const resultByPending = new Map<string, EventRecord>();
   const eventSeqById = new Map(events.map((event) => [event.id, event.seq]));
   const snapshotsByEventId = new Map<string, SnapshotRecord[]>();
   const consumedSnapshots = new Set<string>();
@@ -3865,6 +4636,33 @@ function buildTimelineItems(
   for (const event of events) {
     if (event.type === "tool.called") {
       callById.set(event.id, event);
+      continue;
+    }
+    if (event.type === "tool.pending") {
+      pendingById.set(event.id, event);
+    }
+    const pendingEventId = valueAsString(event.data.pendingEventId);
+    if (
+      pendingEventId &&
+      (event.type === "tool.success" ||
+        event.type === "tool.failed" ||
+        event.type === "tool.rejected")
+    ) {
+      resultByPending.set(pendingEventId, event);
+    }
+  }
+  for (const event of events) {
+    const toolCallEventId = valueAsString(event.data.toolCallEventId);
+    if (
+      toolCallEventId &&
+      (event.type === "tool.success" ||
+        event.type === "tool.failed" ||
+        event.type === "tool.pending")
+    ) {
+      resultByToolCall.set(
+        toolCallEventId,
+        event.type === "tool.pending" ? (resultByPending.get(event.id) ?? event) : event
+      );
     }
   }
   for (const snapshot of snapshots) {
@@ -3987,6 +4785,26 @@ function buildTimelineItems(
           rolledBackSnapshotIds
         )
       });
+      continue;
+    }
+
+    if (event.type === "tool.called" && isMcpToolEvent(event)) {
+      pushItem(mcpTimelineItem(event, resultByToolCall.get(event.id)));
+      continue;
+    }
+
+    if (isMcpToolResultEvent(event)) {
+      const toolCallEventId = valueAsString(event.data.toolCallEventId);
+      const pendingEventId = valueAsString(event.data.pendingEventId);
+      const pendingToolCallEventId = valueAsString(
+        pendingById.get(pendingEventId)?.data.toolCallEventId
+      );
+      if (
+        (!toolCallEventId || !callById.has(toolCallEventId)) &&
+        (!pendingToolCallEventId || !callById.has(pendingToolCallEventId))
+      ) {
+        pushItem(mcpTimelineItem(null, event));
+      }
       continue;
     }
 
@@ -4292,6 +5110,132 @@ function operationSummary(changes: TimelineCodeChange[]) {
   return Array.from(counts.entries())
     .map(([operation, count]) => (count > 1 ? `${operation} ${count}` : operation))
     .join(" · ");
+}
+
+function isMcpToolEvent(event: EventRecord) {
+  return valueAsString(event.data.name).startsWith("mcp__");
+}
+
+function isMcpToolResultEvent(event: EventRecord) {
+  if (
+    event.type !== "tool.success" &&
+    event.type !== "tool.failed" &&
+    event.type !== "tool.pending" &&
+    event.type !== "tool.rejected"
+  ) {
+    return false;
+  }
+  if (isMcpToolEvent(event)) {
+    return true;
+  }
+  const result = asRecord(event.data.result);
+  const pending = asRecord(event.data.pending);
+  const pendingMcp = asRecord(pending.mcp);
+  const mcp = asRecord(event.data.mcp);
+  return Boolean(
+    valueAsString(result.serverId) ||
+      valueAsString(result.toolName) ||
+      valueAsString(pendingMcp.serverId) ||
+      valueAsString(pendingMcp.toolName) ||
+      valueAsString(mcp.serverId) ||
+      valueAsString(mcp.toolName)
+  );
+}
+
+function mcpTimelineItem(
+  callEvent: EventRecord | null | undefined,
+  resultEvent: EventRecord | null | undefined
+): TimelineItem {
+  const event = callEvent ?? resultEvent;
+  const status: Exclude<TimelineStatus, "neutral"> =
+    resultEvent?.type === "tool.failed" || resultEvent?.type === "tool.rejected"
+      ? "failed"
+      : resultEvent?.type === "tool.pending"
+        ? "waiting"
+        : resultEvent?.type === "tool.success"
+          ? "done"
+          : "running";
+  const statusText =
+    status === "failed"
+      ? appT("execution.failed")
+      : status === "waiting"
+        ? appT("execution.waiting")
+        : status === "running"
+          ? appT("execution.running")
+          : appT("execution.done");
+  const tool = mcpToolSummary(callEvent, resultEvent, statusText);
+  return {
+    id: callEvent?.id ?? resultEvent?.id ?? `mcp-${tool.displayName}`,
+    kind: "mcpTool",
+    title: appT("mcp.toolCall"),
+    text: tool.summary,
+    status,
+    event: event ?? undefined,
+    details: [callEvent, resultEvent].filter((item): item is EventRecord => Boolean(item)),
+    mcpTool: tool
+  };
+}
+
+function mcpToolSummary(
+  callEvent: EventRecord | null | undefined,
+  resultEvent: EventRecord | null | undefined,
+  statusText: string
+): TimelineMcpTool {
+  const name = valueAsString(callEvent?.data.name) || valueAsString(resultEvent?.data.name);
+  const parsed = parseMcpDisplayName(name);
+  const result = asRecord(resultEvent?.data.result);
+  const mcp = asRecord(resultEvent?.data.mcp);
+  const pending = asRecord(resultEvent?.data.pending);
+  const pendingMcp = asRecord(pending.mcp);
+  const serverId =
+    valueAsString(result.serverId) ||
+    valueAsString(mcp.serverId) ||
+    valueAsString(pendingMcp.serverId) ||
+    parsed.serverId ||
+    appT("mcp.unknownServer");
+  const toolName =
+    valueAsString(result.toolName) ||
+    valueAsString(mcp.toolName) ||
+    valueAsString(pendingMcp.toolName) ||
+    parsed.toolName ||
+    name ||
+    appT("mcp.unknownTool");
+  const input =
+    callEvent?.data.input ??
+    resultEvent?.data.input ??
+    pendingMcp.arguments;
+  const error = valueAsString(result.error) || valueAsString(resultEvent?.data.error);
+  const output =
+    result.content ??
+    result.result ??
+    (Object.keys(result).length && !error ? result : undefined);
+  const reason = valueAsString(pending.reason);
+  const summary = error
+    ? error
+    : reason
+      ? reason
+      : `${serverId} / ${toolName}`;
+  return {
+    serverId,
+    toolName,
+    displayName: name || `${serverId}/${toolName}`,
+    statusText,
+    summary,
+    input,
+    output,
+    error
+  };
+}
+
+function parseMcpDisplayName(name: string) {
+  if (!name.startsWith("mcp__")) {
+    return { serverId: "", toolName: "" };
+  }
+  const [, serverId = "", ...toolParts] = name.split("__");
+  return {
+    serverId,
+    toolName: toolParts.join("__")
+  };
 }
 
 function statusItemForEvent(event: EventRecord): TimelineItem | null {
@@ -4605,6 +5549,9 @@ function timelineItemIcon(item: TimelineItem) {
   if (item.kind === "reasoning") {
     return <BrainCircuit size={16} />;
   }
+  if (item.kind === "mcpTool") {
+    return <Network size={16} />;
+  }
   if (item.kind === "codeChange" || item.kind === "codeChangeSummary") {
     return <FileCode2 size={16} />;
   }
@@ -4731,6 +5678,36 @@ function Segmented({
           {label}
         </button>
       ))}
+    </div>
+  );
+}
+
+function ToggleSwitch({
+  label,
+  checked,
+  onChange,
+  disabled = false,
+  className = ""
+}: {
+  label: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+  disabled?: boolean;
+  className?: string;
+}) {
+  return (
+    <div className={`settingSwitchRow ${className}`.trim()}>
+      <span>{label}</span>
+      <button
+        type="button"
+        className="switchControl"
+        role="switch"
+        aria-checked={checked}
+        disabled={disabled}
+        onClick={() => onChange(!checked)}
+      >
+        <span />
+      </button>
     </div>
   );
 }
@@ -4940,6 +5917,17 @@ function valueAsString(value: unknown) {
   return typeof value === "string" ? value : "";
 }
 
+function formatJson(value: unknown) {
+  if (typeof value === "string") {
+    return value;
+  }
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
 function stripReasoningControlTags(value: string) {
   let output = "";
   let index = 0;
@@ -4993,6 +5981,20 @@ function preferredConfigProviderId(config: ProviderConfigFileResponse) {
 
 function configPathPreferenceKey(projectRoot: string) {
   return `odot.selectedConfigPath:${projectRoot.trim() || "__app__"}`;
+}
+
+function slashTokenAtCursor(value: string, cursor: number) {
+  const left = value.slice(0, cursor);
+  const match = /(^|\s)\/([^\s/]*)$/.exec(left);
+  if (!match) {
+    return null;
+  }
+  const slashOffset = match[1].length;
+  return {
+    start: left.length - match[0].length + slashOffset,
+    end: cursor,
+    query: match[2] ?? ""
+  };
 }
 
 function selectedConfigPathForProject(projectRoot: string) {
@@ -5359,20 +6361,16 @@ function buildProviderConfigContent(
   model.name = model.name || modelId;
   config.model = `${providerId}/${modelId}`;
 
+  const modelRequest = fields.supportsResponses
+    ? ensureRecord(model, "request")
+    : asRecord(model.request);
+  const providerRequest = asRecord(provider.request);
+  const providerApi = valueAsString(providerRequest.api);
   if (fields.supportsResponses) {
-    const request = ensureRecord(provider, "request");
-    request.api = "responses";
-  } else {
-    const request = asRecord(provider.request);
-    if ("api" in request) {
-      delete request.api;
-    }
-    if (Object.keys(request).length === 0 && "request" in provider) {
-      delete provider.request;
-    }
-  }
-  const modelRequest = asRecord(model.request);
-  if ("api" in modelRequest) {
+    modelRequest.api = "responses";
+  } else if (providerApi === "responses") {
+    modelRequest.api = "chatCompletions";
+  } else if ("api" in modelRequest) {
     delete modelRequest.api;
   }
   if (Object.keys(modelRequest).length === 0 && "request" in model) {
@@ -5395,6 +6393,12 @@ function generateSetupConfig(fields: SetupConfigFields): string {
   const rawId = fields.providerName.trim().toLowerCase().replace(/\s+/g, "-");
   const providerId = rawId || "openai-compatible";
   const modelId = fields.modelId.trim();
+  const modelEntry: Record<string, unknown> = {
+    name: fields.modelDisplayName.trim() || modelId
+  };
+  if (fields.supportsResponses) {
+    modelEntry.request = { api: "responses" };
+  }
   const providerEntry: Record<string, unknown> = {
     name: fields.providerName.trim() || providerId,
     npm: "@ai-sdk/openai-compatible",
@@ -5403,14 +6407,9 @@ function generateSetupConfig(fields: SetupConfigFields): string {
       apiKey: fields.apiKey.trim()
     },
     models: {
-      [modelId]: {
-        name: fields.modelDisplayName.trim() || modelId
-      }
+      [modelId]: modelEntry
     }
   };
-  if (fields.supportsResponses) {
-    providerEntry.request = { api: "responses" };
-  }
   const config = {
     $schema: "https://opencode.ai/config.json",
     model: `${providerId}/${modelId}`,
@@ -5649,14 +6648,12 @@ function SetupDialog({
                     placeholder={t("setup.modelDisplayNamePlaceholder")}
                   />
                 </label>
-                <label className="settingsWide setupToggleRow">
-                  <input
-                    type="checkbox"
-                    checked={supportsResponses}
-                    onChange={(e) => setSupportsResponses(e.target.checked)}
-                  />
-                  <span>{t("setup.supportsResponses")}</span>
-                </label>
+                <ToggleSwitch
+                  className="settingsWide"
+                  label={t("setup.supportsResponses")}
+                  checked={supportsResponses}
+                  onChange={setSupportsResponses}
+                />
               </div>
             </>
           ) : (

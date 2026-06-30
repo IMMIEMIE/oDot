@@ -140,7 +140,51 @@
     "cannotDeleteLastProvider": "At least one provider must remain; cannot delete",
     "configFile": "Config file",
     "switchConfigFile": "Switch JSON",
-    "discardConfigDraft": "Discard unsaved settings edits and switch to another JSON file?"
+    "discardConfigDraft": "Discard unsaved settings edits and switch to another JSON file?",
+    "capabilities": "Project capabilities",
+    "capabilityCounts": "{{skills}} skills / {{servers}} MCP servers / {{tools}} MCP tools",
+    "tabAi": "AI Service",
+    "tabMcp": "MCP Servers",
+    "tabSkills": "Skills",
+    "mcpAdd": "Add MCP server",
+    "mcpImportJson": "Import from JSON",
+    "mcpImportJsonPlaceholder": "Paste MCP server JSON config…\nSupported formats:\n• { \"mcp\": { \"servers\": { ... } } }\n• { \"servers\": { ... } }\n• { \"server-id\": { \"command\": \"...\" } }\n• Single server { \"command\": \"...\", \"args\": [...] }",
+    "mcpImportJsonSubmit": "Import",
+    "mcpEdit": "Edit",
+    "mcpDelete": "Delete",
+    "mcpServerId": "Server ID",
+    "mcpCommand": "Command",
+    "mcpArgs": "Arguments (one per line)",
+    "mcpEnv": "Environment variables",
+    "mcpEnvKey": "Key",
+    "mcpEnvValue": "Value",
+    "mcpCwd": "Working directory",
+    "mcpTimeout": "Timeout (seconds)",
+    "mcpRequireApproval": "Require approval",
+    "mcpReadOnly": "Read only",
+    "mcpEnabled": "Enabled",
+    "mcpTest": "Test connection",
+    "mcpTesting": "Connecting…",
+    "mcpTestSuccess": "Connected, found {{count}} tools",
+    "mcpTestFail": "Connection failed",
+    "mcpNoServers": "No MCP servers yet. Click the button below to add one.",
+    "mcpConfirmDelete": "Delete MCP server \"{{id}}\"?",
+    "mcpDuplicateId": "Server ID \"{{id}}\" already exists",
+    "mcpSave": "Save",
+    "mcpCancel": "Cancel",
+    "mcpToolsLabel": "Available tools",
+    "skillImport": "Import Skill",
+    "skillDelete": "Delete",
+    "skillNoSkills": "No skills yet. Click the button below to import a .md file.",
+    "skillConfirmDelete": "Delete skill \"{{name}}\"?",
+    "skillViewContent": "View content",
+    "skillHideContent": "Hide content"
+  },
+  "skills": {
+    "menuLabel": "Project skills",
+    "empty": "No matching skills",
+    "loaded": "Loaded skill",
+    "removeLoaded": "Remove loaded skill {{name}}"
   },
   "setup": {
     "title": "Initialize API Configuration",
@@ -286,6 +330,14 @@
     "detail": "{{events}} events · {{changes}} file changes",
     "execFailed": "Execution failed"
   },
+  "mcp": {
+    "toolCall": "MCP tool call",
+    "input": "Input",
+    "output": "Output",
+    "error": "Error",
+    "unknownServer": "Unknown server",
+    "unknownTool": "Unknown tool"
+  },
   "todo": {
     "progress": "Steps {{completed}} / {{total}}",
     "waiting": "Waiting for TodoWrite",
@@ -413,6 +465,7 @@
   "api": {
     "pickProjectTitle": "Choose oDot project directory",
     "pickConfigTitle": "Choose provider JSON configuration",
+    "pickSkillTitle": "Choose Skill file (SKILL.md)",
     "tauriOnly": "oDot desktop API is only available inside the Tauri app."
   },
   "recoverAction": {

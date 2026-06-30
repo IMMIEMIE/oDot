@@ -1,8 +1,8 @@
 use crate::{
     storage,
     types::{
-        OpenAiApiMode, ProviderConfigFileResponse, ProviderInput, ProviderKind, ProviderPricing,
-        ProviderRecord, ProviderRequestConfig, ToolMode,
+        McpServerConfig, OpenAiApiMode, ProviderConfigFileResponse, ProviderInput, ProviderKind,
+        ProviderPricing, ProviderRecord, ProviderRequestConfig, ToolMode,
     },
 };
 use serde::Deserialize;
@@ -23,6 +23,31 @@ struct ODotConfig {
     enabled_providers: Vec<String>,
     #[serde(default)]
     disabled_providers: Vec<String>,
+    mcp: Option<ConfigMcp>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ConfigMcp {
+    #[serde(default)]
+    servers: HashMap<String, ConfigMcpServer>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ConfigMcpServer {
+    #[serde(default = "default_true")]
+    enabled: bool,
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    cwd: Option<String>,
+    #[serde(default, rename = "timeoutSeconds", alias = "timeout_seconds")]
+    timeout_seconds: Option<u64>,
+    #[serde(default = "default_true", rename = "requireApproval", alias = "require_approval")]
+    require_approval: bool,
+    #[serde(default, rename = "readOnly", alias = "read_only")]
+    read_only: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -95,6 +120,10 @@ enum CredentialProblem {
     Placeholder,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 pub fn load_provider_config_for_project(
     app: &AppHandle,
     project_root: Option<String>,
@@ -150,6 +179,124 @@ pub fn load_provider_request_config(
     resolve_provider_request_config_with_env(&content, provider_record_id, &path, |name| {
         env::var(name).ok()
     })
+}
+
+pub fn load_mcp_server_configs(
+    app: &AppHandle,
+    project_root: &str,
+    config_path: Option<&str>,
+) -> Result<Vec<McpServerConfig>, String> {
+    let path = resolve_config_path_from_input(app, Some(project_root), config_path)?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let config = parse_config(&content)?;
+    let Some(mcp) = config.mcp else {
+        return Ok(Vec::new());
+    };
+    let mut servers = mcp
+        .servers
+        .into_iter()
+        .map(|(id, server)| McpServerConfig {
+            id,
+            enabled: server.enabled,
+            command: server.command,
+            args: server.args,
+            env: server.env,
+            cwd: server.cwd,
+            timeout_seconds: server.timeout_seconds.unwrap_or(60).clamp(1, 600),
+            require_approval: server.require_approval,
+            read_only: server.read_only,
+        })
+        .collect::<Vec<_>>();
+    servers.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(servers)
+}
+
+pub fn save_mcp_server_entry(
+    app: &AppHandle,
+    project_root: &str,
+    config_path: Option<&str>,
+    server: &McpServerConfig,
+) -> Result<Vec<McpServerConfig>, String> {
+    let path = resolve_config_path_from_input(app, Some(project_root), config_path)?;
+
+    let mut config: Value = if path.exists() {
+        let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        serde_json::from_str(&content).map_err(|error| format!("配置文件 JSON 解析失败: {error}"))?
+    } else {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        serde_json::json!({})
+    };
+
+    let root = config
+        .as_object_mut()
+        .ok_or_else(|| "配置文件必须是 JSON 对象。".to_string())?;
+
+    let mcp_value = root
+        .entry("mcp")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let mcp_obj = mcp_value
+        .as_object_mut()
+        .ok_or_else(|| "mcp 字段必须是 JSON 对象。".to_string())?;
+
+    let servers_value = mcp_obj
+        .entry("servers")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let servers_obj = servers_value
+        .as_object_mut()
+        .ok_or_else(|| "mcp.servers 字段必须是 JSON 对象。".to_string())?;
+
+    servers_obj.insert(
+        server.id.clone(),
+        serde_json::json!({
+            "enabled": server.enabled,
+            "command": server.command,
+            "args": server.args,
+            "env": server.env,
+            "cwd": server.cwd,
+            "timeoutSeconds": server.timeout_seconds,
+            "requireApproval": server.require_approval,
+            "readOnly": server.read_only,
+        }),
+    );
+
+    let content = serde_json::to_string_pretty(&config).map_err(|error| error.to_string())?;
+    fs::write(&path, format!("{content}\n")).map_err(|error| error.to_string())?;
+
+    load_mcp_server_configs(app, project_root, config_path)
+}
+
+pub fn remove_mcp_server_entry(
+    app: &AppHandle,
+    project_root: &str,
+    config_path: Option<&str>,
+    server_id: &str,
+) -> Result<Vec<McpServerConfig>, String> {
+    let path = resolve_config_path_from_input(app, Some(project_root), config_path)?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let mut config: Value = serde_json::from_str(&content)
+        .map_err(|error| format!("配置文件 JSON 解析失败: {error}"))?;
+
+    if let Some(root) = config.as_object_mut() {
+        if let Some(mcp) = root.get_mut("mcp").and_then(Value::as_object_mut) {
+            if let Some(servers) = mcp.get_mut("servers").and_then(Value::as_object_mut) {
+                servers.remove(server_id);
+            }
+        }
+    }
+
+    let content = serde_json::to_string_pretty(&config).map_err(|error| error.to_string())?;
+    fs::write(&path, format!("{content}\n")).map_err(|error| error.to_string())?;
+
+    load_mcp_server_configs(app, project_root, config_path)
 }
 
 fn sync_provider_config(
