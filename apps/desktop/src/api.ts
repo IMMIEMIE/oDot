@@ -244,6 +244,34 @@ export type ProjectFile = {
   language: string;
 };
 
+export type BridgeStatus = {
+  enabled: boolean;
+  host: string;
+  port: number;
+  configuredPort: number;
+  portSource: string;
+  settingsPath?: string | null;
+  error?: string | null;
+  restartRequired: boolean;
+};
+
+export type ExternalPromptReferenceItem = {
+  itemType?: string | null;
+  path?: string | null;
+  absolutePath?: string | null;
+  startLine?: number | null;
+  endLine?: number | null;
+  language?: string | null;
+  content?: string | null;
+};
+
+export type ExternalPromptReferencePayload = {
+  workspaceRoot?: string | null;
+  source?: string | null;
+  mode?: string | null;
+  items: ExternalPromptReferenceItem[];
+};
+
 export async function saveProvider(
   input: ProviderInput
 ): Promise<ProviderRecord> {
@@ -606,6 +634,16 @@ export async function saveShellPolicy(
 export async function fetchProjectFiles(root: string): Promise<ProjectFile[]> {
   assertTauri();
   return invoke<ProjectFile[]>("list_project_files", { root });
+}
+
+export async function getBridgeStatus(): Promise<BridgeStatus> {
+  assertTauri();
+  return invoke<BridgeStatus>("get_bridge_status");
+}
+
+export async function setBridgePort(port: number): Promise<BridgeStatus> {
+  assertTauri();
+  return invoke<BridgeStatus>("set_bridge_port", { port });
 }
 
 export async function pickProjectDirectory(): Promise<string | null> {

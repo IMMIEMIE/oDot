@@ -1,6 +1,7 @@
 mod config_file;
 mod error_model;
 mod event_bus;
+mod external_bridge;
 mod i18n;
 mod llm_runtime;
 mod mcp;
@@ -724,12 +725,23 @@ fn list_project_files(root: String) -> Result<Vec<ProjectFile>, String> {
     workspace::list_project_files(root)
 }
 
+#[tauri::command]
+fn get_bridge_status() -> external_bridge::BridgeStatus {
+    external_bridge::status()
+}
+
+#[tauri::command]
+fn set_bridge_port(app: AppHandle, port: u16) -> Result<external_bridge::BridgeStatus, String> {
+    external_bridge::save_port(&app, port)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             event_bus::init();
+            external_bridge::start(app.handle().clone());
             let app_handle = app.handle().clone();
             let recovery_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -804,7 +816,9 @@ pub fn run() {
             save_shell_policy,
             persist_plan_file,
             reveal_project_path,
-            list_project_files
+            list_project_files,
+            get_bridge_status,
+            set_bridge_port
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

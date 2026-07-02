@@ -1,0 +1,118 @@
+{
+  "name": "odot-vscode",
+  "displayName": "oDot VS Code Bridge",
+  "description": "Send selected code, files, and folders from VS Code to the oDot prompt.",
+  "version": "0.1.0",
+  "publisher": "odot-local",
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:odot.sendReferenceToPrompt",
+    "onCommand:odot.sendResourceToPrompt",
+    "onCommand:odot.checkBridge"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "odot.sendReferenceToPrompt",
+        "title": "oDot: Send Selection/File to Prompt",
+        "category": "oDot",
+        "icon": "$(send)"
+      },
+      {
+        "command": "odot.sendResourceToPrompt",
+        "title": "oDot: Send File/Folder to Prompt",
+        "category": "oDot",
+        "icon": "$(send)"
+      },
+      {
+        "command": "odot.checkBridge",
+        "title": "oDot: Check Bridge",
+        "category": "oDot",
+        "icon": "$(plug)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "odot.sendReferenceToPrompt",
+        "key": "ctrl+l",
+        "mac": "cmd+l",
+        "when": "editorTextFocus || filesExplorerFocus"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "odot.sendReferenceToPrompt",
+          "group": "navigation@90",
+          "when": "editorHasSelection"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "odot.sendResourceToPrompt",
+          "group": "navigation@90"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "odot.sendReferenceToPrompt"
+        },
+        {
+          "command": "odot.sendResourceToPrompt"
+        },
+        {
+          "command": "odot.checkBridge"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "oDot",
+      "properties": {
+        "odot.bridge.host": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Host of the local oDot Bridge."
+        },
+        "odot.bridge.port": {
+          "type": "number",
+          "default": 39871,
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Port of the local oDot Bridge."
+        },
+        "odot.bridge.timeoutMs": {
+          "type": "number",
+          "default": 5000,
+          "minimum": 500,
+          "maximum": 60000,
+          "description": "HTTP timeout in milliseconds when talking to the oDot Bridge."
+        },
+        "odot.reference.maxPayloadBytes": {
+          "type": "number",
+          "default": 900000,
+          "minimum": 16384,
+          "maximum": 1200000,
+          "description": "Approximate maximum JSON payload bytes sent to the oDot Bridge. The payload contains reference metadata only, not file contents."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.8",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.2.1",
+    "typescript": "^5.5.4"
+  }
+}

@@ -40,6 +40,8 @@ import { useTranslation } from "react-i18next";
 import type {
   ChangeEvent,
   ClipboardEvent as ReactClipboardEvent,
+  FormEvent,
+  MouseEvent as ReactMouseEvent,
   PointerEvent,
   ReactNode
 } from "react";
@@ -86,6 +88,7 @@ import {
   type AgentMode,
   type BackgroundJobRecord,
   type EventRecord,
+  type ExternalPromptReferencePayload,
   type LoadedSkill,
   type McpConfigFileResponse,
   type McpServerConfig,
@@ -155,6 +158,27 @@ type TreeNode = {
   children: TreeNode[];
 };
 
+type PromptInlineReference = {
+  id: string;
+  source: "selectedPath" | "attachment" | "externalReference";
+  sourceId: string;
+  label: string;
+  detail: string;
+  kind: "file" | "directory" | "selection" | "attachment";
+};
+
+type ExternalPromptReference = {
+  id: string;
+  source?: string | null;
+  workspaceRoot?: string | null;
+  itemType?: string | null;
+  path?: string | null;
+  absolutePath?: string | null;
+  startLine?: number | null;
+  endLine?: number | null;
+  language?: string | null;
+};
+
 export function App() {
   const { t } = useTranslation();
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
@@ -212,7 +236,7 @@ export function App() {
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
   const timelineScrollRef = useRef<HTMLDivElement | null>(null);
   const shouldStickToTimelineBottomRef = useRef(true);
-  const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const promptInputRef = useRef<HTMLDivElement | null>(null);
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
   const modelMenuRef = useRef<HTMLDivElement | null>(null);
   const shellModeMenuRef = useRef<HTMLDivElement | null>(null);
@@ -223,6 +247,9 @@ export function App() {
   const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
   const [isShellModeMenuOpen, setIsShellModeMenuOpen] = useState(false);
   const [promptAttachments, setPromptAttachments] = useState<PromptAttachment[]>([]);
+  const [externalPromptReferences, setExternalPromptReferences] = useState<
+    ExternalPromptReference[]
+  >([]);
   const [projectCapabilities, setProjectCapabilities] =
     useState<ProjectCapabilities | null>(null);
   const [loadedSkills, setLoadedSkills] = useState<LoadedSkill[]>([]);
@@ -377,6 +404,10 @@ export function App() {
     [allowedAttachmentKinds]
   );
   const canUploadAttachments = allowedAttachmentKinds.length > 0;
+  const promptInlineReferences = useMemo(
+    () => buildPromptInlineReferences(selectedPaths, promptAttachments, externalPromptReferences),
+    [externalPromptReferences, promptAttachments, selectedPaths]
+  );
   const skillOptions = useMemo(() => {
     const query = skillMenu.query.trim().toLowerCase();
     const skills = projectCapabilities?.skills ?? [];
@@ -629,6 +660,55 @@ export function App() {
       }),
     [allowedAttachmentKinds, eventsResponse, isAgentWorking, isStopping, selectedSession]
   );
+
+  useLayoutEffect(() => {
+    const editor = promptInputRef.current;
+    if (!editor) {
+      return;
+    }
+    syncPromptInlineReferences(editor, promptInlineReferences);
+    setPrompt(extractPromptEditorText(editor));
+  }, [promptInlineReferences]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<ExternalPromptReferencePayload>(
+      "odot:external-prompt-references",
+      ({ payload }) => {
+        if (disposed) {
+          return;
+        }
+        if (isPromptLocked) {
+          setNotice({ tone: "error", text: t("prompt.agentWorking") });
+          return;
+        }
+        const nextReferences = externalPromptReferencesFromPayload(payload);
+        if (!nextReferences.length) {
+          setNotice({ tone: "error", text: t("error.unknown") });
+          return;
+        }
+        setExternalPromptReferences((current) =>
+          mergeExternalPromptReferences(current, nextReferences)
+        );
+        setNotice({
+          tone: "success",
+          text: t("notice.attachmentsAdded", { count: nextReferences.length })
+        });
+        promptInputRef.current?.focus();
+      }
+    ).then((dispose) => {
+      if (disposed) {
+        dispose();
+      } else {
+        unlisten = dispose;
+      }
+    }).catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [isPromptLocked, t]);
 
   useEffect(() => {
     saveFloatAgentStatus(floatAgentStatus);
@@ -1112,16 +1192,27 @@ export function App() {
     }
   }
 
-  function handlePromptPaste(event: ReactClipboardEvent<HTMLTextAreaElement>) {
+  function handlePromptPaste(event: ReactClipboardEvent<HTMLDivElement>) {
     if (isPromptLocked) {
       return;
     }
     const files = clipboardFiles(event.clipboardData);
-    if (!files.length) {
+    if (files.length) {
+      event.preventDefault();
+      void addPromptAttachments(files);
+      return;
+    }
+
+    const text = event.clipboardData.getData("text/plain");
+    if (!text) {
       return;
     }
     event.preventDefault();
-    void addPromptAttachments(files);
+    insertTextAtSelection(text);
+    const editor = promptInputRef.current;
+    if (editor) {
+      setPrompt(extractPromptEditorText(editor));
+    }
   }
 
   function removePromptAttachment(id: string) {
@@ -1130,10 +1221,58 @@ export function App() {
     );
   }
 
-  function handlePromptChange(event: ChangeEvent<HTMLTextAreaElement>) {
-    const value = event.target.value;
+  function removeExternalPromptReference(id: string) {
+    setExternalPromptReferences((current) =>
+      current.filter((reference) => reference.id !== id)
+    );
+  }
+
+  function handlePromptInput(event: FormEvent<HTMLDivElement>) {
+    const value = extractPromptEditorText(event.currentTarget);
     setPrompt(value);
-    syncSkillMenu(value, event.target.selectionStart ?? value.length);
+    syncSkillMenu(value, value.length);
+    pruneMissingPromptInlineReferences(event.currentTarget);
+  }
+
+  function handlePromptEditorClick(event: ReactMouseEvent<HTMLDivElement>) {
+    const target = event.target as HTMLElement;
+    const removeButton = target.closest<HTMLButtonElement>("[data-remove-inline-reference]");
+    if (!removeButton) {
+      return;
+    }
+    event.preventDefault();
+    const referenceId = removeButton.dataset.removeInlineReference;
+    const reference = promptInlineReferences.find((item) => item.id === referenceId);
+    if (!reference) {
+      return;
+    }
+    if (reference.source === "attachment") {
+      removePromptAttachment(reference.sourceId);
+    } else if (reference.source === "externalReference") {
+      removeExternalPromptReference(reference.sourceId);
+    } else {
+      toggleFile(reference.sourceId);
+    }
+  }
+
+  function pruneMissingPromptInlineReferences(editor: HTMLDivElement) {
+    const presentIds = new Set(
+      Array.from(editor.querySelectorAll<HTMLElement>("[data-inline-reference-id]"))
+        .map((node) => node.dataset.inlineReferenceId)
+        .filter(Boolean)
+    );
+    for (const reference of promptInlineReferences) {
+      if (presentIds.has(reference.id)) {
+        continue;
+      }
+      if (reference.source === "attachment") {
+        removePromptAttachment(reference.sourceId);
+      } else if (reference.source === "externalReference") {
+        removeExternalPromptReference(reference.sourceId);
+      } else {
+        toggleFile(reference.sourceId);
+      }
+    }
   }
 
   function syncSkillMenu(value: string, cursor: number) {
@@ -1160,12 +1299,12 @@ export function App() {
     const before = prompt.slice(0, skillMenu.start);
     const after = prompt.slice(skillMenu.end);
     const next = `${before}${after}`.replace(/[ \t]{2,}/g, " ");
-    const nextCursor = before.length;
-    setPrompt(next);
+    setPromptEditorText(promptInputRef.current, next, promptInlineReferences);
+    setPrompt(extractPromptEditorText(promptInputRef.current));
     setSkillMenu((current) => ({ ...current, open: false }));
     window.setTimeout(() => {
       promptInputRef.current?.focus();
-      promptInputRef.current?.setSelectionRange(nextCursor, nextCursor);
+      moveCaretToEnd(promptInputRef.current);
     }, 0);
   }
 
@@ -1174,7 +1313,14 @@ export function App() {
   }
 
   async function handleSubmitPrompt() {
-    if ((!prompt.trim() && !promptAttachments.length && !loadedSkills.length) || isPromptLocked) {
+    if (
+      (!prompt.trim() &&
+        !promptAttachments.length &&
+        !externalPromptReferences.length &&
+        !selectedPaths.size &&
+        !loadedSkills.length) ||
+      isPromptLocked
+    ) {
       return;
     }
     shouldStickToTimelineBottomRef.current = true;
@@ -1186,9 +1332,18 @@ export function App() {
       const session = await ensureSession();
       const previousMaxSeq = eventsResponse.events.at(-1)?.seq ?? 0;
       const selectedFileText = Array.from(selectedPaths).sort().join("\n");
-      const finalPrompt = selectedFileText
-        ? `${prompt.trim() || t("prompt.continueFromAttachment")}\n\n${t("prompt.selectedFiles")}\n${selectedFileText}`
-        : prompt;
+      const externalReferenceText = formatExternalPromptReferences(externalPromptReferences);
+      const editorPrompt = extractPromptEditorText(promptInputRef.current, {
+        includeReferences: true
+      }).trim();
+      const promptText = editorPrompt || prompt.trim();
+      const finalPrompt = appendPromptReferenceSections(
+        promptText || t("prompt.continueFromAttachment"),
+        [
+          selectedFileText ? `${t("prompt.selectedFiles")}\n${selectedFileText}` : "",
+          externalReferenceText
+        ]
+      );
       const response = await promptSession({
         sessionId: session.id,
         prompt: finalPrompt,
@@ -1211,6 +1366,12 @@ export function App() {
       await refreshSessions();
       setPrompt("");
       setPromptAttachments([]);
+      setExternalPromptReferences([]);
+      setPromptEditorText(
+        promptInputRef.current,
+        "",
+        buildPromptInlineReferences(selectedPaths, [], [])
+      );
       setLoadedSkills([]);
       setSkillMenu((current) => ({ ...current, open: false }));
       setNotice({
@@ -2066,15 +2227,20 @@ export function App() {
                     ))}
                   </div>
                 )}
-                <textarea
+                <div
                   ref={promptInputRef}
-                  className="promptInput"
-                  rows={1}
-                  value={prompt}
-                  disabled={isPromptLocked}
-                  onChange={handlePromptChange}
+                  className={`promptInput promptRichInput ${
+                    !prompt.trim() && !promptInlineReferences.length ? "empty" : ""
+                  }`}
+                  role="textbox"
+                  aria-multiline="true"
+                  aria-disabled={isPromptLocked}
+                  contentEditable={!isPromptLocked}
+                  suppressContentEditableWarning
+                  onInput={handlePromptInput}
                   onPaste={handlePromptPaste}
-                  placeholder={
+                  onClick={handlePromptEditorClick}
+                  data-placeholder={
                     isAgentWorking
                       ? t("prompt.agentWorking")
                       : isStopping
@@ -2150,27 +2316,6 @@ export function App() {
                       <div className="skillSlashEmpty">{t("skills.empty")}</div>
                     )}
                   </div>
-                </div>
-              )}
-              {promptAttachments.length > 0 && (
-                <div className="promptAttachmentList" aria-label={t("nav.uploadedAttachments")}>
-                  {promptAttachments.map((attachment) => (
-                    <span className="promptAttachmentChip" key={attachment.id}>
-                      <span>{attachment.name}</span>
-                      <small>
-                        {attachment.kind === "image" ? t("common.image") : t("common.text")} ·{" "}
-                        {formatBytes(attachment.size)}
-                      </small>
-                      <button
-                        type="button"
-                        aria-label={t("nav.removeAttachment", { name: attachment.name })}
-                        disabled={isPromptLocked}
-                        onClick={() => removePromptAttachment(attachment.id)}
-                      >
-                        <X size={13} />
-                      </button>
-                    </span>
-                  ))}
                 </div>
               )}
                 <div className="promptActionRow">
@@ -2326,7 +2471,10 @@ export function App() {
                     disabled={
                       isAgentWorking
                         ? false
-                        : (!prompt.trim() && !promptAttachments.length && !loadedSkills.length) ||
+                        : (!prompt.trim() &&
+                            !promptAttachments.length &&
+                            !selectedPaths.size &&
+                            !loadedSkills.length) ||
                           isPromptLocked ||
                           !selectedProviderId
                     }
@@ -6975,6 +7123,228 @@ function attachmentAcceptValue(kinds: PromptAttachmentKind[]) {
   return values.join(",");
 }
 
+function buildPromptInlineReferences(
+  selectedPaths: Set<string>,
+  attachments: PromptAttachment[],
+  externalReferences: ExternalPromptReference[]
+): PromptInlineReference[] {
+  const selectedReferences = Array.from(selectedPaths)
+    .sort()
+    .map((path): PromptInlineReference => ({
+      id: `path:${path}`,
+      source: "selectedPath",
+      sourceId: path,
+      label: basename(path),
+      detail: path,
+      kind: "file"
+    }));
+  const attachmentReferences = attachments.map((attachment): PromptInlineReference => {
+    const parsed = parseAttachmentReferenceLabel(attachment.name);
+    return {
+      id: `attachment:${attachment.id}`,
+      source: "attachment",
+      sourceId: attachment.id,
+      label: parsed.label,
+      detail: parsed.detail,
+      kind: parsed.detail ? "selection" : "attachment"
+    };
+  });
+  const externalPromptReferences = externalReferences.map((reference): PromptInlineReference => ({
+    id: `external:${reference.id}`,
+    source: "externalReference",
+    sourceId: reference.id,
+    label: externalPromptReferenceName(reference),
+    detail: externalPromptReferenceLineLabel(reference, "display"),
+    kind: externalPromptReferenceKind(reference)
+  }));
+  return [...selectedReferences, ...attachmentReferences, ...externalPromptReferences];
+}
+
+function syncPromptInlineReferences(
+  editor: HTMLDivElement,
+  references: PromptInlineReference[]
+) {
+  const referenceIds = new Set(references.map((reference) => reference.id));
+  editor
+    .querySelectorAll<HTMLElement>("[data-inline-reference-id]")
+    .forEach((node) => {
+      if (!referenceIds.has(node.dataset.inlineReferenceId || "")) {
+        node.remove();
+      }
+    });
+
+  for (const reference of references) {
+    const exists = Array.from(
+      editor.querySelectorAll<HTMLElement>("[data-inline-reference-id]")
+    ).some((node) => node.dataset.inlineReferenceId === reference.id);
+    if (exists) {
+      continue;
+    }
+    appendPromptInlineReference(editor, reference);
+  }
+}
+
+function appendPromptInlineReference(
+  editor: HTMLDivElement,
+  reference: PromptInlineReference
+) {
+  if (editor.textContent?.trim()) {
+    editor.appendChild(document.createTextNode(" "));
+  }
+  editor.appendChild(createPromptInlineReferenceElement(reference));
+  editor.appendChild(document.createTextNode(" "));
+  moveCaretToEnd(editor);
+}
+
+function createPromptInlineReferenceElement(reference: PromptInlineReference) {
+  const chip = document.createElement("span");
+  chip.className = `promptInlineReference ${reference.kind}`;
+  chip.contentEditable = "false";
+  chip.dataset.inlineReferenceId = reference.id;
+  chip.dataset.promptLabel = promptInlineReferenceText(reference);
+
+  const marker = document.createElement("span");
+  marker.className = "promptInlineReferenceMarker";
+  marker.textContent = reference.kind === "directory" ? "dir" : "#";
+  chip.appendChild(marker);
+
+  const label = document.createElement("span");
+  label.className = "promptInlineReferenceLabel";
+  label.textContent = reference.label;
+  chip.appendChild(label);
+
+  const detail = promptInlineReferenceDetail(reference);
+  if (detail) {
+    const detailNode = document.createElement("small");
+    detailNode.textContent = detail;
+    chip.appendChild(detailNode);
+  }
+
+  const button = document.createElement("button");
+  button.type = "button";
+  button.tabIndex = -1;
+  button.dataset.removeInlineReference = reference.id;
+  button.setAttribute("aria-label", `Remove ${reference.label}`);
+  button.textContent = "x";
+  chip.appendChild(button);
+
+  return chip;
+}
+
+function extractPromptEditorText(
+  editor: HTMLDivElement | null,
+  options: { includeReferences?: boolean } = {}
+) {
+  if (!editor) {
+    return "";
+  }
+  const parts: string[] = [];
+
+  function visit(node: ChildNode) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      parts.push(node.textContent || "");
+      return;
+    }
+    if (!(node instanceof HTMLElement)) {
+      return;
+    }
+    if (node.dataset.inlineReferenceId) {
+      if (options.includeReferences) {
+        parts.push(` ${node.dataset.promptLabel || node.textContent || ""} `);
+      } else {
+        parts.push(" ");
+      }
+      return;
+    }
+    if (node.tagName === "BR") {
+      parts.push("\n");
+      return;
+    }
+    node.childNodes.forEach(visit);
+    if (node.tagName === "DIV" || node.tagName === "P") {
+      parts.push("\n");
+    }
+  }
+
+  editor.childNodes.forEach(visit);
+  return parts
+    .join("")
+    .replace(/\u00a0/g, " ")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n");
+}
+
+function setPromptEditorText(
+  editor: HTMLDivElement | null,
+  text: string,
+  references: PromptInlineReference[] = []
+) {
+  if (!editor) {
+    return;
+  }
+  editor.textContent = text;
+  syncPromptInlineReferences(editor, references);
+  moveCaretToEnd(editor);
+}
+
+function insertTextAtSelection(text: string) {
+  const selection = window.getSelection();
+  if (!selection || !selection.rangeCount) {
+    return;
+  }
+  const range = selection.getRangeAt(0);
+  range.deleteContents();
+  const node = document.createTextNode(text);
+  range.insertNode(node);
+  range.setStartAfter(node);
+  range.setEndAfter(node);
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
+function moveCaretToEnd(editor: HTMLDivElement | null) {
+  if (!editor) {
+    return;
+  }
+  const selection = window.getSelection();
+  const range = document.createRange();
+  range.selectNodeContents(editor);
+  range.collapse(false);
+  selection?.removeAllRanges();
+  selection?.addRange(range);
+}
+
+function promptInlineReferenceText(reference: PromptInlineReference) {
+  const detail = promptInlineReferenceDetail(reference);
+  return detail ? `${reference.label} ${detail}` : reference.label;
+}
+
+function promptInlineReferenceDetail(reference: PromptInlineReference) {
+  if (reference.source === "externalReference") {
+    return reference.detail;
+  }
+  if (reference.kind === "selection" && reference.detail) {
+    return `(${reference.detail})`;
+  }
+  if (reference.source === "selectedPath") {
+    return "";
+  }
+  return reference.detail ? `(${reference.detail})` : "";
+}
+
+function parseAttachmentReferenceLabel(name: string) {
+  const match = /^(.+):(\d+(?:-\d+)?)$/.exec(name);
+  if (match) {
+    return { label: match[1] ?? name, detail: match[2] ?? "" };
+  }
+  return { label: basename(name), detail: "" };
+}
+
+function basename(path: string) {
+  return path.split(/[\\/]/).filter(Boolean).at(-1) || path;
+}
+
 function attachmentUploadTitle(kinds: PromptAttachmentKind[]) {
   if (!kinds.length) {
     return appT("attachment.uploadUnsupported");
@@ -6984,6 +7354,103 @@ function attachmentUploadTitle(kinds: PromptAttachmentKind[]) {
   );
   const separator = i18n.language === "zh" ? "、" : ", ";
   return appT("attachment.uploadTypes", { types: labels.join(separator) });
+}
+
+function externalPromptReferencesFromPayload(
+  payload: ExternalPromptReferencePayload
+): ExternalPromptReference[] {
+  return (payload.items ?? []).flatMap((item) => {
+    const absolutePath = item.absolutePath?.trim() || "";
+    const itemPath = item.path?.trim() || "";
+    if (!absolutePath && !itemPath) {
+      return [];
+    }
+    const reference: ExternalPromptReference = {
+      id: externalPromptReferenceId(payload, item),
+      source: payload.source,
+      workspaceRoot: payload.workspaceRoot,
+      itemType: item.itemType,
+      path: itemPath || null,
+      absolutePath: absolutePath || null,
+      startLine: item.startLine,
+      endLine: item.endLine,
+      language: item.language
+    };
+    return [reference];
+  });
+}
+
+function mergeExternalPromptReferences(
+  current: ExternalPromptReference[],
+  next: ExternalPromptReference[]
+) {
+  const byId = new Map(current.map((reference) => [reference.id, reference]));
+  for (const reference of next) {
+    byId.set(reference.id, reference);
+  }
+  return Array.from(byId.values());
+}
+
+function externalPromptReferenceId(
+  payload: ExternalPromptReferencePayload,
+  item: ExternalPromptReferencePayload["items"][number]
+) {
+  return [
+    payload.source || "external",
+    item.absolutePath || item.path || "",
+    item.startLine || "",
+    item.endLine || "",
+    item.itemType || ""
+  ].join(":");
+}
+
+function externalPromptReferenceName(item: ExternalPromptReference) {
+  const rawName = item.path || item.absolutePath || item.itemType || "external-reference";
+  const baseName = rawName.split(/[\\/]/).filter(Boolean).at(-1) || rawName;
+  return baseName;
+}
+
+function externalPromptReferenceLineLabel(
+  item: ExternalPromptReference,
+  format: "display" | "plain" = "plain"
+) {
+  const prefix = format === "display" ? "L" : "";
+  if (item.startLine && item.endLine && item.endLine !== item.startLine) {
+    return `${prefix}${item.startLine}-${item.endLine}`;
+  }
+  if (item.startLine) {
+    return `${prefix}${item.startLine}`;
+  }
+  return "";
+}
+
+function externalPromptReferenceKind(reference: ExternalPromptReference) {
+  if ((reference.itemType || "").toLowerCase().includes("dir")) {
+    return "directory";
+  }
+  if (reference.startLine) {
+    return "selection";
+  }
+  return "file";
+}
+
+function formatExternalPromptReferences(references: ExternalPromptReference[]) {
+  const lines = references
+    .map((reference) => {
+      const location = reference.absolutePath || reference.path || "";
+      const lineLabel = externalPromptReferenceLineLabel(reference, "display");
+      return [location, lineLabel].filter(Boolean).join(" ");
+    })
+    .filter(Boolean);
+  return lines.length ? `Referenced VS Code locations:\n${lines.join("\n")}` : "";
+}
+
+function appendPromptReferenceSections(prompt: string, sections: string[]) {
+  const cleanedSections = sections.map((section) => section.trim()).filter(Boolean);
+  if (!cleanedSections.length) {
+    return prompt;
+  }
+  return [prompt.trim(), ...cleanedSections].filter(Boolean).join("\n\n");
 }
 
 function promptAttachmentSummaries(value: unknown): PromptAttachmentSummary[] {

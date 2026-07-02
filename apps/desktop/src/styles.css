@@ -1882,9 +1882,9 @@ pre {
   width: 100%;
   min-width: 0;
   margin: 0;
-  padding: 13px clamp(10px, 1.4vw, 14px) 10px clamp(12px, 1.6vw, 18px);
+  padding: 11px clamp(10px, 1.4vw, 14px) 10px clamp(12px, 1.6vw, 18px);
   border: 1px solid var(--accent-border);
-  border-radius: 8px;
+  border-radius: 14px;
   background:
     linear-gradient(180deg, var(--surface), var(--surface-soft));
   display: grid;
@@ -1908,7 +1908,7 @@ pre {
 
 .promptInputRow {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   flex-wrap: wrap;
   gap: 4px 6px;
   min-width: 0;
@@ -1919,28 +1919,47 @@ pre {
   min-width: 120px;
   min-height: 30px;
   max-height: 118px;
-  padding: 3px 2px;
+  padding: 2px 2px 3px;
   border: 0;
   border-radius: 0;
   background: transparent;
   color: var(--ink);
   line-height: 24px;
-  resize: none;
   font-size: 14px;
-  overflow: hidden;
+  overflow-y: auto;
 }
 
 .promptInput:focus {
   border-color: transparent;
   box-shadow: none;
+  outline: none;
 }
 
-.promptInput::placeholder {
+.promptRichInput {
+  white-space: pre-wrap;
+  word-break: break-word;
+  cursor: text;
+}
+
+.promptRichInput > div,
+.promptRichInput > p {
+  display: inline;
+  margin: 0;
+}
+
+.promptRichInput > div::after,
+.promptRichInput > p::after {
+  content: "";
+}
+
+.promptRichInput.empty::before {
+  content: attr(data-placeholder);
   color: var(--muted);
   font-weight: 650;
+  pointer-events: none;
 }
 
-.promptInput:disabled {
+.promptRichInput[contenteditable="false"] {
   color: var(--muted);
   background: transparent;
   cursor: not-allowed;
@@ -2028,7 +2047,8 @@ pre {
   flex-shrink: 0;
 }
 
-.promptSkillTag {
+.promptSkillTag,
+.promptInlineReference {
   display: inline-flex;
   align-items: center;
   gap: 4px;
@@ -2042,20 +2062,36 @@ pre {
   max-width: min(240px, 100%);
 }
 
-.promptSkillTag > span {
+.promptInlineReference {
+  margin: 0 2px;
+  vertical-align: baseline;
+}
+
+.promptSkillTag > span,
+.promptInlineReferenceLabel {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.promptSkillTag > svg {
+.promptSkillTag > svg,
+.promptInlineReferenceMarker {
   flex-shrink: 0;
   color: var(--accent);
   opacity: 0.7;
 }
 
-.promptSkillTag button {
+.promptInlineReference small {
+  flex: 0 0 auto;
+  color: var(--accent);
+  font-size: 11px;
+  line-height: 18px;
+  opacity: 0.72;
+}
+
+.promptSkillTag button,
+.promptInlineReference button {
   all: unset;
   display: inline-flex;
   align-items: center;
@@ -2070,13 +2106,15 @@ pre {
   transition: opacity 0.15s ease, background 0.15s ease;
 }
 
-.promptSkillTag button:hover:not(:disabled) {
+.promptSkillTag button:hover:not(:disabled),
+.promptInlineReference button:hover:not(:disabled) {
   opacity: 1;
   background: var(--accent);
   color: #fff;
 }
 
-.promptSkillTag button:disabled {
+.promptSkillTag button:disabled,
+.promptInlineReference button:disabled {
   cursor: not-allowed;
   opacity: 0.3;
 }
@@ -3335,7 +3373,7 @@ pre {
     var(--inset-line);
 }
 
-:root[data-theme="dark"] .promptInput::placeholder {
+:root[data-theme="dark"] .promptRichInput.empty::before {
   color: var(--muted);
 }
 
