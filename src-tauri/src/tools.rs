@@ -365,7 +365,8 @@ async fn execute_tool_inner(
     execution_mode: ToolExecutionMode,
 ) -> Result<ToolRun, String> {
     let tool_name = normalize_tool_name(&call.name);
-    if let Some(run) = execute_mcp_tool_if_matched(app, conn, session, call, execution_mode).await?
+    if let Some(run) =
+        execute_mcp_tool_if_matched(app, conn, session, shell_mode, call, execution_mode).await?
     {
         return Ok(run);
     }
@@ -552,6 +553,7 @@ async fn execute_mcp_tool_if_matched(
     app: Option<&AppHandle>,
     conn: &Connection,
     session: &SessionRecord,
+    shell_mode: &ShellMode,
     call: &ToolCallRequest,
     execution_mode: ToolExecutionMode,
 ) -> Result<Option<ToolRun>, String> {
@@ -583,7 +585,7 @@ async fn execute_mcp_tool_if_matched(
                 &call.name,
             )));
         }
-        if tool.require_approval {
+        if mcp_tool_needs_approval(tool.require_approval, shell_mode) {
             return Ok(Some(ToolRun::Pending(json!({
                 "command": format!("{} / {}", server.id, tool.name),
                 "mcp": {
@@ -632,9 +634,21 @@ fn find_mcp_server(
 }
 
 fn session_provider_config_path(conn: &Connection, session: &SessionRecord) -> Option<String> {
+    if let Some(path) = session
+        .config_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        return Some(path.to_string());
+    }
     storage::get_provider(conn, &session.provider_id)
         .ok()
         .and_then(|provider| provider.config_path)
+}
+
+fn mcp_tool_needs_approval(require_approval: bool, shell_mode: &ShellMode) -> bool {
+    require_approval && !matches!(shell_mode, ShellMode::Auto)
 }
 
 fn normalize_tool_name(name: &str) -> String {
@@ -1336,6 +1350,13 @@ mod tests {
             &ShellMode::Auto,
             &policy
         ));
+    }
+
+    #[test]
+    fn auto_mode_runs_mcp_tools_without_manual_approval() {
+        assert!(mcp_tool_needs_approval(true, &ShellMode::Manual));
+        assert!(!mcp_tool_needs_approval(true, &ShellMode::Auto));
+        assert!(!mcp_tool_needs_approval(false, &ShellMode::Manual));
     }
 
     #[test]
