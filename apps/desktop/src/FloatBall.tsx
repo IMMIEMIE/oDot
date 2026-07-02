@@ -44,6 +44,12 @@ import {
   toPromptAttachmentInput,
   type PromptAttachment
 } from "./promptAttachments";
+import {
+  clearPromptDraft,
+  PROMPT_DRAFT_STORAGE_KEY,
+  readPromptDraft,
+  savePromptDraft
+} from "./promptDraft";
 
 type ThemeMode = "system" | "light" | "dark";
 type ResolvedTheme = "light" | "dark";
@@ -60,7 +66,7 @@ export function FloatBall() {
   const [isDragging, setIsDragging] = useState(false);
   const [agentStatus, setAgentStatus] = useState(loadFloatAgentStatus);
   const [promptDirection, setPromptDirection] = useState<PromptPanelDirection | null>(null);
-  const [promptText, setPromptText] = useState("");
+  const [promptText, setPromptText] = useState(() => readPromptDraft()?.text ?? "");
   const [attachments, setAttachments] = useState<PromptAttachment[]>([]);
   const [panelError, setPanelError] = useState("");
   const [isSubmittingPrompt, setIsSubmittingPrompt] = useState(false);
@@ -79,6 +85,7 @@ export function FloatBall() {
   const sleepTimer = useRef<number | undefined>(undefined);
   const cancelledErrorSession = useRef<string | undefined>(undefined);
   const previousStatusKind = useRef<FloatAgentStatusKind>(agentStatus.kind);
+  const promptDraftUpdatedAtRef = useRef(readPromptDraft()?.updatedAt ?? 0);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -134,6 +141,28 @@ export function FloatBall() {
       window.removeEventListener("storage", onStorage);
       media.removeEventListener("change", syncTheme);
       unlistenTheme?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    const applyExternalDraft = () => {
+      const draft = readPromptDraft();
+      if (!draft || draft.source === "float" || draft.updatedAt <= promptDraftUpdatedAtRef.current) {
+        return;
+      }
+      promptDraftUpdatedAtRef.current = draft.updatedAt;
+      setPromptText(draft.text);
+    };
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === PROMPT_DRAFT_STORAGE_KEY) {
+        applyExternalDraft();
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    window.addEventListener("focus", applyExternalDraft);
+    return () => {
+      window.removeEventListener("storage", onStorage);
+      window.removeEventListener("focus", applyExternalDraft);
     };
   }, []);
 
@@ -321,6 +350,11 @@ export function FloatBall() {
   };
 
   function openPromptPanel(direction: PromptPanelDirection) {
+    const draft = readPromptDraft();
+    if (draft && draft.updatedAt >= promptDraftUpdatedAtRef.current) {
+      promptDraftUpdatedAtRef.current = draft.updatedAt;
+      setPromptText(draft.text);
+    }
     setIsActionRingVisible(false);
     setPromptDirection(direction);
     setPanelError("");
@@ -365,12 +399,15 @@ export function FloatBall() {
     setIsSubmittingPrompt(true);
     setPanelError("");
     setPromptText("");
+    clearPromptDraft("float");
+    promptDraftUpdatedAtRef.current = readPromptDraft()?.updatedAt ?? Date.now();
     setAttachments([]);
     closePromptPanel();
     setAgentStatus((current) => syncLocalStatus({
       ...current,
       kind: "working",
       label: t("float.agentWorking"),
+      message: "",
       pendingApproval: null
     }));
     try {
@@ -382,7 +419,6 @@ export function FloatBall() {
         resume: true
       });
       await notifyMainSessionRefresh(agentStatus.sessionId);
-      setAgentStatus(loadFloatAgentStatus());
     } catch (error) {
       setPanelError(errorSummary(error));
       setAgentStatus((current) => syncLocalStatus({
@@ -436,6 +472,7 @@ export function FloatBall() {
         ...current,
         kind: action === "reject" ? "idle" : "working",
         label: action === "reject" ? t("float.commandRejected") : t("float.agentWorking"),
+        message: "",
         pendingApproval: null
       }));
     } catch (error) {
@@ -634,7 +671,12 @@ export function FloatBall() {
             value={promptText}
             placeholder={t("prompt.placeholder")}
             disabled={isSubmittingPrompt}
-            onChange={(event) => setPromptText(event.target.value)}
+            onChange={(event) => {
+              const value = event.target.value;
+              setPromptText(value);
+              savePromptDraft(value, "float");
+              promptDraftUpdatedAtRef.current = readPromptDraft()?.updatedAt ?? Date.now();
+            }}
             onFocus={() => {
               setIsActionRingVisible(false);
             }}

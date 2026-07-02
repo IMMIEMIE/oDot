@@ -120,6 +120,12 @@ import {
   saveFloatAgentStatus
 } from "./floatAgentStatus";
 import {
+  clearPromptDraft,
+  PROMPT_DRAFT_STORAGE_KEY,
+  readPromptDraft,
+  savePromptDraft
+} from "./promptDraft";
+import {
   clipboardFiles,
   readPromptAttachment,
   shellAllowlistPrefix,
@@ -208,7 +214,7 @@ export function App() {
   );
   const [dismissedJobIds, setDismissedJobIds] = useState<Set<string>>(new Set());
   const [streamingEventId, setStreamingEventId] = useState<string | null>(null);
-  const [prompt, setPrompt] = useState("");
+  const [prompt, setPrompt] = useState(() => readPromptDraft()?.text ?? "");
   const [lastError, setLastError] = useState<string | null>(null);
   const [, setNotice] = useState<Notice>({
     tone: "info",
@@ -244,6 +250,8 @@ export function App() {
   const activeRunIdRef = useRef(0);
   const stopBaselineSeqRef = useRef(0);
   const rollbackInFlightRef = useRef(false);
+  const promptDraftHydratedRef = useRef(false);
+  const promptDraftUpdatedAtRef = useRef(readPromptDraft()?.updatedAt ?? 0);
   const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
   const [isShellModeMenuOpen, setIsShellModeMenuOpen] = useState(false);
   const [promptAttachments, setPromptAttachments] = useState<PromptAttachment[]>([]);
@@ -660,6 +668,40 @@ export function App() {
       }),
     [allowedAttachmentKinds, eventsResponse, isAgentWorking, isStopping, selectedSession]
   );
+
+  useLayoutEffect(() => {
+    if (promptDraftHydratedRef.current) {
+      return;
+    }
+    promptDraftHydratedRef.current = true;
+    if (!prompt.trim()) {
+      return;
+    }
+    setPromptEditorText(promptInputRef.current, prompt, promptInlineReferences);
+  }, [prompt, promptInlineReferences]);
+
+  useEffect(() => {
+    const applyExternalDraft = () => {
+      const draft = readPromptDraft();
+      if (!draft || draft.source === "main" || draft.updatedAt <= promptDraftUpdatedAtRef.current) {
+        return;
+      }
+      promptDraftUpdatedAtRef.current = draft.updatedAt;
+      setPrompt(draft.text);
+      setPromptEditorText(promptInputRef.current, draft.text, promptInlineReferences);
+    };
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === PROMPT_DRAFT_STORAGE_KEY) {
+        applyExternalDraft();
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    window.addEventListener("focus", applyExternalDraft);
+    return () => {
+      window.removeEventListener("storage", onStorage);
+      window.removeEventListener("focus", applyExternalDraft);
+    };
+  }, [promptInlineReferences]);
 
   useLayoutEffect(() => {
     const editor = promptInputRef.current;
@@ -1211,7 +1253,10 @@ export function App() {
     insertTextAtSelection(text);
     const editor = promptInputRef.current;
     if (editor) {
-      setPrompt(extractPromptEditorText(editor));
+      const value = extractPromptEditorText(editor);
+      setPrompt(value);
+      savePromptDraft(value, "main");
+      promptDraftUpdatedAtRef.current = readPromptDraft()?.updatedAt ?? Date.now();
     }
   }
 
@@ -1230,6 +1275,8 @@ export function App() {
   function handlePromptInput(event: FormEvent<HTMLDivElement>) {
     const value = extractPromptEditorText(event.currentTarget);
     setPrompt(value);
+    savePromptDraft(value, "main");
+    promptDraftUpdatedAtRef.current = readPromptDraft()?.updatedAt ?? Date.now();
     syncSkillMenu(value, value.length);
     pruneMissingPromptInlineReferences(event.currentTarget);
   }
@@ -1300,7 +1347,10 @@ export function App() {
     const after = prompt.slice(skillMenu.end);
     const next = `${before}${after}`.replace(/[ \t]{2,}/g, " ");
     setPromptEditorText(promptInputRef.current, next, promptInlineReferences);
-    setPrompt(extractPromptEditorText(promptInputRef.current));
+    const value = extractPromptEditorText(promptInputRef.current);
+    setPrompt(value);
+    savePromptDraft(value, "main");
+    promptDraftUpdatedAtRef.current = readPromptDraft()?.updatedAt ?? Date.now();
     setSkillMenu((current) => ({ ...current, open: false }));
     window.setTimeout(() => {
       promptInputRef.current?.focus();
@@ -1365,6 +1415,8 @@ export function App() {
       setStreamingEventId(latestAssistantEvent?.id ?? null);
       await refreshSessions();
       setPrompt("");
+      clearPromptDraft("main");
+      promptDraftUpdatedAtRef.current = readPromptDraft()?.updatedAt ?? Date.now();
       setPromptAttachments([]);
       setExternalPromptReferences([]);
       setPromptEditorText(

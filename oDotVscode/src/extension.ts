@@ -40,19 +40,35 @@ export function deactivate() {
 
 async function sendReferenceToPrompt(resource?: vscode.Uri, selectedResources?: vscode.Uri[]) {
   await runCommand(async () => {
-    const resourceItems = await collectResourceItems(resource, selectedResources);
-    if (resourceItems.length > 0) {
-      await sendItems(resourceItems, "resource");
+    const explicitResourceItems = await urisToItems(
+      normalizeResourceArgs(resource, selectedResources)
+    );
+    if (explicitResourceItems.length > 0) {
+      await sendItems(explicitResourceItems, "resource");
       return;
     }
 
     const editor = vscode.window.activeTextEditor;
-    if (!editor) {
-      throw new Error("No selected code, file, or folder was found.");
+    if (editor) {
+      const selectionItems = collectSelectionItems(editor);
+      if (selectionItems.length > 0) {
+        await sendItems(selectionItems, "selection");
+        return;
+      }
     }
 
-    const selectionItems = collectSelectionItems(editor);
-    await sendItems(selectionItems.length > 0 ? selectionItems : [documentToItem(editor.document)], "selection");
+    const inferredResourceItems = await collectResourceItems();
+    if (inferredResourceItems.length > 0) {
+      await sendItems(inferredResourceItems, "resource");
+      return;
+    }
+
+    if (editor) {
+      await sendItems([documentToItem(editor.document)], "file");
+      return;
+    }
+
+    throw new Error("No selected code, file, or folder was found.");
   });
 }
 
