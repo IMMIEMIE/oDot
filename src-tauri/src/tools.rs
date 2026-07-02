@@ -44,7 +44,15 @@ pub async fn execute_tool(
     shell_mode: &ShellMode,
     call: &ToolCallRequest,
 ) -> Result<ToolOutcome, String> {
-    execute_tool_with_mode(app, conn, session, shell_mode, call, ToolExecutionMode::Agent).await
+    execute_tool_with_mode(
+        app,
+        conn,
+        session,
+        shell_mode,
+        call,
+        ToolExecutionMode::Agent,
+    )
+    .await
 }
 
 pub async fn execute_tool_with_mode(
@@ -68,7 +76,7 @@ pub async fn execute_tool_with_mode(
     )?;
 
     match execute_tool_inner(
-        app,
+        Some(app),
         conn,
         session,
         shell_mode,
@@ -281,7 +289,13 @@ async fn approve_mcp_tool_call(
         .pointer("/pending/mcp/arguments")
         .cloned()
         .unwrap_or(Value::Null);
-    let server = find_mcp_server(app, &session.project_root, server_id)?;
+    let config_path = session_provider_config_path(conn, session);
+    let server = find_mcp_server(
+        app,
+        &session.project_root,
+        config_path.as_deref(),
+        server_id,
+    )?;
     storage::append_event(
         conn,
         &session.id,
@@ -341,7 +355,7 @@ enum ToolRun {
 }
 
 async fn execute_tool_inner(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     conn: &Connection,
     session: &SessionRecord,
     shell_mode: &ShellMode,
@@ -351,15 +365,27 @@ async fn execute_tool_inner(
     execution_mode: ToolExecutionMode,
 ) -> Result<ToolRun, String> {
     let tool_name = normalize_tool_name(&call.name);
-    if let Some(run) = execute_mcp_tool_if_matched(app, session, call, execution_mode).await? {
+    if let Some(run) = execute_mcp_tool_if_matched(app, conn, session, call, execution_mode).await?
+    {
         return Ok(run);
     }
     match tool_name.as_str() {
         "invalid" => Ok(ToolRun::Failure(invalid_tool_result(&call.input))),
-        "skill_list" => Ok(ToolRun::Success(skills::skill_list_result(&session.project_root))),
+        "skill_list" => {
+            let skill_sources = session_skill_sources(app, session);
+            Ok(ToolRun::Success(skills::skill_list_result_with_sources(
+                &session.project_root,
+                &skill_sources,
+            )))
+        }
         "skill_read" => {
             let name = required_string(&call.input, "name")?;
-            Ok(ToolRun::Success(skills::skill_read_result(&session.project_root, &name)))
+            let skill_sources = session_skill_sources(app, session);
+            Ok(ToolRun::Success(skills::skill_read_result_with_sources(
+                &session.project_root,
+                &name,
+                &skill_sources,
+            )))
         }
         "read" => {
             let path = required_string(&call.input, "path")?;
@@ -513,8 +539,18 @@ async fn execute_tool_inner(
     }
 }
 
+fn session_skill_sources(app: Option<&AppHandle>, session: &SessionRecord) -> Vec<String> {
+    app.and_then(|app| {
+        config_file::load_skill_config(app, &session.project_root, session.config_path.as_deref())
+            .ok()
+            .map(|config| config.sources)
+    })
+    .unwrap_or_default()
+}
+
 async fn execute_mcp_tool_if_matched(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
+    conn: &Connection,
     session: &SessionRecord,
     call: &ToolCallRequest,
     execution_mode: ToolExecutionMode,
@@ -522,7 +558,12 @@ async fn execute_mcp_tool_if_matched(
     if !call.name.starts_with("mcp__") {
         return Ok(None);
     }
-    let servers = config_file::load_mcp_server_configs(app, &session.project_root, None)?;
+    let Some(app) = app else {
+        return Err("MCP tool execution requires app handle".to_string());
+    };
+    let config_path = session_provider_config_path(conn, session);
+    let servers =
+        config_file::load_mcp_server_configs(app, &session.project_root, config_path.as_deref())?;
     for server in servers.iter().filter(|server| server.enabled) {
         let tools = match mcp::list_server_tools(&session.project_root, server).await {
             Ok(value) => value,
@@ -537,7 +578,10 @@ async fn execute_mcp_tool_if_matched(
             continue;
         };
         if execution_mode != ToolExecutionMode::Agent && !tool.read_only {
-            return Ok(Some(read_only_mode_mutation_blocked(execution_mode, &call.name)));
+            return Ok(Some(read_only_mode_mutation_blocked(
+                execution_mode,
+                &call.name,
+            )));
         }
         if tool.require_approval {
             return Ok(Some(ToolRun::Pending(json!({
@@ -550,7 +594,13 @@ async fn execute_mcp_tool_if_matched(
                 "reason": "MCP tool requires approval"
             }))));
         }
-        let result = mcp::call_tool(&session.project_root, server, &tool.name, call.input.clone()).await;
+        let result = mcp::call_tool(
+            &session.project_root,
+            server,
+            &tool.name,
+            call.input.clone(),
+        )
+        .await;
         return Ok(Some(match result {
             Ok(value) => ToolRun::Success(json!({
                 "serverId": server.id,
@@ -572,12 +622,19 @@ async fn execute_mcp_tool_if_matched(
 fn find_mcp_server(
     app: &AppHandle,
     project_root: &str,
+    config_path: Option<&str>,
     server_id: &str,
 ) -> Result<crate::types::McpServerConfig, String> {
-    config_file::load_mcp_server_configs(app, project_root, None)?
+    config_file::load_mcp_server_configs(app, project_root, config_path)?
         .into_iter()
         .find(|server| server.id == server_id)
         .ok_or_else(|| format!("未找到 MCP server: {server_id}"))
+}
+
+fn session_provider_config_path(conn: &Connection, session: &SessionRecord) -> Option<String> {
+    storage::get_provider(conn, &session.provider_id)
+        .ok()
+        .and_then(|provider| provider.config_path)
 }
 
 fn normalize_tool_name(name: &str) -> String {
@@ -1200,6 +1257,7 @@ mod tests {
             project_root,
             mode: AgentMode::Plan,
             provider_id: "p1".to_string(),
+            config_path: None,
             title: "test".to_string(),
             status: "active".to_string(),
             shell_mode,
@@ -1295,7 +1353,8 @@ mod tests {
         let policy = policy(&[echo_command()]);
         let event = test_event();
 
-        let result = execute_tool_inner(
+        let result = tauri::async_runtime::block_on(execute_tool_inner(
+            None,
             &conn,
             &session,
             &ShellMode::Auto,
@@ -1303,7 +1362,7 @@ mod tests {
             &call,
             &event,
             ToolExecutionMode::Plan,
-        )
+        ))
         .unwrap();
 
         match result {
@@ -1335,7 +1394,8 @@ mod tests {
         };
         let event = test_event();
 
-        let result = execute_tool_inner(
+        let result = tauri::async_runtime::block_on(execute_tool_inner(
+            None,
             &conn,
             &session,
             &ShellMode::Manual,
@@ -1343,7 +1403,7 @@ mod tests {
             &call,
             &event,
             ToolExecutionMode::Ask,
-        )
+        ))
         .unwrap();
 
         match result {
@@ -1369,7 +1429,8 @@ mod tests {
         };
         let event = test_event();
 
-        let result = execute_tool_inner(
+        let result = tauri::async_runtime::block_on(execute_tool_inner(
+            None,
             &conn,
             &session,
             &ShellMode::Manual,
@@ -1377,7 +1438,7 @@ mod tests {
             &call,
             &event,
             ToolExecutionMode::Ask,
-        )
+        ))
         .unwrap();
 
         match result {
@@ -1438,7 +1499,8 @@ mod tests {
         let policy = policy(&[]);
         let event = test_event();
 
-        let result = execute_tool_inner(
+        let result = tauri::async_runtime::block_on(execute_tool_inner(
+            None,
             &conn,
             &session,
             &ShellMode::Auto,
@@ -1446,7 +1508,7 @@ mod tests {
             &call,
             &event,
             ToolExecutionMode::Agent,
-        )
+        ))
         .unwrap();
 
         match result {

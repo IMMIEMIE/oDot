@@ -1,8 +1,9 @@
 use crate::{
     storage,
     types::{
-        McpServerConfig, OpenAiApiMode, ProviderConfigFileResponse, ProviderInput, ProviderKind,
-        ProviderPricing, ProviderRecord, ProviderRequestConfig, ToolMode,
+        McpConfigFileResponse, McpServerConfig, OpenAiApiMode, ProviderConfigFileResponse,
+        ProviderInput, ProviderKind, ProviderPricing, ProviderRecord, ProviderRequestConfig,
+        ToolMode,
     },
 };
 use serde::Deserialize;
@@ -23,6 +24,10 @@ struct ODotConfig {
     enabled_providers: Vec<String>,
     #[serde(default)]
     disabled_providers: Vec<String>,
+    #[serde(default)]
+    skills: Option<Value>,
+    #[serde(default, rename = "loadedSkills", alias = "loaded_skills")]
+    loaded_skills: Option<Value>,
     mcp: Option<ConfigMcp>,
 }
 
@@ -36,18 +41,33 @@ struct ConfigMcp {
 struct ConfigMcpServer {
     #[serde(default = "default_true")]
     enabled: bool,
-    command: String,
+    #[serde(default)]
+    disabled: Option<bool>,
+    #[serde(default)]
+    command: Option<Value>,
     #[serde(default)]
     args: Vec<String>,
-    #[serde(default)]
+    #[serde(default, alias = "environment")]
     env: HashMap<String, String>,
     cwd: Option<String>,
     #[serde(default, rename = "timeoutSeconds", alias = "timeout_seconds")]
     timeout_seconds: Option<u64>,
-    #[serde(default = "default_true", rename = "requireApproval", alias = "require_approval")]
+    #[serde(default)]
+    timeout: Option<u64>,
+    #[serde(
+        default = "default_true",
+        rename = "requireApproval",
+        alias = "require_approval"
+    )]
     require_approval: bool,
     #[serde(default, rename = "readOnly", alias = "read_only")]
     read_only: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SkillConfig {
+    pub sources: Vec<String>,
+    pub loaded: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -174,9 +194,34 @@ pub fn load_provider_request_config(
     provider_record_id: &str,
 ) -> Result<ProviderRequestConfig, String> {
     let path = provider_config_path(app, project_root, provider_record_id)?;
-    ensure_config_file(&path)?;
-    let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    resolve_provider_request_config_with_env(&content, provider_record_id, &path, |name| {
+    load_provider_request_config_from_path(&path, provider_record_id)
+}
+
+pub fn load_provider_request_config_for_session(
+    app: &AppHandle,
+    project_root: &str,
+    provider_record_id: &str,
+    config_path: Option<&str>,
+) -> Result<ProviderRequestConfig, String> {
+    let path = if config_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        resolve_config_path_from_input(app, Some(project_root), config_path)?
+    } else {
+        provider_config_path(app, project_root, provider_record_id)?
+    };
+    load_provider_request_config_from_path(&path, provider_record_id)
+}
+
+fn load_provider_request_config_from_path(
+    path: &Path,
+    provider_record_id: &str,
+) -> Result<ProviderRequestConfig, String> {
+    ensure_config_file(path)?;
+    let content = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    resolve_provider_request_config_with_env(&content, provider_record_id, path, |name| {
         env::var(name).ok()
     })
 }
@@ -198,20 +243,53 @@ pub fn load_mcp_server_configs(
     let mut servers = mcp
         .servers
         .into_iter()
-        .map(|(id, server)| McpServerConfig {
-            id,
-            enabled: server.enabled,
-            command: server.command,
-            args: server.args,
-            env: server.env,
-            cwd: server.cwd,
-            timeout_seconds: server.timeout_seconds.unwrap_or(60).clamp(1, 600),
-            require_approval: server.require_approval,
-            read_only: server.read_only,
-        })
-        .collect::<Vec<_>>();
+        .filter_map(|(id, server)| config_mcp_server(&id, server).transpose())
+        .collect::<Result<Vec<_>, _>>()?;
     servers.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(servers)
+}
+
+pub fn resolved_config_path_for_project(
+    app: &AppHandle,
+    project_root: &str,
+    config_path: Option<&str>,
+) -> Result<PathBuf, String> {
+    resolve_config_path_from_input(app, Some(project_root), config_path)
+}
+
+pub fn odot_global_skill_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let app_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    Ok(app_dir.join("skills"))
+}
+
+pub fn load_skill_config(
+    app: &AppHandle,
+    project_root: &str,
+    config_path: Option<&str>,
+) -> Result<SkillConfig, String> {
+    let global_skill_dir = odot_global_skill_dir(app)?.to_string_lossy().to_string();
+    let path = resolve_config_path_from_input(app, Some(project_root), config_path)?;
+    if !path.exists() {
+        return Ok(SkillConfig {
+            sources: vec![global_skill_dir],
+            loaded: Vec::new(),
+        });
+    }
+    let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let config = parse_config(&content)?;
+    let mut skill_config =
+        skill_config_from_values(config.skills.as_ref(), config.loaded_skills.as_ref());
+    if !skill_config
+        .sources
+        .iter()
+        .any(|source| source == &global_skill_dir)
+    {
+        skill_config.sources.insert(0, global_skill_dir);
+    }
+    Ok(skill_config)
 }
 
 pub fn save_mcp_server_entry(
@@ -219,12 +297,13 @@ pub fn save_mcp_server_entry(
     project_root: &str,
     config_path: Option<&str>,
     server: &McpServerConfig,
-) -> Result<Vec<McpServerConfig>, String> {
+) -> Result<McpConfigFileResponse, String> {
     let path = resolve_config_path_from_input(app, Some(project_root), config_path)?;
 
     let mut config: Value = if path.exists() {
         let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-        serde_json::from_str(&content).map_err(|error| format!("配置文件 JSON 解析失败: {error}"))?
+        serde_json::from_str(&content)
+            .map_err(|error| format!("配置文件 JSON 解析失败: {error}"))?
     } else {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -267,7 +346,7 @@ pub fn save_mcp_server_entry(
     let content = serde_json::to_string_pretty(&config).map_err(|error| error.to_string())?;
     fs::write(&path, format!("{content}\n")).map_err(|error| error.to_string())?;
 
-    load_mcp_server_configs(app, project_root, config_path)
+    mcp_config_file_response(app, project_root, &path, format!("{content}\n"))
 }
 
 pub fn remove_mcp_server_entry(
@@ -275,10 +354,14 @@ pub fn remove_mcp_server_entry(
     project_root: &str,
     config_path: Option<&str>,
     server_id: &str,
-) -> Result<Vec<McpServerConfig>, String> {
+) -> Result<McpConfigFileResponse, String> {
     let path = resolve_config_path_from_input(app, Some(project_root), config_path)?;
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok(McpConfigFileResponse {
+            path: path.to_string_lossy().to_string(),
+            content: String::new(),
+            mcp_servers: Vec::new(),
+        });
     }
 
     let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
@@ -296,7 +379,131 @@ pub fn remove_mcp_server_entry(
     let content = serde_json::to_string_pretty(&config).map_err(|error| error.to_string())?;
     fs::write(&path, format!("{content}\n")).map_err(|error| error.to_string())?;
 
-    load_mcp_server_configs(app, project_root, config_path)
+    mcp_config_file_response(app, project_root, &path, format!("{content}\n"))
+}
+
+fn mcp_config_file_response(
+    app: &AppHandle,
+    project_root: &str,
+    path: &Path,
+    content: String,
+) -> Result<McpConfigFileResponse, String> {
+    let path_string = path.to_string_lossy().to_string();
+    let mcp_servers = load_mcp_server_configs(app, project_root, Some(&path_string))?;
+    Ok(McpConfigFileResponse {
+        path: path_string,
+        content,
+        mcp_servers,
+    })
+}
+
+fn config_mcp_server(id: &str, server: ConfigMcpServer) -> Result<Option<McpServerConfig>, String> {
+    let Some(command_value) = server.command else {
+        return Ok(None);
+    };
+    let (command, mut command_args) = mcp_command_parts(id, command_value)?;
+    command_args.extend(server.args);
+    let timeout_seconds = mcp_timeout_seconds(server.timeout_seconds, server.timeout);
+    Ok(Some(McpServerConfig {
+        id: id.to_string(),
+        enabled: server
+            .disabled
+            .map(|value| !value)
+            .unwrap_or(server.enabled),
+        command,
+        args: command_args,
+        env: server.env,
+        cwd: server.cwd,
+        timeout_seconds,
+        require_approval: server.require_approval,
+        read_only: server.read_only,
+    }))
+}
+
+fn mcp_command_parts(id: &str, value: Value) -> Result<(String, Vec<String>), String> {
+    match value {
+        Value::String(command) if !command.trim().is_empty() => {
+            Ok((command.trim().to_string(), Vec::new()))
+        }
+        Value::Array(items) => {
+            let mut parts = items
+                .into_iter()
+                .filter_map(|item| item.as_str().map(str::trim).map(ToString::to_string))
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>();
+            if parts.is_empty() {
+                return Err(format!("MCP server '{id}' command 不能为空。"));
+            }
+            let command = parts.remove(0);
+            Ok((command, parts))
+        }
+        _ => Err(format!(
+            "MCP server '{id}' command 必须是字符串或字符串数组。"
+        )),
+    }
+}
+
+fn mcp_timeout_seconds(timeout_seconds: Option<u64>, timeout: Option<u64>) -> u64 {
+    if let Some(seconds) = timeout_seconds {
+        return seconds.clamp(1, 600);
+    }
+    match timeout {
+        Some(value) if value > 600 => value.div_ceil(1000).clamp(1, 600),
+        Some(value) => value.clamp(1, 600),
+        None => 60,
+    }
+}
+
+fn skill_config_from_values(skills: Option<&Value>, loaded_skills: Option<&Value>) -> SkillConfig {
+    let mut config = SkillConfig::default();
+    if let Some(skills) = skills {
+        match skills {
+            Value::Array(items) => config.sources.extend(string_list(items)),
+            Value::Object(object) => {
+                for key in ["sources", "paths", "dirs", "directories"] {
+                    config.sources.extend(value_string_list(object.get(key)));
+                }
+                for key in ["load", "loaded", "default", "defaults"] {
+                    config.loaded.extend(value_string_list(object.get(key)));
+                }
+            }
+            _ => {}
+        }
+    }
+    config.loaded.extend(value_string_list(loaded_skills));
+    dedupe_strings(&mut config.sources);
+    dedupe_strings(&mut config.loaded);
+    config
+}
+
+fn value_string_list(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::Array(items)) => string_list(items),
+        Some(Value::String(item)) => {
+            let trimmed = item.trim();
+            if trimmed.is_empty() {
+                Vec::new()
+            } else {
+                vec![trimmed.to_string()]
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn string_list(items: &[Value]) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn dedupe_strings(items: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    items.retain(|item| seen.insert(item.clone()));
 }
 
 fn sync_provider_config(
@@ -921,6 +1128,13 @@ fn default_config() -> &'static str {
     r#"{
   "$schema": "https://opencode.ai/config.json",
   "model": "openai/gpt-4.1-mini",
+  "skills": {
+    "sources": [],
+    "load": []
+  },
+  "mcp": {
+    "servers": {}
+  },
   "provider": {
     "openai": {
       "name": "OpenAI",

@@ -26,8 +26,8 @@ use std::{
 };
 use tauri::{AppHandle, Emitter};
 use types::{
-    ContextSummaryRecord, CreateSessionInput, EventRecord, McpServerConfig, McpToolDefinition,
-    PersistPlanInput, ProjectCapabilities, ProjectCapabilityError, ProjectFile,
+    ContextSummaryRecord, CreateSessionInput, EventRecord, McpConfigFileResponse, McpServerConfig,
+    McpToolDefinition, PersistPlanInput, ProjectCapabilities, ProjectCapabilityError, ProjectFile,
     PromptSessionInput, ProviderConfigFileResponse, ProviderInput, ProviderRecord,
     RecoverBackgroundTaskInput, RecoverSessionInput, ReplyPermissionInput, RevealPathInput,
     SessionEventsResponse, SessionRecord, ShellPolicy, SkillRecord, SnapshotRecord,
@@ -178,27 +178,48 @@ async fn list_project_capabilities(
     config_path: Option<String>,
 ) -> Result<ProjectCapabilities, String> {
     let mut errors = Vec::new();
-    let skills = match skills::list_project_skills(&project_root) {
+    let resolved_config_path =
+        config_file::resolved_config_path_for_project(&app, &project_root, config_path.as_deref())?;
+    let resolved_config_path_string = resolved_config_path.to_string_lossy().to_string();
+    let skill_config = match config_file::load_skill_config(
+        &app,
+        &project_root,
+        Some(&resolved_config_path_string),
+    ) {
         Ok(value) => value,
         Err(error) => {
             errors.push(ProjectCapabilityError {
                 source: "skills".to_string(),
                 message: error,
             });
-            Vec::new()
+            config_file::SkillConfig::default()
         }
     };
-    let mcp_servers =
-        match config_file::load_mcp_server_configs(&app, &project_root, config_path.as_deref()) {
+    let skills =
+        match skills::list_project_skills_with_sources(&project_root, &skill_config.sources) {
             Ok(value) => value,
             Err(error) => {
                 errors.push(ProjectCapabilityError {
-                    source: "mcp".to_string(),
+                    source: "skills".to_string(),
                     message: error,
                 });
                 Vec::new()
             }
         };
+    let mcp_servers = match config_file::load_mcp_server_configs(
+        &app,
+        &project_root,
+        Some(&resolved_config_path_string),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            errors.push(ProjectCapabilityError {
+                source: "mcp".to_string(),
+                message: error,
+            });
+            Vec::new()
+        }
+    };
     let mut mcp_tools = Vec::new();
     for server in &mcp_servers {
         match mcp::list_server_tools(&project_root, server).await {
@@ -210,6 +231,7 @@ async fn list_project_capabilities(
         }
     }
     Ok(ProjectCapabilities {
+        config_path: resolved_config_path_string,
         skills,
         mcp_servers,
         mcp_tools,
@@ -223,7 +245,7 @@ fn save_mcp_server(
     project_root: String,
     config_path: Option<String>,
     server: McpServerConfig,
-) -> Result<Vec<McpServerConfig>, String> {
+) -> Result<McpConfigFileResponse, String> {
     config_file::save_mcp_server_entry(&app, &project_root, config_path.as_deref(), &server)
 }
 
@@ -233,7 +255,7 @@ fn delete_mcp_server(
     project_root: String,
     config_path: Option<String>,
     server_id: String,
-) -> Result<Vec<McpServerConfig>, String> {
+) -> Result<McpConfigFileResponse, String> {
     config_file::remove_mcp_server_entry(&app, &project_root, config_path.as_deref(), &server_id)
 }
 
@@ -247,26 +269,33 @@ async fn test_mcp_connection(
 
 #[tauri::command]
 fn import_skill(
+    app: AppHandle,
     project_root: String,
     source_path: String,
 ) -> Result<SkillRecord, String> {
-    skills::import_skill(&project_root, &source_path)
+    let global_dir = config_file::odot_global_skill_dir(&app)?;
+    skills::import_skill_to_dir(&project_root, &global_dir, &source_path)
 }
 
 #[tauri::command]
-fn delete_skill(
-    project_root: String,
-    skill_path: String,
-) -> Result<(), String> {
-    skills::delete_skill(&project_root, &skill_path)
+fn delete_skill(app: AppHandle, _project_root: String, skill_path: String) -> Result<(), String> {
+    let global_dir = config_file::odot_global_skill_dir(&app)?;
+    skills::delete_skill_from_dir(&global_dir, &skill_path)
 }
 
 #[tauri::command]
 fn read_skill_content(
+    app: AppHandle,
     project_root: String,
+    config_path: Option<String>,
     name_or_path: String,
 ) -> Result<serde_json::Value, String> {
-    let (skill, content) = skills::read_project_skill(&project_root, &name_or_path)?;
+    let skill_config = config_file::load_skill_config(&app, &project_root, config_path.as_deref())?;
+    let (skill, content) = skills::read_project_skill_with_sources(
+        &project_root,
+        &name_or_path,
+        &skill_config.sources,
+    )?;
     Ok(serde_json::json!({
         "name": skill.name,
         "description": skill.description,
@@ -288,6 +317,12 @@ fn list_sessions(app: AppHandle) -> Result<Vec<SessionRecord>, String> {
 }
 
 #[tauri::command]
+fn get_session(app: AppHandle, session_id: String) -> Result<SessionRecord, String> {
+    let conn = storage::open_db(&app)?;
+    storage::get_session(&conn, &session_id)
+}
+
+#[tauri::command]
 fn delete_session(app: AppHandle, session_id: String) -> Result<(), String> {
     let conn = storage::open_db(&app)?;
     storage::delete_session(&conn, &session_id)
@@ -304,6 +339,12 @@ fn update_session_title(
     app: AppHandle,
     input: UpdateSessionTitleInput,
 ) -> Result<SessionRecord, String> {
+    let conn = storage::open_db(&app)?;
+    storage::update_session_title(&conn, &input.session_id, &input.title)
+}
+
+#[tauri::command]
+fn rename_session(app: AppHandle, input: UpdateSessionTitleInput) -> Result<SessionRecord, String> {
     let conn = storage::open_db(&app)?;
     storage::update_session_title(&conn, &input.session_id, &input.title)
 }
@@ -733,9 +774,11 @@ pub fn run() {
             read_skill_content,
             create_session,
             list_sessions,
+            get_session,
             delete_session,
             cancel_session,
             update_session_title,
+            rename_session,
             update_session_mode,
             get_session_events,
             tail_session_events,

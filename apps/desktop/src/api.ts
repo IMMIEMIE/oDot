@@ -92,10 +92,17 @@ export type ProjectCapabilityError = {
 };
 
 export type ProjectCapabilities = {
+  configPath: string;
   skills: SkillRecord[];
   mcpServers: McpServerConfig[];
   mcpTools: McpToolDefinition[];
   errors: ProjectCapabilityError[];
+};
+
+export type McpConfigFileResponse = {
+  path: string;
+  content: string;
+  mcpServers: McpServerConfig[];
 };
 
 export type CreateSessionInput = {
@@ -103,6 +110,7 @@ export type CreateSessionInput = {
   mode: AgentMode;
   providerId: string;
   shellMode: ShellMode;
+  configPath?: string | null;
   title?: string;
   parentSessionId?: string | null;
 };
@@ -113,6 +121,7 @@ export type SessionRecord = {
   projectRoot: string;
   mode: AgentMode;
   providerId: string;
+  configPath?: string | null;
   title: string;
   status: string;
   shellMode: ShellMode;
@@ -300,9 +309,9 @@ export async function saveMcpServer(
   projectRoot: string,
   server: McpServerConfig,
   configPath?: string | null
-): Promise<McpServerConfig[]> {
+): Promise<McpConfigFileResponse> {
   assertTauri();
-  return invoke<McpServerConfig[]>("save_mcp_server", {
+  return invoke<McpConfigFileResponse>("save_mcp_server", {
     projectRoot,
     configPath: configPath?.trim() || null,
     server
@@ -313,9 +322,9 @@ export async function deleteMcpServer(
   projectRoot: string,
   serverId: string,
   configPath?: string | null
-): Promise<McpServerConfig[]> {
+): Promise<McpConfigFileResponse> {
   assertTauri();
-  return invoke<McpServerConfig[]>("delete_mcp_server", {
+  return invoke<McpConfigFileResponse>("delete_mcp_server", {
     projectRoot,
     configPath: configPath?.trim() || null,
     serverId
@@ -378,6 +387,11 @@ export async function listSessions(): Promise<SessionRecord[]> {
   return invoke<SessionRecord[]>("list_sessions");
 }
 
+export async function getSession(sessionId: string): Promise<SessionRecord> {
+  assertTauri();
+  return invoke<SessionRecord>("get_session", { sessionId });
+}
+
 export async function deleteSession(sessionId: string): Promise<void> {
   assertTauri();
   return invoke<void>("delete_session", { sessionId });
@@ -394,6 +408,14 @@ export async function updateSessionTitle(input: {
 }): Promise<SessionRecord> {
   assertTauri();
   return invoke<SessionRecord>("update_session_title", { input });
+}
+
+export async function renameSession(input: {
+  sessionId: string;
+  title: string;
+}): Promise<SessionRecord> {
+  assertTauri();
+  return invoke<SessionRecord>("rename_session", { input });
 }
 
 export async function updateSessionMode(input: {

@@ -56,7 +56,11 @@ pub async fn call_tool(
 }
 
 pub fn exposed_tool_name(server_id: &str, tool_name: &str) -> String {
-    format!("mcp__{}__{}", sanitize_name(server_id), sanitize_name(tool_name))
+    format!(
+        "mcp__{}__{}",
+        sanitize_name(server_id),
+        sanitize_name(tool_name)
+    )
 }
 
 fn tool_definition(server: &McpServerConfig, tool: &Value) -> Option<McpToolDefinition> {
@@ -197,7 +201,11 @@ fn resolve_cwd(project_root: &str, cwd: Option<&str>) -> Result<PathBuf, String>
     let root = PathBuf::from(project_root);
     let cwd = cwd.unwrap_or(".");
     let path = PathBuf::from(cwd);
-    let resolved = if path.is_absolute() { path } else { root.join(path) };
+    let resolved = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
     ensure_within_project(&root, &resolved)
 }
 

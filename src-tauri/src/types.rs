@@ -230,6 +230,7 @@ pub struct CreateSessionInput {
     pub mode: AgentMode,
     pub provider_id: String,
     pub shell_mode: ShellMode,
+    pub config_path: Option<String>,
     pub title: Option<String>,
     pub parent_session_id: Option<String>,
 }
@@ -242,6 +243,7 @@ pub struct SessionRecord {
     pub project_root: String,
     pub mode: AgentMode,
     pub provider_id: String,
+    pub config_path: Option<String>,
     pub title: String,
     pub status: String,
     pub shell_mode: ShellMode,
@@ -516,10 +518,19 @@ pub struct ProjectCapabilityError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectCapabilities {
+    pub config_path: String,
     pub skills: Vec<SkillRecord>,
     pub mcp_servers: Vec<McpServerConfig>,
     pub mcp_tools: Vec<McpToolDefinition>,
     pub errors: Vec<ProjectCapabilityError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpConfigFileResponse {
+    pub path: String,
+    pub content: String,
+    pub mcp_servers: Vec<McpServerConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

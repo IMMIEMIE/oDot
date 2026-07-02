@@ -1,28 +1,34 @@
-use crate::types::{LoadedSkill, SkillRecord};
+﻿use crate::types::{LoadedSkill, SkillRecord};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
-    fs,
+    collections::{HashMap, HashSet},
+    env, fs,
     path::{Path, PathBuf},
 };
 
-const SKILLS_DIR: &str = ".odot/skills";
 const SKILL_FILE: &str = "SKILL.md";
 const MAX_SKILL_BYTES: u64 = 256 * 1024;
 
-pub fn list_project_skills(project_root: &str) -> Result<Vec<SkillRecord>, String> {
+pub fn list_project_skills_with_sources(
+    project_root: &str,
+    extra_sources: &[String],
+) -> Result<Vec<SkillRecord>, String> {
     let root = PathBuf::from(project_root);
-    let skills_root = root.join(SKILLS_DIR);
     let mut records = Vec::new();
-    if !skills_root.exists() {
-        return Ok(records);
+    for skills_root in skill_source_dirs(&root, extra_sources) {
+        if skills_root.exists() {
+            scan_skill_dir(&root, &skills_root, &mut records)?;
+        }
     }
-    scan_skill_dir(&root, &skills_root, &mut records)?;
     disambiguate_skill_names(records)
 }
 
-pub fn read_project_skill(project_root: &str, name_or_path: &str) -> Result<(SkillRecord, String), String> {
-    let skills = list_project_skills(project_root)?;
+pub fn read_project_skill_with_sources(
+    project_root: &str,
+    name_or_path: &str,
+    extra_sources: &[String],
+) -> Result<(SkillRecord, String), String> {
+    let skills = list_project_skills_with_sources(project_root, extra_sources)?;
     let query = normalize_slashes(name_or_path.trim());
     let skill = skills
         .iter()
@@ -32,21 +38,25 @@ pub fn read_project_skill(project_root: &str, name_or_path: &str) -> Result<(Ski
                 || skill.path.trim_end_matches("/SKILL.md") == query
         })
         .cloned()
-        .ok_or_else(|| format!("未找到 Skill: {name_or_path}"))?;
-    let path = ensure_skill_path(project_root, &skill.path)?;
+        .ok_or_else(|| format!("鏈壘鍒?Skill: {name_or_path}"))?;
+    let path = ensure_skill_path(project_root, &skill.path, extra_sources)?;
     let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
     Ok((skill, content))
 }
 
-pub fn skill_list_result(project_root: &str) -> Value {
-    match list_project_skills(project_root) {
+pub fn skill_list_result_with_sources(project_root: &str, extra_sources: &[String]) -> Value {
+    match list_project_skills_with_sources(project_root, extra_sources) {
         Ok(skills) => json!({ "skills": skills }),
         Err(error) => json!({ "error": error }),
     }
 }
 
-pub fn skill_read_result(project_root: &str, name_or_path: &str) -> Value {
-    match read_project_skill(project_root, name_or_path) {
+pub fn skill_read_result_with_sources(
+    project_root: &str,
+    name_or_path: &str,
+    extra_sources: &[String],
+) -> Value {
+    match read_project_skill_with_sources(project_root, name_or_path, extra_sources) {
         Ok((skill, content)) => json!({
             "name": skill.name,
             "description": skill.description,
@@ -57,16 +67,20 @@ pub fn skill_read_result(project_root: &str, name_or_path: &str) -> Value {
     }
 }
 
-pub fn import_skill(project_root: &str, source_path: &str) -> Result<SkillRecord, String> {
+pub fn import_skill_to_dir(
+    project_root: &str,
+    skills_root: &Path,
+    source_path: &str,
+) -> Result<SkillRecord, String> {
     let source = PathBuf::from(source_path);
     if !source.exists() {
-        return Err(format!("源文件不存在: {source_path}"));
+        return Err(format!("Source file does not exist: {source_path}"));
     }
 
     let content = fs::read_to_string(&source).map_err(|error| error.to_string())?;
     if content.len() as u64 > MAX_SKILL_BYTES {
         return Err(format!(
-            "Skill 文件过大（最大 {}KB）。",
+            "Skill file is too large (max {}KB).",
             MAX_SKILL_BYTES / 1024
         ));
     }
@@ -85,7 +99,6 @@ pub fn import_skill(project_root: &str, source_path: &str) -> Result<SkillRecord
         .unwrap_or(fallback_name);
 
     let dir_name = sanitize_dir_name(&skill_name);
-    let skills_root = PathBuf::from(project_root).join(SKILLS_DIR);
     let target_dir = skills_root.join(&dir_name);
     let target_file = target_dir.join(SKILL_FILE);
 
@@ -93,7 +106,7 @@ pub fn import_skill(project_root: &str, source_path: &str) -> Result<SkillRecord
     fs::write(&target_file, &content).map_err(|error| error.to_string())?;
 
     let root = PathBuf::from(project_root);
-    let rel = relative_skill_path(&root, &target_file)?;
+    let rel = skill_record_path(&root, &target_file)?;
 
     Ok(SkillRecord {
         name: skill_name,
@@ -102,32 +115,59 @@ pub fn import_skill(project_root: &str, source_path: &str) -> Result<SkillRecord
     })
 }
 
-pub fn delete_skill(project_root: &str, skill_path: &str) -> Result<(), String> {
+pub fn delete_skill_from_dir(skills_root: &Path, skill_path: &str) -> Result<(), String> {
     let normalized = normalize_slashes(skill_path.trim());
-    if !normalized.starts_with(".odot/skills/") || !normalized.ends_with("/SKILL.md") {
-        return Err("Skill 路径必须位于 .odot/skills/**/SKILL.md。".to_string());
-    }
     if normalized.contains("..") {
-        return Err("Skill 路径不能包含 ..。".to_string());
+        return Err("Skill path cannot contain '..'.".to_string());
     }
-
-    let root = fs::canonicalize(project_root).map_err(|error| error.to_string())?;
-    let full_path = root.join(&normalized);
-
+    let root = fs::canonicalize(skills_root).map_err(|error| error.to_string())?;
+    let raw_path = PathBuf::from(&normalized);
+    let full_path = if raw_path.is_absolute() {
+        raw_path
+    } else {
+        root.join(&normalized)
+    };
     if !full_path.exists() {
-        return Err(format!("Skill 文件不存在: {skill_path}"));
+        return Err(format!("Skill file does not exist: {skill_path}"));
     }
-
     let canonical = fs::canonicalize(&full_path).map_err(|error| error.to_string())?;
-    if !canonical.starts_with(&root) {
-        return Err("Skill 路径越界。".to_string());
+    if canonical.file_name().and_then(|value| value.to_str()) != Some(SKILL_FILE) {
+        return Err("Skill file must be named SKILL.md.".to_string());
     }
-
-    let skill_dir = full_path
+    if !canonical.starts_with(&root) {
+        return Err("Skill path is outside the global skills directory.".to_string());
+    }
+    let skill_dir = canonical
         .parent()
-        .ok_or_else(|| "无法获取 Skill 目录。".to_string())?;
-
+        .ok_or_else(|| "Unable to resolve Skill directory.".to_string())?;
     fs::remove_dir_all(skill_dir).map_err(|error| error.to_string())
+}
+
+pub fn resolve_loaded_skills(
+    project_root: &str,
+    refs: &[String],
+    extra_sources: &[String],
+) -> Result<Vec<LoadedSkill>, String> {
+    let skills = list_project_skills_with_sources(project_root, extra_sources)?;
+    let mut loaded = Vec::new();
+    let mut seen = HashSet::new();
+    for item in refs {
+        let query = normalize_slashes(item.trim());
+        let Some(skill) = skills.iter().find(|skill| {
+            skill.name == item.trim()
+                || skill.path == query
+                || skill.path.trim_end_matches("/SKILL.md") == query
+        }) else {
+            continue;
+        };
+        if seen.insert(skill.path.clone()) {
+            loaded.push(LoadedSkill {
+                name: skill.name.clone(),
+                path: skill.path.clone(),
+            });
+        }
+    }
+    Ok(loaded)
 }
 
 fn sanitize_dir_name(name: &str) -> String {
@@ -147,7 +187,11 @@ fn sanitize_dir_name(name: &str) -> String {
     }
 }
 
-pub fn loaded_skills_context(project_root: &str, loaded: &[LoadedSkill]) -> String {
+pub fn loaded_skills_context_with_sources(
+    project_root: &str,
+    loaded: &[LoadedSkill],
+    extra_sources: &[String],
+) -> String {
     if loaded.is_empty() {
         return String::new();
     }
@@ -158,7 +202,7 @@ pub fn loaded_skills_context(project_root: &str, loaded: &[LoadedSkill]) -> Stri
         } else {
             item.path.as_str()
         };
-        match read_project_skill(project_root, key) {
+        match read_project_skill_with_sources(project_root, key, extra_sources) {
             Ok((skill, content)) => blocks.push(format!(
                 "<skill name=\"{}\" path=\"{}\">\n{}\n</skill>",
                 escape_attr(&skill.name),
@@ -176,8 +220,8 @@ pub fn loaded_skills_context(project_root: &str, loaded: &[LoadedSkill]) -> Stri
     format!("Loaded skills:\n{}", blocks.join("\n\n"))
 }
 
-pub fn skill_catalog_prompt(project_root: &str) -> String {
-    match list_project_skills(project_root) {
+pub fn skill_catalog_prompt_with_sources(project_root: &str, extra_sources: &[String]) -> String {
+    match list_project_skills_with_sources(project_root, extra_sources) {
         Ok(skills) if !skills.is_empty() => {
             let lines = skills
                 .iter()
@@ -186,8 +230,70 @@ pub fn skill_catalog_prompt(project_root: &str) -> String {
                 .join("\n");
             format!("Project skills available via skill_list/skill_read:\n{lines}")
         }
-        _ => "Project skills: none found in .odot/skills.".to_string(),
+        _ => "Project skills: none found.".to_string(),
     }
+}
+
+fn skill_source_dirs(root: &Path, extra_sources: &[String]) -> Vec<PathBuf> {
+    let mut dirs = vec![
+        root.join(".odot").join("skills"),
+        root.join(".opencode").join("skills"),
+        root.join(".claude").join("skills"),
+        root.join(".agents").join("skills"),
+    ];
+    if let Some(home) = home_dir() {
+        dirs.push(home.join(".config").join("opencode").join("skills"));
+        dirs.push(home.join(".claude").join("skills"));
+        dirs.push(home.join(".agents").join("skills"));
+    }
+    dirs.extend(extra_sources.iter().filter_map(|source| {
+        if source.starts_with("http://") || source.starts_with("https://") {
+            return None;
+        }
+        let expanded = expand_home(source)?;
+        let path = PathBuf::from(expanded);
+        Some(if path.is_absolute() {
+            path
+        } else {
+            root.join(path)
+        })
+    }));
+    dedupe_paths(dirs)
+}
+
+fn home_dir() -> Option<PathBuf> {
+    env::var("USERPROFILE")
+        .or_else(|_| env::var("HOME"))
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+fn expand_home(source: &str) -> Option<String> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed == "~" {
+        return home_dir().map(|path| path.to_string_lossy().to_string());
+    }
+    trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix("~\\"))
+        .and_then(|rest| home_dir().map(|home| home.join(rest).to_string_lossy().to_string()))
+        .or_else(|| Some(trimmed.to_string()))
+}
+
+fn dedupe_paths(dirs: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for dir in dirs {
+        let key = normalize_slashes(&dir.to_string_lossy()).to_ascii_lowercase();
+        if seen.insert(key) {
+            result.push(dir);
+        }
+    }
+    result
 }
 
 fn scan_skill_dir(root: &Path, dir: &Path, records: &mut Vec<SkillRecord>) -> Result<(), String> {
@@ -204,7 +310,7 @@ fn scan_skill_dir(root: &Path, dir: &Path, records: &mut Vec<SkillRecord>) -> Re
         if path.metadata().map_err(|error| error.to_string())?.len() > MAX_SKILL_BYTES {
             continue;
         }
-        let rel = relative_skill_path(root, &path)?;
+        let rel = skill_record_path(root, &path)?;
         let content = fs::read_to_string(&path).map_err(|error| error.to_string())?;
         let metadata = parse_skill_metadata(&content);
         let fallback_name = path
@@ -264,39 +370,59 @@ fn parse_skill_metadata(content: &str) -> HashMap<String, String> {
             continue;
         };
         current_key = key.trim().to_string();
-        result.insert(current_key.clone(), value.trim().trim_matches('"').to_string());
+        result.insert(
+            current_key.clone(),
+            value.trim().trim_matches('"').to_string(),
+        );
     }
     result
 }
 
-fn ensure_skill_path(project_root: &str, relative: &str) -> Result<PathBuf, String> {
+fn ensure_skill_path(
+    project_root: &str,
+    relative: &str,
+    extra_sources: &[String],
+) -> Result<PathBuf, String> {
     let normalized = normalize_slashes(relative);
-    if !normalized.starts_with(".odot/skills/") || !normalized.ends_with("/SKILL.md") {
-        return Err("Skill 路径必须位于 .odot/skills/**/SKILL.md。".to_string());
-    }
     if normalized.contains("..") {
-        return Err("Skill 路径不能包含 ..。".to_string());
+        return Err("Skill path cannot contain '..'.".to_string());
     }
     let root = fs::canonicalize(project_root).map_err(|error| error.to_string())?;
-    let path = fs::canonicalize(root.join(&normalized)).map_err(|error| error.to_string())?;
-    if !path.starts_with(&root) {
-        return Err("Skill 路径越界。".to_string());
+    let raw_path = PathBuf::from(&normalized);
+    let candidate = if raw_path.is_absolute() {
+        raw_path
+    } else {
+        root.join(&normalized)
+    };
+    let path = fs::canonicalize(candidate).map_err(|error| error.to_string())?;
+    if path.file_name().and_then(|value| value.to_str()) != Some(SKILL_FILE) {
+        return Err("Skill file must be named SKILL.md.".to_string());
+    }
+    let allowed = skill_source_dirs(&root, extra_sources)
+        .into_iter()
+        .filter_map(|dir| fs::canonicalize(dir).ok())
+        .any(|dir| path.starts_with(dir));
+    if !allowed {
+        return Err("Skill path is outside allowed skill sources.".to_string());
     }
     Ok(path)
 }
 
-fn relative_skill_path(root: &Path, path: &Path) -> Result<String, String> {
+fn skill_record_path(root: &Path, path: &Path) -> Result<String, String> {
     let root = fs::canonicalize(root).map_err(|error| error.to_string())?;
     let path = fs::canonicalize(path).map_err(|error| error.to_string())?;
-    if !path.starts_with(&root) {
-        return Err("Skill 路径越界。".to_string());
+    if path.starts_with(&root) {
+        let relative = path.strip_prefix(root).map_err(|error| error.to_string())?;
+        return Ok(normalize_slashes(&relative.to_string_lossy()));
     }
-    let relative = path.strip_prefix(root).map_err(|error| error.to_string())?;
-    Ok(normalize_slashes(&relative.to_string_lossy()))
+    Ok(normalize_slashes(&path.to_string_lossy()))
 }
 
 fn normalize_slashes(value: &str) -> String {
-    value.replace('\\', "/").trim_start_matches("./").to_string()
+    value
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_string()
 }
 
 fn escape_attr(value: &str) -> String {

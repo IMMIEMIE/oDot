@@ -87,6 +87,7 @@ import {
   type BackgroundJobRecord,
   type EventRecord,
   type LoadedSkill,
+  type McpConfigFileResponse,
   type McpServerConfig,
   type McpToolDefinition,
   type PermissionRequestRecord,
@@ -478,9 +479,9 @@ export function App() {
       setProjectCapabilities(null);
       return;
     }
-    void listProjectCapabilities(projectRoot, configPath || selectedConfigPathForProject(projectRoot))
+    void refreshProjectCapabilities(projectRoot, configPath || selectedConfigPathForProject(projectRoot))
       .then((capabilities) => {
-        if (!disposed) {
+        if (!disposed && capabilities) {
           setProjectCapabilities(capabilities);
         }
       })
@@ -829,7 +830,42 @@ export function App() {
     if (preferredProviderId) {
       setSelectedProviderId(preferredProviderId);
     }
+    await refreshProjectCapabilities(projectRoot, config.path);
     return config;
+  }
+
+  async function refreshProjectCapabilities(
+    root = projectRoot,
+    targetConfigPath: string | null | undefined = configPath || selectedConfigPathForProject(root)
+  ) {
+    if (!root.trim()) {
+      setProjectCapabilities(null);
+      return null;
+    }
+    const capabilities = await listProjectCapabilities(root, targetConfigPath || null);
+    setProjectCapabilities(capabilities);
+    if (capabilities.configPath.trim() && root.trim() === projectRoot.trim()) {
+      setConfigPath(capabilities.configPath);
+      rememberConfigPathForProject(root, capabilities.configPath);
+    }
+    return capabilities;
+  }
+
+  function syncMcpConfigContent(response: McpConfigFileResponse) {
+    setConfigContent(response.content);
+    setProjectCapabilities((current) =>
+      current
+        ? {
+            ...current,
+            configPath: response.path,
+            mcpServers: response.mcpServers
+          }
+        : current
+    );
+    if (response.path.trim()) {
+      setConfigPath(response.path);
+      rememberConfigPathForProject(projectRoot, response.path);
+    }
   }
 
   async function handleSetupComplete(content: string) {
@@ -864,11 +900,16 @@ export function App() {
   }
 
   async function selectSession(session: SessionRecord) {
+    const sessionConfigPath =
+      session.configPath ||
+      selectedConfigPathForProject(session.projectRoot) ||
+      (session.projectRoot === projectRoot ? configPath : null);
     const config = await loadProviderConfig(
       session.projectRoot,
-      selectedConfigPathForProject(session.projectRoot)
+      sessionConfigPath
     );
     setConfigPath(config.path);
+    rememberConfigPathForProject(session.projectRoot, config.path);
     setConfigContent(config.content);
     setProviders(config.providers);
 
@@ -876,13 +917,18 @@ export function App() {
     setProjectRoot(session.projectRoot);
     setMode(session.mode);
     setShellMode(session.shellMode);
+    setLoadedSkills([]);
     const sessionProviderExists = config.providers.some(
       (provider) => provider.id === session.providerId
     );
     setSelectedProviderId(
       sessionProviderExists ? session.providerId : preferredConfigProviderId(config)
     );
-    await Promise.all([loadEvents(session.id), loadFiles(session.projectRoot)]);
+    await Promise.all([
+      loadEvents(session.id),
+      loadFiles(session.projectRoot),
+      refreshProjectCapabilities(session.projectRoot, config.path)
+    ]);
     if (!sessionProviderExists) {
       setNotice({ tone: "error", text: t("notice.sessionProviderMissing") });
     }
@@ -1018,13 +1064,14 @@ export function App() {
         projectRoot,
         mode,
         providerId: selectedProviderId,
-        shellMode,
-        title: projectRoot.split(/[\\/]/).filter(Boolean).pop()
-      });
+      shellMode,
+      configPath: configPath || selectedConfigPathForProject(projectRoot) || null
+    });
       await refreshSessions();
       setSelectedSessionId(session.id);
       setNotice({ tone: "success", text: t("notice.sessionCreated") });
       setEventsResponse(EMPTY_EVENTS);
+      await refreshProjectCapabilities(projectRoot, configPath || selectedConfigPathForProject(projectRoot));
       return session;
     } catch (error) {
       reportError(error);
@@ -2580,13 +2627,10 @@ export function App() {
           onClose={() => setIsSettingsOpen(false)}
           onSave={saveSettings}
           onLoadConfigFile={loadSettingsConfigFile}
-          onRefreshCapabilities={async () => {
-            if (!projectRoot) return;
-            try {
-              const caps = await listProjectCapabilities(projectRoot, configPath || null);
-              setProjectCapabilities(caps);
-            } catch { /* ignore */ }
-          }}
+          onRefreshCapabilities={(targetConfigPath) =>
+            refreshProjectCapabilities(projectRoot, targetConfigPath || configPath || null)
+          }
+          onMcpConfigChanged={syncMcpConfigContent}
         />
       )}
       {isSessionsOpen && (
@@ -2652,7 +2696,8 @@ function SettingsModal({
   onClose,
   onSave,
   onLoadConfigFile,
-  onRefreshCapabilities
+  onRefreshCapabilities,
+  onMcpConfigChanged
 }: {
   configPath: string;
   configContent: string;
@@ -2669,7 +2714,8 @@ function SettingsModal({
   onClose: () => void;
   onSave: (content: string, policy: ShellPolicy, configPath?: string | null) => Promise<void>;
   onLoadConfigFile: (configPath: string) => Promise<ProviderConfigFileResponse>;
-  onRefreshCapabilities: () => Promise<void>;
+  onRefreshCapabilities: (configPath?: string | null) => Promise<ProjectCapabilities | null>;
+  onMcpConfigChanged: (response: McpConfigFileResponse) => void;
 }) {
   const { t } = useTranslation();
   const initial = parseProviderSettings(configContent, selectedProviderId);
@@ -2875,6 +2921,7 @@ function SettingsModal({
       setSelectedConfigPath(config.path);
       setJsonText(config.content);
       syncFromParsed(config.content, config.selectedProviderId ?? "");
+      await syncPersistedCapabilities(config.path);
     } catch (loadError) {
       setError(errorMessage(loadError));
     }
@@ -2932,6 +2979,28 @@ function SettingsModal({
     };
   }
 
+  async function syncPersistedCapabilities(targetConfigPath = selectedConfigPath) {
+    const capabilities = await onRefreshCapabilities(targetConfigPath || null);
+    if (capabilities) {
+      setSelectedConfigPath(capabilities.configPath);
+      setMcpServers(capabilities.mcpServers);
+      setSkills(capabilities.skills);
+      setSkillExpanded((current) =>
+        current && capabilities.skills.some((skill) => skill.path === current)
+          ? current
+          : null
+      );
+    }
+    return capabilities;
+  }
+
+  function applyPersistedMcpServers(response: McpConfigFileResponse) {
+    setSelectedConfigPath(response.path);
+    setMcpServers(response.mcpServers);
+    setJsonText(response.content);
+    onMcpConfigChanged(response);
+  }
+
   async function handleMcpSave() {
     setError("");
     const server = mcpFormToServer();
@@ -2941,11 +3010,11 @@ function SettingsModal({
       setError(t("settings.mcpDuplicateId", { id: server.id })); return;
     }
     try {
-      const updated = await saveMcpServer(projectRoot, server, selectedConfigPath || null);
-      setMcpServers(updated);
+      const response = await saveMcpServer(projectRoot, server, selectedConfigPath || null);
+      applyPersistedMcpServers(response);
       setMcpEditing(null);
       setMcpShowJsonImport(false);
-      await onRefreshCapabilities();
+      await syncPersistedCapabilities(response.path);
     } catch (e) { setError(errorMessage(e)); }
   }
 
@@ -2953,10 +3022,10 @@ function SettingsModal({
     setError("");
     if (!window.confirm(t("settings.mcpConfirmDelete", { id }))) return;
     try {
-      const updated = await deleteMcpServer(projectRoot, id, selectedConfigPath || null);
-      setMcpServers(updated);
+      const response = await deleteMcpServer(projectRoot, id, selectedConfigPath || null);
+      applyPersistedMcpServers(response);
       if (mcpEditing?.id === id) setMcpEditing(null);
-      await onRefreshCapabilities();
+      await syncPersistedCapabilities(response.path);
     } catch (e) { setError(errorMessage(e)); }
   }
 
@@ -2996,26 +3065,18 @@ function SettingsModal({
       }
       const entries = Object.entries(serversMap);
       if (entries.length === 0) { setError(t("settings.mcpImportNoServers")); return; }
-      let updated = mcpServers;
+      let response: McpConfigFileResponse | null = null;
       for (const [id, config] of entries) {
-        const server: McpServerConfig = {
-          id,
-          enabled: (config.enabled as boolean) ?? true,
-          command: (config.command as string) || "",
-          args: (config.args as string[]) || [],
-          env: (config.env as Record<string, string>) || {},
-          cwd: (config.cwd as string) || null,
-          timeoutSeconds: (config.timeoutSeconds as number) || 60,
-          requireApproval: (config.requireApproval as boolean) ?? true,
-          readOnly: (config.readOnly as boolean) ?? false
-        };
+        const server = mcpServerFromImport(id, config);
+        if (!server) continue;
         if (!server.command) continue;
-        updated = await saveMcpServer(projectRoot, server, selectedConfigPath || null);
+        response = await saveMcpServer(projectRoot, server, selectedConfigPath || null);
       }
-      setMcpServers(updated);
+      if (!response) { setError(t("settings.mcpImportNoServers")); return; }
+      applyPersistedMcpServers(response);
       setMcpJsonText("");
       setMcpShowJsonImport(false);
-      await onRefreshCapabilities();
+      await syncPersistedCapabilities(response.path);
     } catch (e) { setError(errorMessage(e)); }
   }
 
@@ -3029,7 +3090,7 @@ function SettingsModal({
         const filtered = prev.filter((s) => s.path !== record.path);
         return [...filtered, record];
       });
-      await onRefreshCapabilities();
+      await syncPersistedCapabilities();
     } catch (e) { setError(errorMessage(e)); }
   }
 
@@ -3040,7 +3101,7 @@ function SettingsModal({
       await deleteSkill(projectRoot, skill.path);
       setSkills((prev) => prev.filter((s) => s.path !== skill.path));
       if (skillExpanded === skill.path) setSkillExpanded(null);
-      await onRefreshCapabilities();
+      await syncPersistedCapabilities();
     } catch (e) { setError(errorMessage(e)); }
   }
 
@@ -3051,7 +3112,11 @@ function SettingsModal({
       try {
         const { invoke } = await import("@tauri-apps/api/core");
         const result = await invoke<{ name: string; description: string; path: string; content: string }>(
-          "read_skill_content", { projectRoot, nameOrPath: skill.name }
+          "read_skill_content", {
+            projectRoot,
+            configPath: selectedConfigPath || null,
+            nameOrPath: skill.name
+          }
         );
         setSkillContents((prev) => ({ ...prev, [skill.path]: result.content }));
       } catch {
@@ -6378,6 +6443,56 @@ function buildProviderConfigContent(
   }
 
   return `${JSON.stringify(config, null, 2)}\n`;
+}
+
+function mcpServerFromImport(
+  id: string,
+  config: Record<string, unknown>
+): McpServerConfig | null {
+  const commandValue = config.command;
+  let command = "";
+  let args: string[] = [];
+  if (Array.isArray(commandValue)) {
+    const parts = commandValue.map((part) => String(part)).filter(Boolean);
+    command = parts[0] ?? "";
+    args = parts.slice(1);
+  } else {
+    command = valueAsString(commandValue);
+    const rawArgs = config.args;
+    args = Array.isArray(rawArgs) ? rawArgs.map((part) => String(part)).filter(Boolean) : [];
+  }
+  if (!command.trim()) {
+    return null;
+  }
+  const envValue = asRecord(config.env);
+  const environmentValue = asRecord(config.environment);
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries({ ...environmentValue, ...envValue })) {
+    env[key] = String(value);
+  }
+  const disabled = typeof config.disabled === "boolean" ? config.disabled : false;
+  const enabled = disabled ? false : ((config.enabled as boolean | undefined) ?? true);
+  return {
+    id,
+    enabled,
+    command: command.trim(),
+    args,
+    env,
+    cwd: valueAsString(config.cwd) || null,
+    timeoutSeconds: mcpImportTimeoutSeconds(config),
+    requireApproval: (config.requireApproval as boolean | undefined) ?? true,
+    readOnly: (config.readOnly as boolean | undefined) ?? false
+  };
+}
+
+function mcpImportTimeoutSeconds(config: Record<string, unknown>) {
+  const raw =
+    Number(config.timeoutSeconds) ||
+    Number(config.timeout_seconds) ||
+    Number(config.timeout) ||
+    60;
+  const seconds = raw > 600 ? Math.ceil(raw / 1000) : raw;
+  return Math.max(1, Math.min(600, Math.floor(seconds)));
 }
 
 type SetupConfigFields = {

@@ -2,11 +2,10 @@ use crate::{
     event_bus, provider,
     types::{
         AgentMode, BackgroundJobRecord, ContextSummaryRecord, CreateSessionInput, EventRecord,
-        LoadedSkill,
-        PermissionReply, PermissionRequestRecord, PromptAttachment, ProviderInput, ProviderKind,
-        ProviderRecord, SessionCheckpointRecord, SessionEventsResponse, SessionInputDelivery,
-        SessionInputRecord, SessionRecord, SessionRunRecord, ShellMode, ShellPolicy,
-        SnapshotRecord, TodoRecord,
+        LoadedSkill, PermissionReply, PermissionRequestRecord, PromptAttachment, ProviderInput,
+        ProviderKind, ProviderRecord, SessionCheckpointRecord, SessionEventsResponse,
+        SessionInputDelivery, SessionInputRecord, SessionRecord, SessionRunRecord, ShellMode,
+        ShellPolicy, SnapshotRecord, TodoRecord,
     },
     util,
 };
@@ -59,6 +58,7 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
           project_root TEXT NOT NULL,
           mode TEXT NOT NULL,
           provider_id TEXT NOT NULL,
+          config_path TEXT,
           title TEXT NOT NULL,
           status TEXT NOT NULL,
           shell_mode TEXT NOT NULL,
@@ -227,6 +227,12 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
         "parent_session_id",
         "ALTER TABLE session ADD COLUMN parent_session_id TEXT",
     )?;
+    ensure_column(
+        conn,
+        "session",
+        "config_path",
+        "ALTER TABLE session ADD COLUMN config_path TEXT",
+    )?;
     Ok(())
 }
 
@@ -346,19 +352,14 @@ pub fn create_session(
     let now = util::now_string();
     let id = Uuid::new_v4().to_string();
     let root = util::ensure_directory(&input.project_root)?;
-    let title = input.title.unwrap_or_else(|| {
-        root.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("Untitled session")
-            .to_string()
-    });
+    let title = input.title.unwrap_or_else(|| "New session".to_string());
 
     conn.execute(
         r#"
         INSERT INTO session
-          (id, parent_session_id, project_root, mode, provider_id, title, status, shell_mode, created_at, updated_at)
+          (id, parent_session_id, project_root, mode, provider_id, config_path, title, status, shell_mode, created_at, updated_at)
         VALUES
-          (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, ?9)
+          (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, ?10)
         "#,
         params![
             &id,
@@ -366,6 +367,7 @@ pub fn create_session(
             root.to_string_lossy().to_string(),
             input.mode.as_str(),
             &input.provider_id,
+            input.config_path.as_deref().map(str::trim).filter(|value| !value.is_empty()),
             &title,
             input.shell_mode.as_str(),
             &now,
@@ -393,6 +395,7 @@ pub fn create_child_session(
             },
             provider_id: parent.provider_id.clone(),
             shell_mode: parent.shell_mode.clone(),
+            config_path: parent.config_path.clone(),
             title: Some(title.to_string()),
             parent_session_id: Some(parent.id.clone()),
         },
@@ -402,7 +405,7 @@ pub fn create_child_session(
 pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionRecord>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, parent_session_id, project_root, mode, provider_id, title, status, shell_mode, total_cost, total_input_tokens, total_output_tokens, created_at, updated_at
+            "SELECT id, parent_session_id, project_root, mode, provider_id, config_path, title, status, shell_mode, total_cost, total_input_tokens, total_output_tokens, created_at, updated_at
              FROM session ORDER BY updated_at DESC",
         )
         .map_err(|error| error.to_string())?;
@@ -429,7 +432,7 @@ pub fn list_session_ids_with_pending_input(conn: &Connection) -> Result<Vec<Stri
 
 pub fn get_session(conn: &Connection, id: &str) -> Result<SessionRecord, String> {
     conn.query_row(
-        "SELECT id, parent_session_id, project_root, mode, provider_id, title, status, shell_mode, total_cost, total_input_tokens, total_output_tokens, created_at, updated_at
+        "SELECT id, parent_session_id, project_root, mode, provider_id, config_path, title, status, shell_mode, total_cost, total_input_tokens, total_output_tokens, created_at, updated_at
          FROM session WHERE id = ?1",
         params![id],
         session_from_row,
@@ -1496,21 +1499,22 @@ fn provider_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     let mode: String = row.get(3)?;
-    let shell_mode: String = row.get(7)?;
+    let shell_mode: String = row.get(8)?;
     Ok(SessionRecord {
         id: row.get(0)?,
         parent_session_id: row.get(1)?,
         project_root: row.get(2)?,
         mode: AgentMode::from_str(&mode).unwrap_or(AgentMode::Ask),
         provider_id: row.get(4)?,
-        title: row.get(5)?,
-        status: row.get(6)?,
+        config_path: row.get(5)?,
+        title: row.get(6)?,
+        status: row.get(7)?,
         shell_mode: ShellMode::from_str(&shell_mode).unwrap_or(ShellMode::Manual),
-        total_cost: row.get(8)?,
-        total_input_tokens: row.get(9)?,
-        total_output_tokens: row.get(10)?,
-        created_at: row.get(11)?,
-        updated_at: row.get(12)?,
+        total_cost: row.get(9)?,
+        total_input_tokens: row.get(10)?,
+        total_output_tokens: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
     })
 }
 
@@ -1711,6 +1715,7 @@ mod tests {
             project_root: "E:/oDot".to_string(),
             mode: AgentMode::Agent,
             provider_id: "provider/model".to_string(),
+            config_path: None,
             title: "Test".to_string(),
             status: "active".to_string(),
             shell_mode: ShellMode::Auto,
@@ -2014,6 +2019,7 @@ mod tests {
                 mode: AgentMode::Agent,
                 provider_id: "p1".to_string(),
                 shell_mode: ShellMode::Auto,
+                config_path: Some("C:/tmp/odot.json".to_string()),
                 title: Some("Parent".to_string()),
                 parent_session_id: None,
             },
@@ -2022,6 +2028,7 @@ mod tests {
         let child = create_child_session(&conn, &parent, "Child").unwrap();
 
         assert_eq!(child.parent_session_id.as_deref(), Some(parent.id.as_str()));
+        assert_eq!(child.config_path.as_deref(), parent.config_path.as_deref());
         let listed = list_sessions(&conn).unwrap();
         assert!(listed
             .iter()
@@ -2095,6 +2102,7 @@ mod tests {
                 mode: AgentMode::Agent,
                 provider_id: "p1".to_string(),
                 shell_mode: ShellMode::Manual,
+                config_path: None,
                 title: Some("Todo test".to_string()),
                 parent_session_id: None,
             },

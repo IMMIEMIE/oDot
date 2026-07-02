@@ -10,7 +10,12 @@ pub(super) async fn run_session_steps(
     run_id: Option<&str>,
 ) -> Result<SessionEventsResponse, String> {
     run_session_steps_with_config_loader(app, conn, session, current_prompt, run_id, || {
-        config_file::load_provider_request_config(app, &session.project_root, &session.provider_id)
+        config_file::load_provider_request_config_for_session(
+            app,
+            &session.project_root,
+            &session.provider_id,
+            session.config_path.as_deref(),
+        )
     })
     .await
 }
@@ -134,7 +139,18 @@ where
                 return Err(error);
             }
         };
-        let (mcp_tools, capability_errors) = runtime_mcp_tools(app, &session.project_root).await;
+        let (mcp_tools, capability_errors) = runtime_mcp_tools(
+            app,
+            &session.project_root,
+            Some(&request_config.config_path),
+        )
+        .await;
+        let skill_config = config_file::load_skill_config(
+            app,
+            &session.project_root,
+            Some(&request_config.config_path),
+        )
+        .unwrap_or_default();
         for error in capability_errors {
             let _ = storage::append_event(
                 conn,
@@ -158,6 +174,7 @@ where
             native_runtime,
             &request_config.model,
             provider_id_str,
+            &mcp_tools,
             plan_path.as_deref(),
         );
         let turn = if native_runtime {
@@ -179,6 +196,8 @@ where
                 native_runtime,
                 &request_config.model,
                 provider_id_str,
+                &mcp_tools,
+                &skill_config.sources,
             )?;
             let messages = build_stream_messages(
                 conn,
@@ -186,6 +205,7 @@ where
                 &stream_system_prompt,
                 &current_prompt,
                 &request_config,
+                &skill_config.sources,
             )?;
             match stream_openai_compatible_with_retry(
                 conn,
@@ -197,6 +217,7 @@ where
                 &stream_system_prompt,
                 &current_prompt,
                 &messages,
+                &skill_config.sources,
             )
             .await
             {
@@ -220,8 +241,13 @@ where
                 }
             }
         } else {
-            let user_prompt =
-                build_user_prompt(conn, &session.id, &current_prompt, &request_config)?;
+            let user_prompt = build_user_prompt(
+                conn,
+                &session.id,
+                &current_prompt,
+                &request_config,
+                &skill_config.sources,
+            )?;
             let completion = match complete_with_retry(
                 conn,
                 &session.id,
@@ -230,6 +256,7 @@ where
                 &system_prompt,
                 &current_prompt,
                 &user_prompt,
+                &skill_config.sources,
             )
             .await
             {

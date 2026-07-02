@@ -1002,7 +1002,10 @@ fn native_tool_definitions() -> Value {
 }
 
 fn native_tool_definitions_for(mcp_tools: &[McpToolDefinition]) -> Value {
-    let mut tools = native_tool_definitions().as_array().cloned().unwrap_or_default();
+    let mut tools = native_tool_definitions()
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     tools.extend(mcp_tools.iter().map(|tool| {
         json!({
             "type": "function",
@@ -1274,7 +1277,7 @@ mod tests {
             json!({ "role": "tool", "tool_call_id": "call_1", "content": "file" }),
         ];
 
-        let body = openai_responses_stream_request_body(&provider, &messages);
+        let body = openai_responses_stream_request_body(&provider, &messages, &[]);
         let input = body.get("input").and_then(Value::as_array).unwrap();
 
         assert_eq!(body.get("instructions"), Some(&json!("system")));

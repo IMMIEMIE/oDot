@@ -4,17 +4,17 @@ use crate::{
     llm_runtime::{sanitize_assistant_content, LlmStreamEvent},
     mcp, provider, session_coordinator, skills, storage, task_registry, tools,
     types::{
-        AgentMode, ContextSummaryRecord, EventRecord, ModelTurn, PromptAttachment,
-        PromptAttachmentKind, PromptSessionInput, ProviderPricing, ProviderRequestConfig,
-        RecoverBackgroundTaskAction, RecoverBackgroundTaskInput, SessionEventsResponse,
-        SessionInputDelivery, SubmitPromptInput, ToolCallRequest, ToolMode, McpToolDefinition,
+        AgentMode, ContextSummaryRecord, EventRecord, McpToolDefinition, ModelTurn,
+        PromptAttachment, PromptAttachmentKind, PromptSessionInput, ProviderPricing,
+        ProviderRequestConfig, RecoverBackgroundTaskAction, RecoverBackgroundTaskInput,
+        SessionEventsResponse, SessionInputDelivery, SubmitPromptInput, ToolCallRequest, ToolMode,
     },
     util,
 };
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::PathBuf,
     time::{Duration, Instant},
@@ -49,6 +49,16 @@ const STREAM_DELTA_FLUSH_CHARS: usize = 96;
 const STREAM_DELTA_FLUSH_MS: u64 = 120;
 const LLM_RETRY_ATTEMPTS: usize = 3;
 const LLM_RETRY_BASE_DELAY_MS: u64 = 350;
+const AUTO_SESSION_TITLE: &str = "New session";
+const TITLE_SYSTEM_PROMPT: &str = r#"You are a title generator. Output ONLY a thread title.
+
+Rules:
+- Use the same language as the user message.
+- One line only.
+- 50 characters or fewer.
+- No quotes, Markdown, explanations, or punctuation-only filler.
+- Focus on the user's main task or topic.
+- Never mention that you are generating a title."#;
 pub async fn submit_prompt(
     app: &AppHandle,
     conn: &Connection,
@@ -73,8 +83,9 @@ pub async fn submit_prompt(
 pub async fn prompt_session(
     app: &AppHandle,
     conn: &Connection,
-    input: PromptSessionInput,
+    mut input: PromptSessionInput,
 ) -> Result<SessionEventsResponse, String> {
+    merge_configured_loaded_skills(app, conn, &mut input)?;
     let admitted = input_queue::admit(conn, input)?;
 
     if admitted.input.resume {
@@ -511,7 +522,7 @@ async fn resume_session_inner(
     session_id: &str,
     run_id: Option<&str>,
 ) -> Result<SessionEventsResponse, String> {
-    let session = storage::get_session(conn, session_id)?;
+    let mut session = storage::get_session(conn, session_id)?;
     storage::set_session_status(conn, &session.id, "active")?;
     let prompt = if let Some(input) =
         input_queue::promote_next(conn, &session.id, attachment_summaries)?
@@ -522,9 +533,24 @@ async fn resume_session_inner(
     };
 
     // Load provider config for token-based overflow detection.
-    let request_config =
-        config_file::load_provider_request_config(app, &session.project_root, &session.provider_id)
-            .ok();
+    let request_config = config_file::load_provider_request_config_for_session(
+        app,
+        &session.project_root,
+        &session.provider_id,
+        session.config_path.as_deref(),
+    )
+    .ok();
+    if let Err(error) =
+        maybe_generate_session_title(conn, &session, &prompt, request_config.as_ref()).await
+    {
+        let _ = storage::append_event(
+            conn,
+            &session.id,
+            "session.title.generation_failed",
+            json!({ "error": error }),
+        );
+    }
+    session = storage::get_session(conn, &session.id)?;
     let context_limit = request_config
         .as_ref()
         .and_then(|rc| rc.context_token_limit);
@@ -540,6 +566,84 @@ async fn resume_session_inner(
     run_session_steps(app, conn, &session, &prompt, run_id).await
 }
 
+async fn maybe_generate_session_title(
+    conn: &Connection,
+    session: &crate::types::SessionRecord,
+    prompt: &str,
+    request_config: Option<&ProviderRequestConfig>,
+) -> Result<(), String> {
+    let prompt_count = storage::list_events(conn, &session.id)?
+        .iter()
+        .filter(|event| event.event_type == "prompt.submitted")
+        .count();
+    if prompt_count != 1 || !is_auto_session_title(session) || prompt.trim().is_empty() {
+        return Ok(());
+    }
+    let Some(request_config) = request_config else {
+        return Ok(());
+    };
+    let mut title_config = request_config.clone();
+    title_config.tool_mode = ToolMode::Json;
+    title_config.output_token_limit = Some(title_config.output_token_limit.unwrap_or(80).min(80));
+    let user_prompt = format!(
+        "Generate a title for this user message:\n\n<user_message>\n{}\n</user_message>",
+        truncate(prompt, 2_000)
+    );
+    let completion = provider::complete(&title_config, TITLE_SYSTEM_PROMPT, &user_prompt).await?;
+    let title = clean_generated_title(&completion.raw_response);
+    if title.is_empty() || title == session.title {
+        return Ok(());
+    }
+    storage::update_session_title(conn, &session.id, &title)?;
+    storage::append_event(
+        conn,
+        &session.id,
+        "session.title.generated",
+        json!({ "title": title }),
+    )?;
+    Ok(())
+}
+
+fn is_auto_session_title(session: &crate::types::SessionRecord) -> bool {
+    let title = session.title.trim();
+    if title == AUTO_SESSION_TITLE || title.starts_with("New session - ") {
+        return true;
+    }
+    PathBuf::from(&session.project_root)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| title == name)
+        .unwrap_or(false)
+}
+
+fn clean_generated_title(raw: &str) -> String {
+    let mut title = raw
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | '#' | '*' | ' '))
+        .trim()
+        .to_string();
+    if let Some((_, value)) = title.split_once(':') {
+        if title.to_ascii_lowercase().starts_with("title:") {
+            title = value.trim().to_string();
+        }
+    }
+    let mut output = String::new();
+    for ch in title.chars() {
+        if output.chars().count() >= 50 {
+            break;
+        }
+        if matches!(ch, '\r' | '\n' | '\t') {
+            output.push(' ');
+        } else {
+            output.push(ch);
+        }
+    }
+    output.trim().to_string()
+}
+
 async fn complete_with_retry(
     conn: &Connection,
     session_id: &str,
@@ -548,6 +652,7 @@ async fn complete_with_retry(
     system_prompt: &str,
     current_prompt: &str,
     initial_user_prompt: &str,
+    skill_sources: &[String],
 ) -> Result<provider::ProviderCompletion, String> {
     let mut last_error = None;
     let mut compacted_after_context_overflow = false;
@@ -584,8 +689,13 @@ async fn complete_with_retry(
                 last_error = Some(error);
                 if can_compact_retry {
                     let _ = compact_session_with_provider(conn, session_id, request_config).await?;
-                    user_prompt =
-                        build_user_prompt(conn, session_id, current_prompt, request_config)?;
+                    user_prompt = build_user_prompt(
+                        conn,
+                        session_id,
+                        current_prompt,
+                        request_config,
+                        skill_sources,
+                    )?;
                     compacted_after_context_overflow = true;
                     continue;
                 }
@@ -607,6 +717,7 @@ async fn stream_openai_compatible_with_retry(
     stream_system_prompt: &str,
     current_prompt: &str,
     initial_messages: &[Value],
+    skill_sources: &[String],
 ) -> Result<ModelTurn, String> {
     let mut last_error = None;
     let mut compacted_after_context_overflow = false;
@@ -620,11 +731,12 @@ async fn stream_openai_compatible_with_retry(
             request_config,
         );
         let mut emitted_stream_event = false;
-        let result = provider::stream_openai_compatible(request_config, &messages, mcp_tools, |event| {
-            emitted_stream_event = true;
-            sink.handle(event)
-        })
-        .await;
+        let result =
+            provider::stream_openai_compatible(request_config, &messages, mcp_tools, |event| {
+                emitted_stream_event = true;
+                sink.handle(event)
+            })
+            .await;
 
         match result {
             Ok(turn) => {
@@ -666,6 +778,7 @@ async fn stream_openai_compatible_with_retry(
                         stream_system_prompt,
                         current_prompt,
                         request_config,
+                        skill_sources,
                     )?;
                     compacted_after_context_overflow = true;
                     continue;
@@ -786,6 +899,7 @@ fn build_system_prompt(
     native_tools: bool,
     model: &str,
     provider_id: &str,
+    mcp_tools: &[McpToolDefinition],
     plan_path: Option<&str>,
 ) -> String {
     let shell_environment = shell_environment_prompt();
@@ -794,6 +908,7 @@ fn build_system_prompt(
         model, provider_id
     );
     let mode_guidance = build_mode_guidance(mode, plan_path);
+    let mcp_guidance = mcp_tool_catalog_prompt(mcp_tools);
     if native_tools {
         format!(
             r#"{model_identity}
@@ -814,6 +929,8 @@ Tool guidance:
 - mcp__server__tool: call a project-configured MCP tool when available.
 - plan_exit: in plan mode, request user approval to switch from planning to execution after the plan file is complete.
 Use read for file contents and search for project text. Do not read project files with shell commands such as Get-Content, more, cat, grep, or sed when read/search can do it.
+
+{mcp_guidance}
 
 Shell environment:
 {shell_environment}
@@ -858,6 +975,8 @@ Tool inputs:
 - plan_exit: {{}}
 Use read for file contents and search for project text. Do not read project files with shell commands such as Get-Content, more, cat, grep, or sed when read/search can do it.
 
+{mcp_guidance}
+
 Shell environment:
 {shell_environment}
 
@@ -895,6 +1014,31 @@ Final user-facing response in plan mode should be brief because the authoritativ
     }
 }
 
+fn mcp_tool_catalog_prompt(mcp_tools: &[McpToolDefinition]) -> String {
+    if mcp_tools.is_empty() {
+        return "MCP tools: none currently available.".to_string();
+    }
+    let tools = mcp_tools
+        .iter()
+        .map(|tool| {
+            format!(
+                "- {}: {} inputSchema={}",
+                tool.display_name,
+                if tool.description.trim().is_empty() {
+                    "(no description)"
+                } else {
+                    tool.description.trim()
+                },
+                truncate(&json_text(&tool.input_schema), 1_500)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "MCP tools available this turn. Call them by exact name in toolCalls/native tools:\n{tools}"
+    )
+}
+
 fn shell_environment_prompt() -> &'static str {
     if cfg!(target_os = "windows") {
         "Host OS is Windows. Shell commands run in Windows PowerShell via powershell -NoProfile -ExecutionPolicy Bypass -Command. Prefer PowerShell commands and Windows-compatible syntax. Avoid bash-only commands such as grep, sed, rm, chmod, sudo, or here-docs unless you first verify they are available."
@@ -903,8 +1047,41 @@ fn shell_environment_prompt() -> &'static str {
     }
 }
 
-async fn runtime_mcp_tools(app: &AppHandle, project_root: &str) -> (Vec<McpToolDefinition>, Vec<String>) {
-    let servers = match config_file::load_mcp_server_configs(app, project_root, None) {
+fn merge_configured_loaded_skills(
+    app: &AppHandle,
+    conn: &Connection,
+    input: &mut PromptSessionInput,
+) -> Result<(), String> {
+    let session = storage::get_session(conn, &input.session_id)?;
+    let skill_config =
+        config_file::load_skill_config(app, &session.project_root, session.config_path.as_deref())?;
+    if skill_config.loaded.is_empty() {
+        return Ok(());
+    }
+    let configured = skills::resolve_loaded_skills(
+        &session.project_root,
+        &skill_config.loaded,
+        &skill_config.sources,
+    )?;
+    let mut seen = input
+        .loaded_skills
+        .iter()
+        .map(|skill| skill.path.clone())
+        .collect::<HashSet<_>>();
+    for skill in configured {
+        if seen.insert(skill.path.clone()) {
+            input.loaded_skills.push(skill);
+        }
+    }
+    Ok(())
+}
+
+async fn runtime_mcp_tools(
+    app: &AppHandle,
+    project_root: &str,
+    config_path: Option<&str>,
+) -> (Vec<McpToolDefinition>, Vec<String>) {
+    let servers = match config_file::load_mcp_server_configs(app, project_root, config_path) {
         Ok(value) => value,
         Err(error) => return (Vec::new(), vec![error]),
     };
@@ -926,6 +1103,8 @@ fn build_stream_system_prompt(
     native_tools: bool,
     model: &str,
     provider_id: &str,
+    mcp_tools: &[McpToolDefinition],
+    skill_sources: &[String],
 ) -> Result<String, String> {
     let summaries = storage::list_context_summaries(conn, &session.id)?;
     let summary = summaries
@@ -939,6 +1118,7 @@ fn build_stream_system_prompt(
             native_tools,
             model,
             provider_id,
+            mcp_tools,
             if matches!(session.mode, AgentMode::Plan) {
                 Some(util::plan_file_path(&session.created_at, &session.title))
             } else {
@@ -947,7 +1127,7 @@ fn build_stream_system_prompt(
             .as_deref()
         ),
         project_context_text(&session.project_root),
-        skills::skill_catalog_prompt(&session.project_root),
+        skills::skill_catalog_prompt_with_sources(&session.project_root, skill_sources),
         summary
     ))
 }
@@ -1055,6 +1235,7 @@ fn build_stream_messages(
     system_prompt: &str,
     current_prompt: &str,
     provider: &ProviderRequestConfig,
+    skill_sources: &[String],
 ) -> Result<Vec<Value>, String> {
     let events = load_context_events(conn, session_id, provider)?;
     let tool_call_ids = provider_tool_call_ids(&events);
@@ -1075,8 +1256,11 @@ fn build_stream_messages(
                     .unwrap_or("");
                 let attachments = prompt_event_attachments(conn, event)?;
                 let loaded_skills = prompt_event_loaded_skills(conn, event)?;
-                let loaded_skill_context =
-                    skills::loaded_skills_context(&storage::get_session(conn, session_id)?.project_root, &loaded_skills);
+                let loaded_skill_context = skills::loaded_skills_context_with_sources(
+                    &storage::get_session(conn, session_id)?.project_root,
+                    &loaded_skills,
+                    skill_sources,
+                );
                 if prompt.trim().is_empty() && attachments.is_empty() && loaded_skills.is_empty() {
                     continue;
                 }
@@ -1176,7 +1360,11 @@ fn prompt_event_loaded_skills(
     }
 }
 
-fn user_message_content(prompt: &str, attachments: &[PromptAttachment], loaded_skill_context: &str) -> Value {
+fn user_message_content(
+    prompt: &str,
+    attachments: &[PromptAttachment],
+    loaded_skill_context: &str,
+) -> Value {
     if attachments.is_empty() && loaded_skill_context.trim().is_empty() {
         return json!(prompt);
     }
@@ -1744,6 +1932,7 @@ fn build_user_prompt(
     session_id: &str,
     current_prompt: &str,
     provider: &ProviderRequestConfig,
+    skill_sources: &[String],
 ) -> Result<String, String> {
     let events = load_context_events(conn, session_id, provider)?;
     let summaries = storage::list_context_summaries(conn, session_id)?;
@@ -1755,8 +1944,13 @@ fn build_user_prompt(
     let project_context = project_context_text(&session.project_root);
 
     let event_lines = recent_event_timeline(&events);
-    let current_prompt =
-        text_runtime_prompt_with_attachments(conn, &events, current_prompt, &session.project_root)?;
+    let current_prompt = text_runtime_prompt_with_attachments(
+        conn,
+        &events,
+        current_prompt,
+        &session.project_root,
+        skill_sources,
+    )?;
 
     Ok(format!(
         "Current user prompt:\n{current_prompt}\n\nProject context:\n{project_context}\n\nCompressed context:\n{summary}\n\nRecent event timeline:\n{event_lines}"
@@ -1768,6 +1962,7 @@ fn text_runtime_prompt_with_attachments(
     events: &[EventRecord],
     current_prompt: &str,
     project_root: &str,
+    skill_sources: &[String],
 ) -> Result<String, String> {
     let Some(event) = events.iter().rev().find(|event| {
         event.event_type == "prompt.submitted"
@@ -1782,7 +1977,8 @@ fn text_runtime_prompt_with_attachments(
     };
     let attachments = prompt_event_attachments(conn, event)?;
     let loaded_skills = prompt_event_loaded_skills(conn, event)?;
-    let loaded_skill_context = skills::loaded_skills_context(project_root, &loaded_skills);
+    let loaded_skill_context =
+        skills::loaded_skills_context_with_sources(project_root, &loaded_skills, skill_sources);
     if attachments.is_empty() && loaded_skills.is_empty() {
         return Ok(current_prompt.to_string());
     }
@@ -2106,8 +2302,8 @@ mod tests {
 
     #[test]
     fn system_prompts_prefer_shell_and_read_search() {
-        let native = build_system_prompt("agent", true, "test-model", "test-provider", None);
-        let json = build_system_prompt("agent", false, "test-model", "test-provider", None);
+        let native = build_system_prompt("agent", true, "test-model", "test-provider", &[], None);
+        let json = build_system_prompt("agent", false, "test-model", "test-provider", &[], None);
 
         assert!(native.contains("- shell: run verification commands."));
         assert!(native.contains("- task: launch an isolated subagent session"));
@@ -2116,7 +2312,7 @@ mod tests {
         assert!(!native.contains("bash/shell"));
         assert!(native.contains("Use read for file contents and search for project text."));
         assert!(json.contains(
-            "\"name\": \"read|search|grep|edit|write|delete|shell|question|todo_write|task|plan_exit\""
+            "\"name\": \"read|search|grep|edit|write|delete|shell|question|todo_write|task|skill_list|skill_read|mcp__server__tool|plan_exit\""
         ));
         assert!(json.contains("\"background\":false"));
         assert!(json.contains("\"task_id\":\"optional existing task session id\""));
@@ -2283,6 +2479,7 @@ mod tests {
             true,
             "test-model",
             "test-provider",
+            &[],
             Some(".odot/plans/123-plan.md"),
         );
 
@@ -2595,6 +2792,7 @@ mod tests {
                 kind: PromptAttachmentKind::Image,
                 content: "data:image/png;base64,abc".to_string(),
             }],
+            "",
         );
 
         let parts = content.as_array().expect("parts");

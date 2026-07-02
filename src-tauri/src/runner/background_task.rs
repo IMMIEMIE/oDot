@@ -134,7 +134,8 @@ pub(super) async fn execute_agent_turn_tools(
                 task_runs.push(task);
             }
         } else {
-            let outcome = tools::execute_tool(app, conn, session, &session.shell_mode, call).await?;
+            let outcome =
+                tools::execute_tool(app, conn, session, &session.shell_mode, call).await?;
             has_pending |= outcome.pending;
         }
     }
