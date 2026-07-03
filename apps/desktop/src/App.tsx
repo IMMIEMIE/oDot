@@ -618,7 +618,7 @@ export function App() {
         .find(
           (event) =>
             event.type === "assistant.message" &&
-            valueAsString(event.data.text).trim()
+            extractExecutablePlanText(valueAsString(event.data.text)) !== null
         ) ?? null
     );
   }, [eventsResponse.events, selectedSession?.mode]);
@@ -1453,7 +1453,7 @@ export function App() {
     }
     shouldStickToTimelineBottomRef.current = true;
 
-    const planText = valueAsString(planEvent.data.text).trim();
+    const planText = extractExecutablePlanText(valueAsString(planEvent.data.text));
     if (!planText) {
       setNotice({ tone: "error", text: t("notice.noPlanContent") });
       return;
@@ -6184,6 +6184,12 @@ function stripReasoningControlTags(value: string) {
     index = tagStart + match[0].length;
   }
   return output;
+}
+
+function extractExecutablePlanText(value: string) {
+  const match = /<proposed_plan>([\s\S]*?)<\/proposed_plan>/.exec(value);
+  const planText = match?.[1]?.trim();
+  return planText ? planText : null;
 }
 
 function errorMessage(error: unknown) {
