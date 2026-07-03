@@ -116,6 +116,12 @@ import {
   externalPromptReferencesFromPayload,
   formatExternalPromptReferences,
   mergeExternalPromptReferences,
+  mergePromptReferencesForStorage,
+  PROMPT_REFERENCES_STORAGE_KEY,
+  readPromptReferences,
+  referencesEqual,
+  resolvePromptReferencesFromStorage,
+  savePromptReferences,
   type ExternalPromptReference
 } from "./externalPromptReferences";
 import {
@@ -135,7 +141,8 @@ import {
 } from "./sessionStore";
 import {
   deriveFloatAgentStatus,
-  saveFloatAgentStatus
+  loadFloatAgentStatus,
+  persistFloatAgentStatus
 } from "./floatAgentStatus";
 import {
   clearPromptDraft,
@@ -254,7 +261,10 @@ export function App() {
   const [promptAttachments, setPromptAttachments] = useState<PromptAttachment[]>([]);
   const [externalPromptReferences, setExternalPromptReferences] = useState<
     ExternalPromptReference[]
-  >([]);
+  >(() => readPromptReferences()?.references ?? []);
+  const promptReferencesDraftUpdatedAtRef = useRef(
+    readPromptReferences()?.updatedAt ?? 0
+  );
   const [projectCapabilities, setProjectCapabilities] =
     useState<ProjectCapabilities | null>(null);
   const [loadedSkills, setLoadedSkills] = useState<LoadedSkill[]>([]);
@@ -700,6 +710,38 @@ export function App() {
     };
   }, [promptInlineReferences]);
 
+  useEffect(() => {
+    savePromptReferences(
+      mergePromptReferencesForStorage(externalPromptReferences, selectedPaths, projectRoot),
+      "main"
+    );
+    promptReferencesDraftUpdatedAtRef.current = readPromptReferences()?.updatedAt ?? Date.now();
+  }, [externalPromptReferences, projectRoot, selectedPaths]);
+
+  useEffect(() => {
+    const applyExternalReferences = () => {
+      setExternalPromptReferences((current) => {
+        const nextReferences = resolvePromptReferencesFromStorage(
+          "main",
+          promptReferencesDraftUpdatedAtRef,
+          current
+        );
+        return referencesEqual(current, nextReferences) ? current : nextReferences;
+      });
+    };
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === PROMPT_REFERENCES_STORAGE_KEY) {
+        applyExternalReferences();
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    window.addEventListener("focus", applyExternalReferences);
+    return () => {
+      window.removeEventListener("storage", onStorage);
+      window.removeEventListener("focus", applyExternalReferences);
+    };
+  }, []);
+
   useLayoutEffect(() => {
     const editor = promptInputRef.current;
     if (!editor) {
@@ -754,7 +796,7 @@ export function App() {
   }, [isPromptLocked, t]);
 
   useEffect(() => {
-    saveFloatAgentStatus(floatAgentStatus);
+    persistFloatAgentStatus(loadFloatAgentStatus(), floatAgentStatus);
   }, [floatAgentStatus]);
 
   useEffect(() => {
@@ -1924,6 +1966,35 @@ export function App() {
     }
   }
 
+  async function switchToFloatWindow() {
+    const mainWin = getCurrentWindow();
+    const floatWin = await WebviewWindow.getByLabel("float");
+    if (!floatWin) {
+      setNotice({ tone: "error", text: t("error.unknown") });
+      return;
+    }
+    persistFloatAgentStatus(loadFloatAgentStatus(), floatAgentStatus);
+    savePromptDraft(
+      extractPromptEditorText(promptInputRef.current) || prompt,
+      "main"
+    );
+    promptDraftUpdatedAtRef.current = readPromptDraft()?.updatedAt ?? Date.now();
+    savePromptReferences(
+      mergePromptReferencesForStorage(externalPromptReferences, selectedPaths, projectRoot),
+      "main"
+    );
+    promptReferencesDraftUpdatedAtRef.current = readPromptReferences()?.updatedAt ?? Date.now();
+    try {
+      await floatWin.show();
+      await floatWin.setFocus();
+      await mainWin.hide();
+    } catch (error) {
+      await mainWin.show().catch(() => undefined);
+      await mainWin.setFocus().catch(() => undefined);
+      reportError(error);
+    }
+  }
+
   async function handleDeleteSession(sessionId: string) {
     const session = sessions.find((item) => item.id === sessionId);
     const confirmed = window.confirm(
@@ -2133,12 +2204,7 @@ export function App() {
       }}
     >
       <aside className="leftPane">
-        <header className="brandRow" onClick={async () => {
-                  const mainWin = getCurrentWindow();
-                  const floatWin = await WebviewWindow.getByLabel("float");
-                  await floatWin?.show();
-                  await mainWin.hide();
-                }}>
+        <header className="brandRow" onClick={() => void switchToFloatWindow()}>
           <span className="brandIcon">
             <OdodBotIcon size={22} />
           </span>

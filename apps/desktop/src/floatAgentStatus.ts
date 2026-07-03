@@ -8,6 +8,7 @@ import { appT } from "./i18n";
 import type { PromptAttachmentKind } from "./promptAttachments";
 
 export const FLOAT_AGENT_STATUS_STORAGE_KEY = "odot.floatAgentStatus";
+export const COMPLETE_TO_IDLE_DELAY_MS = 45_000;
 
 export type FloatAgentStatusKind =
   | "idle"
@@ -24,6 +25,7 @@ export type FloatAgentStatusRecord = {
   allowedAttachmentKinds: PromptAttachmentKind[];
   message?: string;
   pendingApproval?: FloatPendingApproval | null;
+  completedAt?: number;
   updatedAt: number;
 };
 
@@ -83,8 +85,9 @@ export function deriveFloatAgentStatus({
   }
 
   if (isWorking) {
-    const latestReasoningMessage = latestReasoningText(eventsResponse.events);
-    if (latestModelOutputIsReasoning(eventsResponse.events)) {
+    const currentRunEvents = eventsSinceLatestPrompt(eventsResponse.events);
+    const latestReasoningMessage = latestReasoningText(currentRunEvents);
+    if (latestModelOutputIsReasoning(currentRunEvents)) {
       return floatAgentStatus(
         "thinking",
         appT("floatStatus.thinking"),
@@ -94,7 +97,7 @@ export function deriveFloatAgentStatus({
         latestReasoningMessage
       );
     }
-    const latestAssistantMessage = latestAssistantText(eventsResponse.events);
+    const latestAssistantMessage = latestAssistantText(currentRunEvents);
     return floatAgentStatus(
       "working",
       appT("floatStatus.working"),
@@ -135,13 +138,61 @@ export function saveFloatAgentStatus(status: FloatAgentStatusRecord) {
   localStorage.setItem(FLOAT_AGENT_STATUS_STORAGE_KEY, JSON.stringify(status));
 }
 
+export function mergeFloatAgentStatusForStorage(
+  previous: FloatAgentStatusRecord,
+  next: FloatAgentStatusRecord
+): FloatAgentStatusRecord {
+  if (next.kind !== "complete") {
+    return { ...next, completedAt: undefined };
+  }
+  const completedAt =
+    previous.sessionId === next.sessionId && previous.completedAt
+      ? previous.completedAt
+      : Date.now();
+  return { ...next, completedAt };
+}
+
+export function resolveFloatAgentStatusExpiry(
+  status: FloatAgentStatusRecord,
+  now = Date.now()
+): FloatAgentStatusRecord {
+  if (status.kind !== "complete") {
+    return status;
+  }
+  const completedAt = status.completedAt ?? status.updatedAt;
+  if (now - completedAt < COMPLETE_TO_IDLE_DELAY_MS) {
+    return status.completedAt === completedAt ? status : { ...status, completedAt };
+  }
+  return {
+    kind: "idle",
+    label: appT("floatStatus.idle"),
+    sessionId: status.sessionId,
+    allowedAttachmentKinds: status.allowedAttachmentKinds,
+    message: "",
+    pendingApproval: null,
+    completedAt,
+    updatedAt: now
+  };
+}
+
+export function persistFloatAgentStatus(
+  previous: FloatAgentStatusRecord,
+  next: FloatAgentStatusRecord
+): FloatAgentStatusRecord {
+  const resolved = resolveFloatAgentStatusExpiry(
+    mergeFloatAgentStatusForStorage(previous, next)
+  );
+  saveFloatAgentStatus(resolved);
+  return resolved;
+}
+
 export function loadFloatAgentStatus(): FloatAgentStatusRecord {
   const raw = localStorage.getItem(FLOAT_AGENT_STATUS_STORAGE_KEY);
   if (!raw) {
     return DEFAULT_FLOAT_AGENT_STATUS;
   }
   try {
-    return normalizeFloatAgentStatus(JSON.parse(raw));
+    return resolveFloatAgentStatusExpiry(normalizeFloatAgentStatus(JSON.parse(raw)));
   } catch {
     return DEFAULT_FLOAT_AGENT_STATUS;
   }
@@ -256,6 +307,47 @@ function latestStatusEvent(events: EventRecord[]) {
   );
 }
 
+export function looksLikeMarkdownDocument(text: string): boolean {
+  const trimmed = cleanModelText(text);
+  if (!trimmed) {
+    return false;
+  }
+  return (
+    /^#{1,6}\s+\S/m.test(trimmed) ||
+    /```[\s\S]*?```/.test(trimmed) ||
+    /^\s*[-*+]\s+\S/m.test(trimmed) ||
+    /^\s*\d+\.\s+\S/m.test(trimmed) ||
+    /\[[^\]]+\]\([^)]+\)/.test(trimmed) ||
+    /^\|.+\|.+\|$/m.test(trimmed)
+  );
+}
+
+export function isStaleCompletedReply(message: string, previousMessage: string): boolean {
+  const live = message.trim();
+  const previous = previousMessage.trim();
+  if (!live || !previous) {
+    return false;
+  }
+  if (live === previous) {
+    return true;
+  }
+  const prefixLength = Math.min(live.length, previous.length, 240);
+  if (prefixLength >= 32 && live.slice(0, prefixLength) === previous.slice(0, prefixLength)) {
+    return true;
+  }
+  return looksLikeMarkdownDocument(live) && looksLikeMarkdownDocument(previous);
+}
+
+function eventsSinceLatestPrompt(events: EventRecord[]) {
+  const latestPrompt = [...events]
+    .reverse()
+    .find((event) => event.type === "prompt.submitted");
+  if (!latestPrompt) {
+    return events;
+  }
+  return events.filter((event) => event.seq > latestPrompt.seq);
+}
+
 function latestModelOutputIsReasoning(events: EventRecord[]) {
   const latest = [...events].reverse().find((event) =>
     [
@@ -340,6 +432,8 @@ function normalizeFloatAgentStatus(value: unknown): FloatAgentStatusRecord {
     allowedAttachmentKinds: normalizeAttachmentKinds(record.allowedAttachmentKinds),
     message: valueAsString(record.message),
     pendingApproval: normalizePendingApproval(record.pendingApproval),
+    completedAt:
+      typeof record.completedAt === "number" ? record.completedAt : undefined,
     updatedAt:
       typeof record.updatedAt === "number"
         ? record.updatedAt

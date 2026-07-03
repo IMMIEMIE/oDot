@@ -39,6 +39,11 @@ import {
   externalPromptReferencesFromPayload,
   formatExternalPromptReferences,
   mergeExternalPromptReferences,
+  PROMPT_REFERENCES_STORAGE_KEY,
+  readPromptReferences,
+  referencesEqual,
+  resolvePromptReferencesFromStorage,
+  savePromptReferences,
   type ExternalPromptReference
 } from "./externalPromptReferences";
 import {
@@ -48,7 +53,9 @@ import {
   type PromptInlineReference
 } from "./promptInlineReferences";
 import {
+  COMPLETE_TO_IDLE_DELAY_MS,
   FLOAT_AGENT_STATUS_STORAGE_KEY,
+  isStaleCompletedReply,
   saveFloatAgentStatus,
   loadFloatAgentStatus,
   type FloatAgentStatusRecord,
@@ -70,7 +77,6 @@ import {
 
 type ThemeMode = "system" | "light" | "dark";
 type ResolvedTheme = "light" | "dark";
-type SideBubbleDirection = "right" | "left";
 type FloatExpansionMode = "prompt" | "approval";
 type FloatWindowLayoutKind = "ball" | "prompt" | "approval" | "reply";
 type FloatWindowAnchor = { x: number; y: number };
@@ -95,7 +101,7 @@ const FLOAT_WINDOW_SCREEN_MARGIN = 8;
 const FLOAT_APPROVAL_WIDTH = 332;
 const FLOAT_APPROVAL_HEIGHT = 166;
 const FLOAT_REPLY_WIDTH = 332;
-const FLOAT_REPLY_HEIGHT = 112;
+const FLOAT_REPLY_HEIGHT = 136;
 const FLOAT_REPLY_ANCHOR_OFFSET = 36;
 
 export function FloatBall() {
@@ -107,26 +113,36 @@ export function FloatBall() {
   const [attachments, setAttachments] = useState<PromptAttachment[]>([]);
   const [externalPromptReferences, setExternalPromptReferences] = useState<
     ExternalPromptReference[]
-  >([]);
+  >(() => readPromptReferences()?.references ?? []);
+  const promptReferencesDraftUpdatedAtRef = useRef(
+    readPromptReferences()?.updatedAt ?? 0
+  );
   const [panelError, setPanelError] = useState("");
   const [isSubmittingPrompt, setIsSubmittingPrompt] = useState(false);
   const [isResolvingApproval, setIsResolvingApproval] = useState(false);
   const [promptInputHeight, setPromptInputHeight] = useState(FLOAT_PROMPT_INPUT_MIN_HEIGHT);
+  const [dismissedCompletedReply, setDismissedCompletedReply] = useState("");
   const [isSleeping, setIsSleeping] = useState(false);
   const [showCompleteCheck, setShowCompleteCheck] = useState(false);
-  const [thinkingBubbleDirection, setThinkingBubbleDirection] =
-    useState<SideBubbleDirection>("right");
   const pointerStart = useRef<{ id: number; x: number; y: number } | null>(null);
   const didDrag = useRef(false);
   const completeCheckTimer = useRef<number | undefined>(undefined);
+  const completeToIdleTimer = useRef<number | undefined>(undefined);
   const sleepTimer = useRef<number | undefined>(undefined);
   const cancelledErrorSession = useRef<string | undefined>(undefined);
+  const pendingPromptStatus = useRef<{
+    sessionId: string;
+    previousMessage: string;
+    startedAt: number;
+  } | null>(null);
   const previousStatusKind = useRef<FloatAgentStatusKind>(agentStatus.kind);
   const promptDraftUpdatedAtRef = useRef(readPromptDraft()?.updatedAt ?? 0);
   const floatWindowAnchor = useRef<FloatWindowAnchor | null>(null);
   const promptInputRef = useRef<HTMLDivElement | null>(null);
   const resizeRequestId = useRef(0);
   const promptResizeFrame = useRef<number | undefined>(undefined);
+  const promptResizeAttempts = useRef(0);
+  const resizePromptInputRef = useRef<() => void>(() => {});
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -209,7 +225,64 @@ export function FloatBall() {
   }, []);
 
   useEffect(() => {
-    const syncStatus = () => setAgentStatus(loadFloatAgentStatus());
+    savePromptReferences(externalPromptReferences, "float");
+    promptReferencesDraftUpdatedAtRef.current = readPromptReferences()?.updatedAt ?? Date.now();
+  }, [externalPromptReferences]);
+
+  useEffect(() => {
+    const applyExternalReferences = () => {
+      setExternalPromptReferences((current) => {
+        const nextReferences = resolvePromptReferencesFromStorage(
+          "float",
+          promptReferencesDraftUpdatedAtRef,
+          current
+        );
+        return referencesEqual(current, nextReferences) ? current : nextReferences;
+      });
+    };
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === PROMPT_REFERENCES_STORAGE_KEY) {
+        applyExternalReferences();
+      }
+    };
+    const syncFromStorage = () => {
+      if (document.visibilityState === "visible") {
+        applyExternalReferences();
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    window.addEventListener("focus", applyExternalReferences);
+    document.addEventListener("visibilitychange", syncFromStorage);
+    return () => {
+      window.removeEventListener("storage", onStorage);
+      window.removeEventListener("focus", applyExternalReferences);
+      document.removeEventListener("visibilitychange", syncFromStorage);
+    };
+  }, []);
+
+  useEffect(() => {
+    const syncStatus = () => {
+      const next = loadFloatAgentStatus();
+      const pending = pendingPromptStatus.current;
+      if (pending && next.sessionId === pending.sessionId) {
+        const nextMessage = next.message?.trim() ?? "";
+        if (
+          next.updatedAt < pending.startedAt ||
+          isStaleCompletedReply(nextMessage, pending.previousMessage)
+        ) {
+          return;
+        }
+        if (
+          ((next.kind === "working" || next.kind === "thinking") && nextMessage) ||
+          next.kind === "approval" ||
+          next.kind === "error" ||
+          (next.kind === "complete" && nextMessage)
+        ) {
+          pendingPromptStatus.current = null;
+        }
+      }
+      setAgentStatus(next);
+    };
     const onStorage = (event: StorageEvent) => {
       if (event.key === FLOAT_AGENT_STATUS_STORAGE_KEY) {
         syncStatus();
@@ -303,10 +376,59 @@ export function FloatBall() {
   }, [agentStatus.kind]);
 
   useEffect(() => {
-    if (agentStatus.kind === "working" || agentStatus.kind === "thinking") {
-      void resolveSideBubbleDirection().then(setThinkingBubbleDirection);
+    if (agentStatus.kind !== "complete") {
+      setDismissedCompletedReply("");
     }
   }, [agentStatus.kind]);
+
+  useEffect(() => {
+    if (completeToIdleTimer.current) {
+      window.clearTimeout(completeToIdleTimer.current);
+      completeToIdleTimer.current = undefined;
+    }
+    if (agentStatus.kind !== "complete") {
+      return;
+    }
+    const completedAt = agentStatus.completedAt ?? agentStatus.updatedAt;
+    const remaining = COMPLETE_TO_IDLE_DELAY_MS - (Date.now() - completedAt);
+    const transitionToIdle = () => {
+      setAgentStatus((current) => {
+        if (current.kind !== "complete") {
+          return current;
+        }
+        return syncLocalStatus({
+          kind: "idle",
+          label: t("floatStatus.idle"),
+          sessionId: current.sessionId,
+          allowedAttachmentKinds: current.allowedAttachmentKinds,
+          message: "",
+          pendingApproval: null,
+          completedAt: current.completedAt ?? current.updatedAt,
+          updatedAt: Date.now()
+        });
+      });
+    };
+    if (remaining <= 0) {
+      transitionToIdle();
+      return;
+    }
+    completeToIdleTimer.current = window.setTimeout(() => {
+      completeToIdleTimer.current = undefined;
+      transitionToIdle();
+    }, remaining);
+    return () => {
+      if (completeToIdleTimer.current) {
+        window.clearTimeout(completeToIdleTimer.current);
+        completeToIdleTimer.current = undefined;
+      }
+    };
+  }, [
+    agentStatus.completedAt,
+    agentStatus.kind,
+    agentStatus.sessionId,
+    agentStatus.updatedAt,
+    t
+  ]);
 
   useEffect(() => {
     setExpandedMode((current) => {
@@ -336,9 +458,28 @@ export function FloatBall() {
   async function restoreMainWindow() {
     const floatWin = getCurrentWindow();
     const mainWin = await WebviewWindow.getByLabel("main");
-    await mainWin?.show();
-    await mainWin?.setFocus();
-    await floatWin.hide();
+    if (!mainWin) {
+      setPanelError(t("error.unknown"));
+      return;
+    }
+    const draftText = extractPromptEditorText(promptInputRef.current) || promptText;
+    if (draftText.trim()) {
+      savePromptDraft(draftText, "float");
+      promptDraftUpdatedAtRef.current = readPromptDraft()?.updatedAt ?? Date.now();
+    }
+    savePromptReferences(externalPromptReferences, "float");
+    promptReferencesDraftUpdatedAtRef.current = readPromptReferences()?.updatedAt ?? Date.now();
+    setExpandedMode(null);
+    setPanelError("");
+    try {
+      await mainWin.show();
+      await mainWin.setFocus();
+      await floatWin.hide();
+    } catch (error) {
+      await floatWin.show().catch(() => undefined);
+      await floatWin.setFocus().catch(() => undefined);
+      setPanelError(errorSummary(error));
+    }
   }
 
   function resetPointer(target: Element, pointerId: number) {
@@ -390,7 +531,6 @@ export function FloatBall() {
     void invoke("start_float_drag")
       .finally(() => {
         setIsDragging(false);
-        void resolveSideBubbleDirection().then(setThinkingBubbleDirection);
       });
   };
 
@@ -420,6 +560,19 @@ export function FloatBall() {
     didDrag.current = false;
   };
 
+  function buildFloatPromptInlineReferences(
+    references: ExternalPromptReference[] = externalPromptReferences
+  ): PromptInlineReference[] {
+    return references.map((reference): PromptInlineReference => ({
+      id: `external:${reference.id}`,
+      source: "externalReference",
+      sourceId: reference.id,
+      label: externalPromptReferenceName(reference),
+      detail: externalPromptReferenceLineLabel(reference, "display"),
+      kind: externalPromptReferenceKind(reference)
+    }));
+  }
+
   function openPromptPanel() {
     const draft = readPromptDraft();
     let nextPromptText = promptText;
@@ -428,12 +581,23 @@ export function FloatBall() {
       nextPromptText = draft.text;
       setPromptText(nextPromptText);
     }
+    const nextReferences = resolvePromptReferencesFromStorage(
+      "float",
+      promptReferencesDraftUpdatedAtRef,
+      externalPromptReferences
+    );
+    if (!referencesEqual(externalPromptReferences, nextReferences)) {
+      setExternalPromptReferences(nextReferences);
+    }
+    const inlineReferences = buildFloatPromptInlineReferences(nextReferences);
     setPromptInputHeight(FLOAT_PROMPT_INPUT_MIN_HEIGHT);
+    promptResizeAttempts.current = 0;
     setExpandedMode("prompt");
     setPanelError("");
     window.setTimeout(() => {
-      setPromptEditorText(promptInputRef.current, nextPromptText, floatPromptInlineReferences());
+      setPromptEditorText(promptInputRef.current, nextPromptText, inlineReferences);
       promptInputRef.current?.focus();
+      schedulePromptInputResize();
     }, 0);
   }
 
@@ -443,14 +607,7 @@ export function FloatBall() {
   }
 
   function floatPromptInlineReferences(): PromptInlineReference[] {
-    return externalPromptReferences.map((reference): PromptInlineReference => ({
-      id: `external:${reference.id}`,
-      source: "externalReference",
-      sourceId: reference.id,
-      label: externalPromptReferenceName(reference),
-      detail: externalPromptReferenceLineLabel(reference, "display"),
-      kind: externalPromptReferenceKind(reference)
-    }));
+    return buildFloatPromptInlineReferences();
   }
 
   function handlePromptInput(event: FormEvent<HTMLDivElement>) {
@@ -525,6 +682,19 @@ export function FloatBall() {
     if (!input) {
       return;
     }
+    // The float window grows from ball width to prompt width asynchronously
+    // (via Tauri IPC). Measuring while the window is still narrow makes the text
+    // wrap into many lines, so the height gets wrongly clamped to the maximum.
+    // Wait until the window has actually widened before measuring.
+    if (
+      window.innerWidth < FLOAT_PROMPT_WIDTH - 40 &&
+      promptResizeAttempts.current < 60
+    ) {
+      promptResizeAttempts.current += 1;
+      schedulePromptInputResize();
+      return;
+    }
+    promptResizeAttempts.current = 0;
     const nextHeight = Math.min(
       FLOAT_PROMPT_INPUT_MAX_HEIGHT,
       promptInputContentHeight(input)
@@ -533,13 +703,15 @@ export function FloatBall() {
     setPromptInputHeight((current) => current === nextHeight ? current : nextHeight);
   }
 
+  resizePromptInputRef.current = resizePromptInput;
+
   function schedulePromptInputResize() {
     if (promptResizeFrame.current) {
       window.cancelAnimationFrame(promptResizeFrame.current);
     }
     promptResizeFrame.current = window.requestAnimationFrame(() => {
       promptResizeFrame.current = undefined;
-      resizePromptInput();
+      resizePromptInputRef.current();
     });
   }
 
@@ -557,6 +729,7 @@ export function FloatBall() {
     }
     const nextAttachments = attachments;
     const nextExternalPromptReferences = externalPromptReferences;
+    const previousMessage = agentStatus.message?.trim() ?? "";
     const externalReferenceText = formatExternalPromptReferences(nextExternalPromptReferences);
     const finalPrompt = appendPromptReferenceSections(
       prompt || t("prompt.continueFromAttachment"),
@@ -571,12 +744,18 @@ export function FloatBall() {
     setExternalPromptReferences([]);
     setPromptEditorText(promptInputRef.current, "");
     closePromptPanel();
+    pendingPromptStatus.current = {
+      sessionId: agentStatus.sessionId,
+      previousMessage,
+      startedAt: Date.now()
+    };
     setAgentStatus((current) => syncLocalStatus({
       ...current,
       kind: "working",
       label: t("float.agentWorking"),
       message: "",
-      pendingApproval: null
+      pendingApproval: null,
+      completedAt: undefined
     }));
     try {
       await promptSession({
@@ -658,28 +837,63 @@ export function FloatBall() {
 
   const canOpenPrompt = agentStatus.kind === "idle" || agentStatus.kind === "complete";
   const isAgentActive = agentStatus.kind === "working" || agentStatus.kind === "thinking";
+  const rawAgentMessage = agentStatus.message?.trim() ?? "";
+  const displayAgentMessage =
+    isAgentActive &&
+    pendingPromptStatus.current?.sessionId === agentStatus.sessionId &&
+    isStaleCompletedReply(rawAgentMessage, pendingPromptStatus.current.previousMessage)
+      ? ""
+      : rawAgentMessage;
+  const completedReplyKey = [
+    agentStatus.sessionId,
+    rawAgentMessage
+  ].join(":");
+  const hasCompletedReply =
+    agentStatus.kind === "complete" &&
+    Boolean(rawAgentMessage) &&
+    dismissedCompletedReply !== completedReplyKey;
   const isApprovalPending = agentStatus.kind === "approval";
   const isError = agentStatus.kind === "error";
   const showSleepingIcon =
-    isSleeping && !isAgentActive && !isApprovalPending && !isError && !showCompleteCheck;
-  const liveMessage = agentStatus.message?.trim() || agentStatus.label;
+    isSleeping &&
+    !isAgentActive &&
+    !hasCompletedReply &&
+    !isApprovalPending &&
+    !isError &&
+    !showCompleteCheck;
+  const liveMessage = (hasCompletedReply ? rawAgentMessage : displayAgentMessage) || agentStatus.label;
   const isPromptCapsuleOpen = expandedMode === "prompt" && canOpenPrompt;
   const isApprovalCapsuleOpen =
     expandedMode === "approval" && isApprovalPending && Boolean(agentStatus.pendingApproval);
   const showReplyCapsule =
-    !isPromptCapsuleOpen && !isApprovalCapsuleOpen && isAgentActive && liveMessage.length > 0;
-  const shouldRenderMarkdown = agentStatus.kind === "working";
+    !isPromptCapsuleOpen &&
+    !isApprovalCapsuleOpen &&
+    (hasCompletedReply || (isAgentActive && displayAgentMessage.length > 0)) &&
+    liveMessage.length > 0;
+  const shouldRenderMarkdown =
+    (agentStatus.kind === "working" && displayAgentMessage.length > 0) || hasCompletedReply;
   const canSendPrompt =
     Boolean(promptText.trim() || attachments.length || externalPromptReferences.length) &&
-    Boolean(agentStatus.sessionId) &&
     !isSubmittingPrompt;
 
   useLayoutEffect(() => {
     if (!isPromptCapsuleOpen) {
       return;
     }
-    setPromptEditorText(promptInputRef.current, promptText, floatPromptInlineReferences());
-  }, [isPromptCapsuleOpen]);
+    const nextReferences = resolvePromptReferencesFromStorage(
+      "float",
+      promptReferencesDraftUpdatedAtRef,
+      externalPromptReferences
+    );
+    if (!referencesEqual(externalPromptReferences, nextReferences)) {
+      setExternalPromptReferences(nextReferences);
+    }
+    setPromptEditorText(
+      promptInputRef.current,
+      promptText,
+      buildFloatPromptInlineReferences(nextReferences)
+    );
+  }, [externalPromptReferences, isPromptCapsuleOpen, promptText]);
 
   useEffect(() => {
     let disposed = false;
@@ -742,7 +956,6 @@ export function FloatBall() {
         : "ball";
   const floatWindowMetrics = floatWindowLayoutMetrics(
     floatLayoutKind,
-    thinkingBubbleDirection,
     promptWindowHeight
   );
   const containerClassName = [
@@ -768,7 +981,6 @@ export function FloatBall() {
     isPromptCapsuleOpen ? "floatCapsule--prompt" : "",
     isApprovalCapsuleOpen ? "floatCapsule--approval" : "",
     showReplyCapsule ? "floatCapsule--reply" : "",
-    showReplyCapsule ? `floatCapsule--${thinkingBubbleDirection}` : ""
   ].filter(Boolean).join(" ");
   const approvalTitle = agentStatus.pendingApproval?.command.trim();
 
@@ -824,20 +1036,39 @@ export function FloatBall() {
         <div className="floatCapsulePanel floatReplyCapsule" aria-live="polite">
           <div className="floatReplyHeader">
             <span>{agentStatus.label}</span>
-            <button
-              type="button"
-              className="floatPanelIconButton floatWindowModeButton"
-              aria-label={t("common.expand")}
-              title={t("common.expand")}
-              onClick={(event) => {
-                event.stopPropagation();
-                void restoreMainWindow();
-              }}
-            >
-              <Maximize2 size={13} />
-            </button>
+            <span className="floatReplyHeaderActions">
+              {hasCompletedReply && (
+                <button
+                  type="button"
+                  className="floatPanelIconButton"
+                  aria-label={t("prompt.closePanel")}
+                  title={t("prompt.closePanel")}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setDismissedCompletedReply(completedReplyKey);
+                  }}
+                >
+                  <X size={13} />
+                </button>
+              )}
+              <button
+                type="button"
+                className="floatPanelIconButton floatWindowModeButton"
+                aria-label={t("common.expand")}
+                title={t("common.expand")}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void restoreMainWindow();
+                }}
+              >
+                <Maximize2 size={13} />
+              </button>
+            </span>
           </div>
-          <div className="floatReplyTextStream" key={liveMessage}>
+          <div
+            className={`floatReplyTextStream ${hasCompletedReply ? "floatReplyTextStream--complete" : ""}`}
+            key={liveMessage}
+          >
             {shouldRenderMarkdown ? (
               <div className="floatThinkingBubbleMarkdown">
                 <ReactMarkdown
@@ -874,7 +1105,9 @@ export function FloatBall() {
         >
           <div
             ref={promptInputRef}
-            className="floatPromptInput"
+            className={`floatPromptInput promptRichInput ${
+              !promptText.trim() && !externalPromptReferences.length ? "empty" : ""
+            }`}
             role="textbox"
             aria-label={t("prompt.placeholder")}
             data-placeholder={t("prompt.placeholder")}
@@ -1019,7 +1252,6 @@ export function FloatBall() {
 
 function floatWindowLayoutMetrics(
   kind: FloatWindowLayoutKind,
-  direction: SideBubbleDirection,
   promptHeight: number
 ): FloatWindowMetrics {
   if (kind === "prompt") {
@@ -1042,9 +1274,7 @@ function floatWindowLayoutMetrics(
     return {
       width: FLOAT_REPLY_WIDTH,
       height: FLOAT_REPLY_HEIGHT,
-      anchorX: direction === "left"
-        ? FLOAT_REPLY_WIDTH - FLOAT_REPLY_ANCHOR_OFFSET
-        : FLOAT_REPLY_ANCHOR_OFFSET,
+      anchorX: FLOAT_REPLY_ANCHOR_OFFSET,
       anchorY: FLOAT_REPLY_HEIGHT / 2
     };
   }
@@ -1152,29 +1382,6 @@ function clampFloatWindowPosition(
 
 function clampNumber(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
-}
-
-async function resolveSideBubbleDirection(): Promise<SideBubbleDirection> {
-  try {
-    const floatWin = getCurrentWindow();
-    const [position, monitor] = await Promise.all([
-      floatWin.outerPosition(),
-      currentMonitor()
-    ]);
-    if (!monitor) {
-      return window.screenX + window.innerWidth * 0.5 > window.screen.availWidth * 0.5
-        ? "left"
-        : "right";
-    }
-    const monitorLeft = monitor.position.x;
-    const monitorWidth = monitor.size.width;
-    const windowCenter = position.x + window.innerWidth * window.devicePixelRatio * 0.5;
-    return windowCenter > monitorLeft + monitorWidth * 0.5 ? "left" : "right";
-  } catch {
-    return window.screenX + window.innerWidth * 0.5 > window.screen.availWidth * 0.5
-      ? "left"
-      : "right";
-  }
 }
 
 async function notifyMainSessionRefresh(sessionId: string) {

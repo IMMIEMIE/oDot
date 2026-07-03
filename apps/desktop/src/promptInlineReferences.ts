@@ -35,12 +35,16 @@ export function appendPromptInlineReference(
   editor: HTMLDivElement,
   reference: PromptInlineReference
 ) {
-  if (editor.textContent?.trim()) {
-    editor.appendChild(document.createTextNode(" "));
+  const chip = createPromptInlineReferenceElement(reference);
+  const range = promptInlineReferenceInsertionRange(editor);
+  if (hasMeaningfulTextBeforeRange(editor, range)) {
+    insertNodeAtRange(range, document.createTextNode(" "));
   }
-  editor.appendChild(createPromptInlineReferenceElement(reference));
-  editor.appendChild(document.createTextNode(" "));
-  moveCaretToEnd(editor);
+  insertNodeAtRange(range, chip);
+  insertNodeAtRange(range, document.createTextNode(" "));
+  const selection = window.getSelection();
+  selection?.removeAllRanges();
+  selection?.addRange(range);
 }
 
 export function extractPromptEditorText(
@@ -69,12 +73,20 @@ export function extractPromptEditorText(
       return;
     }
     if (node.tagName === "BR") {
-      parts.push("\n");
+      if (!isContentEditablePlaceholderBr(node)) {
+        parts.push("\n");
+      }
       return;
     }
     node.childNodes.forEach(visit);
     if (node.tagName === "DIV" || node.tagName === "P") {
-      parts.push("\n");
+      const next = node.nextSibling;
+      if (
+        next instanceof HTMLElement &&
+        (next.tagName === "DIV" || next.tagName === "P")
+      ) {
+        parts.push("\n");
+      }
     }
   }
 
@@ -165,6 +177,101 @@ function createPromptInlineReferenceElement(reference: PromptInlineReference) {
 function promptInlineReferenceText(reference: PromptInlineReference) {
   const detail = promptInlineReferenceDetail(reference);
   return detail ? `${reference.label} ${detail}` : reference.label;
+}
+
+function promptInlineReferenceInsertionRange(editor: HTMLDivElement) {
+  const selection = window.getSelection();
+  if (
+    selection &&
+    selection.rangeCount > 0 &&
+    selection.anchorNode &&
+    editor.contains(selection.anchorNode)
+  ) {
+    const range = selection.getRangeAt(0).cloneRange();
+    range.collapse(false);
+    return range;
+  }
+  return promptInlineReferenceEndRange(editor);
+}
+
+function promptInlineReferenceEndRange(editor: HTMLDivElement) {
+  const range = document.createRange();
+  let node: ChildNode | null = editor.lastChild;
+
+  while (node) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      range.setStart(node, node.textContent?.length ?? 0);
+      range.collapse(true);
+      return range;
+    }
+    if (!(node instanceof HTMLElement)) {
+      break;
+    }
+    if (node.dataset.inlineReferenceId) {
+      range.setStartAfter(node);
+      range.collapse(true);
+      return range;
+    }
+    if (node.tagName === "BR") {
+      range.setStartBefore(node);
+      range.collapse(true);
+      return range;
+    }
+    if (node.tagName === "DIV" || node.tagName === "P") {
+      const last = node.lastChild;
+      if (last?.nodeName === "BR") {
+        if (node.childNodes.length === 1) {
+          node.removeChild(last);
+          range.selectNodeContents(node);
+          range.collapse(false);
+          return range;
+        }
+        range.setStartBefore(last);
+        range.collapse(true);
+        return range;
+      }
+      if (last) {
+        node = last;
+        continue;
+      }
+      range.selectNodeContents(node);
+      range.collapse(false);
+      return range;
+    }
+    break;
+  }
+
+  range.selectNodeContents(editor);
+  range.collapse(false);
+  return range;
+}
+
+function insertNodeAtRange(range: Range, node: Node) {
+  range.insertNode(node);
+  range.setStartAfter(node);
+  range.collapse(true);
+}
+
+function hasMeaningfulTextBeforeRange(editor: HTMLDivElement, range: Range) {
+  const beforeRange = document.createRange();
+  beforeRange.selectNodeContents(editor);
+  beforeRange.setEnd(range.startContainer, range.startOffset);
+  return Boolean(beforeRange.toString().replace(/\u00a0/g, " ").trim());
+}
+
+function isContentEditablePlaceholderBr(node: ChildNode) {
+  if (!(node instanceof HTMLElement) || node.tagName !== "BR") {
+    return false;
+  }
+  const parent = node.parentElement;
+  if (!parent || parent === node.ownerDocument?.body) {
+    return false;
+  }
+  if (node !== parent.lastChild) {
+    return false;
+  }
+  const text = (parent.textContent || "").replace(/\u00a0/g, " ");
+  return Boolean(text.trim());
 }
 
 function promptInlineReferenceDetail(reference: PromptInlineReference) {

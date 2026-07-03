@@ -107,7 +107,7 @@
     "agentWorking": "Agent 正在工作，结束后才能继续发送。",
     "agentStopping": "Agent 正在停止，确认截断后才能继续发送。",
     "pendingCommands": "请先处理待确认命令。",
-    "followUp": "要求后续变更",
+    "followUp": "这里输入",
     "placeholder": "输入 prompt，Enter 发送",
     "continueSession": "继续当前会话",
     "closePanel": "关闭输入框",
