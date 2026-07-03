@@ -109,6 +109,24 @@ import {
   type TodoRecord
 } from "./api";
 import {
+  appendPromptReferenceSections,
+  externalPromptReferenceKind,
+  externalPromptReferenceLineLabel,
+  externalPromptReferenceName,
+  externalPromptReferencesFromPayload,
+  formatExternalPromptReferences,
+  mergeExternalPromptReferences,
+  type ExternalPromptReference
+} from "./externalPromptReferences";
+import {
+  extractPromptEditorText,
+  insertTextAtSelection,
+  moveCaretToEnd,
+  setPromptEditorText,
+  syncPromptInlineReferences,
+  type PromptInlineReference
+} from "./promptInlineReferences";
+import {
   EMPTY_SESSION_EVENTS as EMPTY_EVENTS,
   currentSessionEvents,
   mergeSessionEvents,
@@ -162,27 +180,6 @@ type TreeNode = {
   path: string;
   file?: ProjectFile;
   children: TreeNode[];
-};
-
-type PromptInlineReference = {
-  id: string;
-  source: "selectedPath" | "attachment" | "externalReference";
-  sourceId: string;
-  label: string;
-  detail: string;
-  kind: "file" | "directory" | "selection" | "attachment";
-};
-
-type ExternalPromptReference = {
-  id: string;
-  source?: string | null;
-  workspaceRoot?: string | null;
-  itemType?: string | null;
-  path?: string | null;
-  absolutePath?: string | null;
-  startLine?: number | null;
-  endLine?: number | null;
-  language?: string | null;
 };
 
 export function App() {
@@ -717,8 +714,12 @@ export function App() {
     let unlisten: (() => void) | undefined;
     void listen<ExternalPromptReferencePayload>(
       "odot:external-prompt-references",
-      ({ payload }) => {
+      async ({ payload }) => {
         if (disposed) {
+          return;
+        }
+        const isVisible = await getCurrentWindow().isVisible().catch(() => true);
+        if (disposed || !isVisible) {
           return;
         }
         if (isPromptLocked) {
@@ -7182,179 +7183,6 @@ function buildPromptInlineReferences(
   return [...selectedReferences, ...attachmentReferences, ...externalPromptReferences];
 }
 
-function syncPromptInlineReferences(
-  editor: HTMLDivElement,
-  references: PromptInlineReference[]
-) {
-  const referenceIds = new Set(references.map((reference) => reference.id));
-  editor
-    .querySelectorAll<HTMLElement>("[data-inline-reference-id]")
-    .forEach((node) => {
-      if (!referenceIds.has(node.dataset.inlineReferenceId || "")) {
-        node.remove();
-      }
-    });
-
-  for (const reference of references) {
-    const exists = Array.from(
-      editor.querySelectorAll<HTMLElement>("[data-inline-reference-id]")
-    ).some((node) => node.dataset.inlineReferenceId === reference.id);
-    if (exists) {
-      continue;
-    }
-    appendPromptInlineReference(editor, reference);
-  }
-}
-
-function appendPromptInlineReference(
-  editor: HTMLDivElement,
-  reference: PromptInlineReference
-) {
-  if (editor.textContent?.trim()) {
-    editor.appendChild(document.createTextNode(" "));
-  }
-  editor.appendChild(createPromptInlineReferenceElement(reference));
-  editor.appendChild(document.createTextNode(" "));
-  moveCaretToEnd(editor);
-}
-
-function createPromptInlineReferenceElement(reference: PromptInlineReference) {
-  const chip = document.createElement("span");
-  chip.className = `promptInlineReference ${reference.kind}`;
-  chip.contentEditable = "false";
-  chip.dataset.inlineReferenceId = reference.id;
-  chip.dataset.promptLabel = promptInlineReferenceText(reference);
-
-  const marker = document.createElement("span");
-  marker.className = "promptInlineReferenceMarker";
-  marker.textContent = reference.kind === "directory" ? "dir" : "#";
-  chip.appendChild(marker);
-
-  const label = document.createElement("span");
-  label.className = "promptInlineReferenceLabel";
-  label.textContent = reference.label;
-  chip.appendChild(label);
-
-  const detail = promptInlineReferenceDetail(reference);
-  if (detail) {
-    const detailNode = document.createElement("small");
-    detailNode.textContent = detail;
-    chip.appendChild(detailNode);
-  }
-
-  const button = document.createElement("button");
-  button.type = "button";
-  button.tabIndex = -1;
-  button.dataset.removeInlineReference = reference.id;
-  button.setAttribute("aria-label", `Remove ${reference.label}`);
-  button.textContent = "x";
-  chip.appendChild(button);
-
-  return chip;
-}
-
-function extractPromptEditorText(
-  editor: HTMLDivElement | null,
-  options: { includeReferences?: boolean } = {}
-) {
-  if (!editor) {
-    return "";
-  }
-  const parts: string[] = [];
-
-  function visit(node: ChildNode) {
-    if (node.nodeType === Node.TEXT_NODE) {
-      parts.push(node.textContent || "");
-      return;
-    }
-    if (!(node instanceof HTMLElement)) {
-      return;
-    }
-    if (node.dataset.inlineReferenceId) {
-      if (options.includeReferences) {
-        parts.push(` ${node.dataset.promptLabel || node.textContent || ""} `);
-      } else {
-        parts.push(" ");
-      }
-      return;
-    }
-    if (node.tagName === "BR") {
-      parts.push("\n");
-      return;
-    }
-    node.childNodes.forEach(visit);
-    if (node.tagName === "DIV" || node.tagName === "P") {
-      parts.push("\n");
-    }
-  }
-
-  editor.childNodes.forEach(visit);
-  return parts
-    .join("")
-    .replace(/\u00a0/g, " ")
-    .replace(/[ \t]{2,}/g, " ")
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n");
-}
-
-function setPromptEditorText(
-  editor: HTMLDivElement | null,
-  text: string,
-  references: PromptInlineReference[] = []
-) {
-  if (!editor) {
-    return;
-  }
-  editor.textContent = text;
-  syncPromptInlineReferences(editor, references);
-  moveCaretToEnd(editor);
-}
-
-function insertTextAtSelection(text: string) {
-  const selection = window.getSelection();
-  if (!selection || !selection.rangeCount) {
-    return;
-  }
-  const range = selection.getRangeAt(0);
-  range.deleteContents();
-  const node = document.createTextNode(text);
-  range.insertNode(node);
-  range.setStartAfter(node);
-  range.setEndAfter(node);
-  selection.removeAllRanges();
-  selection.addRange(range);
-}
-
-function moveCaretToEnd(editor: HTMLDivElement | null) {
-  if (!editor) {
-    return;
-  }
-  const selection = window.getSelection();
-  const range = document.createRange();
-  range.selectNodeContents(editor);
-  range.collapse(false);
-  selection?.removeAllRanges();
-  selection?.addRange(range);
-}
-
-function promptInlineReferenceText(reference: PromptInlineReference) {
-  const detail = promptInlineReferenceDetail(reference);
-  return detail ? `${reference.label} ${detail}` : reference.label;
-}
-
-function promptInlineReferenceDetail(reference: PromptInlineReference) {
-  if (reference.source === "externalReference") {
-    return reference.detail;
-  }
-  if (reference.kind === "selection" && reference.detail) {
-    return `(${reference.detail})`;
-  }
-  if (reference.source === "selectedPath") {
-    return "";
-  }
-  return reference.detail ? `(${reference.detail})` : "";
-}
-
 function parseAttachmentReferenceLabel(name: string) {
   const match = /^(.+):(\d+(?:-\d+)?)$/.exec(name);
   if (match) {
@@ -7376,103 +7204,6 @@ function attachmentUploadTitle(kinds: PromptAttachmentKind[]) {
   );
   const separator = i18n.language === "zh" ? "、" : ", ";
   return appT("attachment.uploadTypes", { types: labels.join(separator) });
-}
-
-function externalPromptReferencesFromPayload(
-  payload: ExternalPromptReferencePayload
-): ExternalPromptReference[] {
-  return (payload.items ?? []).flatMap((item) => {
-    const absolutePath = item.absolutePath?.trim() || "";
-    const itemPath = item.path?.trim() || "";
-    if (!absolutePath && !itemPath) {
-      return [];
-    }
-    const reference: ExternalPromptReference = {
-      id: externalPromptReferenceId(payload, item),
-      source: payload.source,
-      workspaceRoot: payload.workspaceRoot,
-      itemType: item.itemType,
-      path: itemPath || null,
-      absolutePath: absolutePath || null,
-      startLine: item.startLine,
-      endLine: item.endLine,
-      language: item.language
-    };
-    return [reference];
-  });
-}
-
-function mergeExternalPromptReferences(
-  current: ExternalPromptReference[],
-  next: ExternalPromptReference[]
-) {
-  const byId = new Map(current.map((reference) => [reference.id, reference]));
-  for (const reference of next) {
-    byId.set(reference.id, reference);
-  }
-  return Array.from(byId.values());
-}
-
-function externalPromptReferenceId(
-  payload: ExternalPromptReferencePayload,
-  item: ExternalPromptReferencePayload["items"][number]
-) {
-  return [
-    payload.source || "external",
-    item.absolutePath || item.path || "",
-    item.startLine || "",
-    item.endLine || "",
-    item.itemType || ""
-  ].join(":");
-}
-
-function externalPromptReferenceName(item: ExternalPromptReference) {
-  const rawName = item.path || item.absolutePath || item.itemType || "external-reference";
-  const baseName = rawName.split(/[\\/]/).filter(Boolean).at(-1) || rawName;
-  return baseName;
-}
-
-function externalPromptReferenceLineLabel(
-  item: ExternalPromptReference,
-  format: "display" | "plain" = "plain"
-) {
-  const prefix = format === "display" ? "L" : "";
-  if (item.startLine && item.endLine && item.endLine !== item.startLine) {
-    return `${prefix}${item.startLine}-${item.endLine}`;
-  }
-  if (item.startLine) {
-    return `${prefix}${item.startLine}`;
-  }
-  return "";
-}
-
-function externalPromptReferenceKind(reference: ExternalPromptReference) {
-  if ((reference.itemType || "").toLowerCase().includes("dir")) {
-    return "directory";
-  }
-  if (reference.startLine) {
-    return "selection";
-  }
-  return "file";
-}
-
-function formatExternalPromptReferences(references: ExternalPromptReference[]) {
-  const lines = references
-    .map((reference) => {
-      const location = reference.absolutePath || reference.path || "";
-      const lineLabel = externalPromptReferenceLineLabel(reference, "display");
-      return [location, lineLabel].filter(Boolean).join(" ");
-    })
-    .filter(Boolean);
-  return lines.length ? `Referenced VS Code locations:\n${lines.join("\n")}` : "";
-}
-
-function appendPromptReferenceSections(prompt: string, sections: string[]) {
-  const cleanedSections = sections.map((section) => section.trim()).filter(Boolean);
-  if (!cleanedSections.length) {
-    return prompt;
-  }
-  return [prompt.trim(), ...cleanedSections].filter(Boolean).join("\n\n");
 }
 
 function promptAttachmentSummaries(value: unknown): PromptAttachmentSummary[] {

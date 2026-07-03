@@ -4108,7 +4108,10 @@ body.float-window-body {
   color: var(--ink);
   line-height: 1.45;
   overflow-y: auto;
+  outline: none;
   scrollbar-width: none;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .floatPromptCapsule .floatPromptInput:focus {
@@ -4116,14 +4119,44 @@ body.float-window-body {
   box-shadow: none;
 }
 
+.floatPromptCapsule .floatPromptInput:empty::before {
+  content: attr(data-placeholder);
+  color: var(--muted);
+  pointer-events: none;
+}
+
 .floatPromptCapsule .floatPromptInput::-webkit-scrollbar {
   display: none;
 }
 
+.floatPromptCapsule .promptInlineReference {
+  margin: 0 2px;
+  max-width: 180px;
+  vertical-align: baseline;
+}
+
 .floatPromptCapsule .floatAttachmentList {
+  flex-wrap: nowrap;
   max-height: 28px;
   margin-top: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.floatPromptCapsule .floatAttachmentList::-webkit-scrollbar {
+  display: none;
+}
+
+.floatPromptCapsule .floatAttachmentChip {
+  flex: 0 0 auto;
+  max-width: 210px;
+}
+
+.floatPromptCapsule .floatAttachmentChip {
   overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .floatPromptCapsule .floatPanelError {

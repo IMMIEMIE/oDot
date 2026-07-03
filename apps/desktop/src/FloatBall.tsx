@@ -10,7 +10,12 @@ import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { AlertTriangle, Check, KeyRound, Maximize2, Send, ShieldCheck, X } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import type { ClipboardEvent as ReactClipboardEvent, PointerEvent as ReactPointerEvent } from "react";
+import type {
+  ClipboardEvent as ReactClipboardEvent,
+  FormEvent,
+  MouseEvent as ReactMouseEvent,
+  PointerEvent as ReactPointerEvent
+} from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { OdodBotIcon, SleepingOdodBotIcon, WorkingOdodBotIcon } from "./OdodBotIcon";
@@ -23,8 +28,25 @@ import {
   promptSession,
   rejectToolCall,
   replyPermission,
-  saveShellPolicy
+  saveShellPolicy,
+  type ExternalPromptReferencePayload
 } from "./api";
+import {
+  appendPromptReferenceSections,
+  externalPromptReferenceKind,
+  externalPromptReferenceLineLabel,
+  externalPromptReferenceName,
+  externalPromptReferencesFromPayload,
+  formatExternalPromptReferences,
+  mergeExternalPromptReferences,
+  type ExternalPromptReference
+} from "./externalPromptReferences";
+import {
+  extractPromptEditorText,
+  setPromptEditorText,
+  syncPromptInlineReferences,
+  type PromptInlineReference
+} from "./promptInlineReferences";
 import {
   FLOAT_AGENT_STATUS_STORAGE_KEY,
   saveFloatAgentStatus,
@@ -75,7 +97,6 @@ const FLOAT_APPROVAL_HEIGHT = 166;
 const FLOAT_REPLY_WIDTH = 332;
 const FLOAT_REPLY_HEIGHT = 112;
 const FLOAT_REPLY_ANCHOR_OFFSET = 36;
-let promptTextMeasureContext: CanvasRenderingContext2D | null | undefined;
 
 export function FloatBall() {
   const { t } = useTranslation();
@@ -84,6 +105,9 @@ export function FloatBall() {
   const [expandedMode, setExpandedMode] = useState<FloatExpansionMode | null>(null);
   const [promptText, setPromptText] = useState(() => readPromptDraft()?.text ?? "");
   const [attachments, setAttachments] = useState<PromptAttachment[]>([]);
+  const [externalPromptReferences, setExternalPromptReferences] = useState<
+    ExternalPromptReference[]
+  >([]);
   const [panelError, setPanelError] = useState("");
   const [isSubmittingPrompt, setIsSubmittingPrompt] = useState(false);
   const [isResolvingApproval, setIsResolvingApproval] = useState(false);
@@ -100,8 +124,9 @@ export function FloatBall() {
   const previousStatusKind = useRef<FloatAgentStatusKind>(agentStatus.kind);
   const promptDraftUpdatedAtRef = useRef(readPromptDraft()?.updatedAt ?? 0);
   const floatWindowAnchor = useRef<FloatWindowAnchor | null>(null);
-  const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const promptInputRef = useRef<HTMLDivElement | null>(null);
   const resizeRequestId = useRef(0);
+  const promptResizeFrame = useRef<number | undefined>(undefined);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -168,6 +193,7 @@ export function FloatBall() {
       }
       promptDraftUpdatedAtRef.current = draft.updatedAt;
       setPromptText(draft.text);
+      setPromptEditorText(promptInputRef.current, draft.text, floatPromptInlineReferences());
     };
     const onStorage = (event: StorageEvent) => {
       if (event.key === PROMPT_DRAFT_STORAGE_KEY) {
@@ -198,6 +224,15 @@ export function FloatBall() {
     };
   }, []);
 
+  useLayoutEffect(() => {
+    const editor = promptInputRef.current;
+    if (!editor) {
+      return;
+    }
+    syncPromptInlineReferences(editor, floatPromptInlineReferences());
+    setPromptText(extractPromptEditorText(editor));
+  }, [externalPromptReferences]);
+
   useEffect(() => {
     function enterFloatSleep() {
       setIsSleeping(true);
@@ -222,6 +257,15 @@ export function FloatBall() {
       if (sleepTimer.current) {
         window.clearTimeout(sleepTimer.current);
         sleepTimer.current = undefined;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (promptResizeFrame.current) {
+        window.cancelAnimationFrame(promptResizeFrame.current);
+        promptResizeFrame.current = undefined;
       }
     };
   }, []);
@@ -378,13 +422,19 @@ export function FloatBall() {
 
   function openPromptPanel() {
     const draft = readPromptDraft();
+    let nextPromptText = promptText;
     if (draft && draft.updatedAt >= promptDraftUpdatedAtRef.current) {
       promptDraftUpdatedAtRef.current = draft.updatedAt;
-      setPromptText(draft.text);
+      nextPromptText = draft.text;
+      setPromptText(nextPromptText);
     }
     setPromptInputHeight(FLOAT_PROMPT_INPUT_MIN_HEIGHT);
     setExpandedMode("prompt");
     setPanelError("");
+    window.setTimeout(() => {
+      setPromptEditorText(promptInputRef.current, nextPromptText, floatPromptInlineReferences());
+      promptInputRef.current?.focus();
+    }, 0);
   }
 
   function closePromptPanel() {
@@ -392,7 +442,59 @@ export function FloatBall() {
     setPanelError("");
   }
 
-  async function handlePaste(event: ReactClipboardEvent<HTMLTextAreaElement>) {
+  function floatPromptInlineReferences(): PromptInlineReference[] {
+    return externalPromptReferences.map((reference): PromptInlineReference => ({
+      id: `external:${reference.id}`,
+      source: "externalReference",
+      sourceId: reference.id,
+      label: externalPromptReferenceName(reference),
+      detail: externalPromptReferenceLineLabel(reference, "display"),
+      kind: externalPromptReferenceKind(reference)
+    }));
+  }
+
+  function handlePromptInput(event: FormEvent<HTMLDivElement>) {
+    const value = extractPromptEditorText(event.currentTarget);
+    setPromptText(value);
+    savePromptDraft(value, "float");
+    promptDraftUpdatedAtRef.current = readPromptDraft()?.updatedAt ?? Date.now();
+    pruneMissingPromptInlineReferences(event.currentTarget);
+    schedulePromptInputResize();
+  }
+
+  function handlePromptEditorClick(event: ReactMouseEvent<HTMLDivElement>) {
+    const target = event.target as HTMLElement;
+    const removeButton = target.closest<HTMLButtonElement>("[data-remove-inline-reference]");
+    if (!removeButton) {
+      return;
+    }
+    event.preventDefault();
+    const referenceId = removeButton.dataset.removeInlineReference;
+    const reference = floatPromptInlineReferences().find((item) => item.id === referenceId);
+    if (reference) {
+      setExternalPromptReferences((current) =>
+        current.filter((item) => item.id !== reference.sourceId)
+      );
+    }
+  }
+
+  function pruneMissingPromptInlineReferences(editor: HTMLDivElement) {
+    const presentIds = new Set(
+      Array.from(editor.querySelectorAll<HTMLElement>("[data-inline-reference-id]"))
+        .map((node) => node.dataset.inlineReferenceId)
+        .filter(Boolean)
+    );
+    for (const reference of floatPromptInlineReferences()) {
+      if (presentIds.has(reference.id)) {
+        continue;
+      }
+      setExternalPromptReferences((current) =>
+        current.filter((item) => item.id !== reference.sourceId)
+      );
+    }
+  }
+
+  async function handlePaste(event: ReactClipboardEvent<HTMLDivElement>) {
     const files = clipboardFiles(event.clipboardData);
     if (!files.length) {
       return;
@@ -408,14 +510,45 @@ export function FloatBall() {
       );
       setAttachments((current) => [...current, ...nextAttachments]);
       setPanelError("");
+      schedulePromptInputResize();
     } catch (error) {
       setPanelError(errorSummary(error));
     }
   }
 
+  function resizePromptInput() {
+    if (!isPromptCapsuleOpen) {
+      setPromptInputHeight(FLOAT_PROMPT_INPUT_MIN_HEIGHT);
+      return;
+    }
+    const input = promptInputRef.current;
+    if (!input) {
+      return;
+    }
+    const nextHeight = Math.min(
+      FLOAT_PROMPT_INPUT_MAX_HEIGHT,
+      promptInputContentHeight(input)
+    );
+    input.style.height = `${nextHeight}px`;
+    setPromptInputHeight((current) => current === nextHeight ? current : nextHeight);
+  }
+
+  function schedulePromptInputResize() {
+    if (promptResizeFrame.current) {
+      window.cancelAnimationFrame(promptResizeFrame.current);
+    }
+    promptResizeFrame.current = window.requestAnimationFrame(() => {
+      promptResizeFrame.current = undefined;
+      resizePromptInput();
+    });
+  }
+
   async function sendPrompt() {
-    const prompt = promptText.trim();
-    if (isSubmittingPrompt || (!prompt && !attachments.length)) {
+    const editorPrompt = extractPromptEditorText(promptInputRef.current, {
+      includeReferences: true
+    }).trim();
+    const prompt = editorPrompt || promptText.trim();
+    if (isSubmittingPrompt || (!prompt && !attachments.length && !externalPromptReferences.length)) {
       return;
     }
     if (!agentStatus.sessionId) {
@@ -423,12 +556,20 @@ export function FloatBall() {
       return;
     }
     const nextAttachments = attachments;
+    const nextExternalPromptReferences = externalPromptReferences;
+    const externalReferenceText = formatExternalPromptReferences(nextExternalPromptReferences);
+    const finalPrompt = appendPromptReferenceSections(
+      prompt || t("prompt.continueFromAttachment"),
+      [externalReferenceText]
+    );
     setIsSubmittingPrompt(true);
     setPanelError("");
     setPromptText("");
     clearPromptDraft("float");
     promptDraftUpdatedAtRef.current = readPromptDraft()?.updatedAt ?? Date.now();
     setAttachments([]);
+    setExternalPromptReferences([]);
+    setPromptEditorText(promptInputRef.current, "");
     closePromptPanel();
     setAgentStatus((current) => syncLocalStatus({
       ...current,
@@ -440,7 +581,7 @@ export function FloatBall() {
     try {
       await promptSession({
         sessionId: agentStatus.sessionId,
-        prompt: prompt || t("prompt.continueFromAttachment"),
+        prompt: finalPrompt,
         attachments: nextAttachments.map(toPromptAttachmentInput),
         delivery: "queue",
         resume: true
@@ -529,9 +670,59 @@ export function FloatBall() {
     !isPromptCapsuleOpen && !isApprovalCapsuleOpen && isAgentActive && liveMessage.length > 0;
   const shouldRenderMarkdown = agentStatus.kind === "working";
   const canSendPrompt =
-    Boolean(promptText.trim() || attachments.length) &&
+    Boolean(promptText.trim() || attachments.length || externalPromptReferences.length) &&
     Boolean(agentStatus.sessionId) &&
     !isSubmittingPrompt;
+
+  useLayoutEffect(() => {
+    if (!isPromptCapsuleOpen) {
+      return;
+    }
+    setPromptEditorText(promptInputRef.current, promptText, floatPromptInlineReferences());
+  }, [isPromptCapsuleOpen]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<ExternalPromptReferencePayload>(
+      "odot:external-prompt-references",
+      async ({ payload }) => {
+        if (disposed) {
+          return;
+        }
+        const isVisible = await getCurrentWindow().isVisible().catch(() => true);
+        if (disposed || !isVisible) {
+          return;
+        }
+        if (!canOpenPrompt || isSubmittingPrompt) {
+          setPanelError(t("prompt.agentWorking"));
+          return;
+        }
+        const nextReferences = externalPromptReferencesFromPayload(payload);
+        if (!nextReferences.length) {
+          setPanelError(t("error.unknown"));
+          return;
+        }
+        setExternalPromptReferences((current) =>
+          mergeExternalPromptReferences(current, nextReferences)
+        );
+        setPanelError("");
+        setExpandedMode("prompt");
+        window.setTimeout(() => promptInputRef.current?.focus(), 0);
+      }
+    ).then((dispose) => {
+      if (disposed) {
+        dispose();
+      } else {
+        unlisten = dispose;
+      }
+    }).catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [canOpenPrompt, isSubmittingPrompt, t]);
+
   const promptInputChromeHeight =
     FLOAT_PROMPT_CHROME_HEIGHT +
     (attachments.length ? 32 : 0) +
@@ -539,21 +730,8 @@ export function FloatBall() {
   const promptWindowHeight = promptInputChromeHeight + promptInputHeight;
 
   useLayoutEffect(() => {
-    if (!isPromptCapsuleOpen) {
-      setPromptInputHeight(FLOAT_PROMPT_INPUT_MIN_HEIGHT);
-      return;
-    }
-    const input = promptInputRef.current;
-    if (!input) {
-      return;
-    }
-    const nextHeight = Math.min(
-      FLOAT_PROMPT_INPUT_MAX_HEIGHT,
-      promptInputContentHeight(input, input.value)
-    );
-    input.style.height = `${nextHeight}px`;
-    setPromptInputHeight((current) => current === nextHeight ? current : nextHeight);
-  }, [isPromptCapsuleOpen, promptText]);
+    resizePromptInput();
+  }, [externalPromptReferences.length, isPromptCapsuleOpen, promptText]);
 
   const floatLayoutKind: FloatWindowLayoutKind = isPromptCapsuleOpen
     ? "prompt"
@@ -694,23 +872,23 @@ export function FloatBall() {
             void sendPrompt();
           }}
         >
-          <textarea
+          <div
             ref={promptInputRef}
             className="floatPromptInput"
-            value={promptText}
-            placeholder={t("prompt.placeholder")}
-            disabled={isSubmittingPrompt}
-            onChange={(event) => {
-              const value = event.target.value;
-              setPromptText(value);
-              savePromptDraft(value, "float");
-              promptDraftUpdatedAtRef.current = readPromptDraft()?.updatedAt ?? Date.now();
-            }}
+            role="textbox"
+            aria-label={t("prompt.placeholder")}
+            data-placeholder={t("prompt.placeholder")}
+            contentEditable={!isSubmittingPrompt}
+            suppressContentEditableWarning
+            onInput={handlePromptInput}
+            onClick={handlePromptEditorClick}
             onPaste={(event) => void handlePaste(event)}
             onKeyDown={(event) => {
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
                 void sendPrompt();
+              } else if (event.key === "Enter" && event.shiftKey) {
+                schedulePromptInputResize();
               }
             }}
           />
@@ -878,73 +1056,27 @@ function floatWindowLayoutMetrics(
   };
 }
 
-function promptInputContentHeight(input: HTMLTextAreaElement, value: string) {
-  const text = value.trimEnd();
-  if (!text) {
-    return FLOAT_PROMPT_INPUT_MIN_HEIGHT;
-  }
-
+function promptInputContentHeight(input: HTMLDivElement) {
   const style = window.getComputedStyle(input);
   const lineHeight = cssPixels(style.lineHeight)
     ?? (cssPixels(style.fontSize) ?? 12) * 1.45;
   const paddingTop = cssPixels(style.paddingTop) ?? 0;
   const paddingBottom = cssPixels(style.paddingBottom) ?? 0;
-  const paddingLeft = cssPixels(style.paddingLeft) ?? 0;
-  const paddingRight = cssPixels(style.paddingRight) ?? 0;
-  const inputWidth =
-    input.clientWidth ||
-    input.getBoundingClientRect().width ||
-    FLOAT_PROMPT_WIDTH - 74;
-  const contentWidth = Math.max(1, inputWidth - paddingLeft - paddingRight);
-  const rows = promptInputWrappedRows(
-    text,
-    style.font || `${style.fontSize} ${style.fontFamily}`,
-    contentWidth
-  );
-
-  return Math.max(
-    FLOAT_PROMPT_INPUT_MIN_HEIGHT,
-    Math.ceil(rows * lineHeight + paddingTop + paddingBottom)
-  );
-}
-
-function promptInputWrappedRows(text: string, font: string, width: number) {
-  const context = promptMeasureContext();
-  if (!context) {
-    return Math.max(1, text.split(/\r?\n/).length);
+  if (!input.textContent?.trim() && !input.querySelector("[data-inline-reference-id]")) {
+    return FLOAT_PROMPT_INPUT_MIN_HEIGHT;
   }
-
-  context.font = font;
-  let rows = 0;
-  for (const line of text.split(/\r?\n/)) {
-    if (!line) {
-      rows += 1;
-      continue;
-    }
-
-    let lineRows = 1;
-    let currentWidth = 0;
-    for (const char of Array.from(line)) {
-      const charWidth = context.measureText(char).width;
-      if (currentWidth > 0 && currentWidth + charWidth > width) {
-        lineRows += 1;
-        currentWidth = charWidth;
-      } else {
-        currentWidth += charWidth;
-      }
-    }
-    rows += lineRows;
-  }
-
-  return Math.max(1, rows);
-}
-
-function promptMeasureContext() {
-  if (promptTextMeasureContext !== undefined) {
-    return promptTextMeasureContext;
-  }
-  promptTextMeasureContext = document.createElement("canvas").getContext("2d");
-  return promptTextMeasureContext;
+  // Temporarily set height:auto + overflow:hidden so scrollHeight
+  // returns the true content height instead of the previously set
+  // fixed height (WebView2 may return the fixed height otherwise).
+  const savedHeight = input.style.height;
+  const savedOverflow = input.style.overflowY;
+  input.style.height = "auto";
+  input.style.overflowY = "hidden";
+  const naturalHeight = input.scrollHeight;
+  input.style.height = savedHeight;
+  input.style.overflowY = savedOverflow;
+  const singleLineHeight = Math.ceil(lineHeight + paddingTop + paddingBottom);
+  return Math.max(FLOAT_PROMPT_INPUT_MIN_HEIGHT, naturalHeight, singleLineHeight);
 }
 
 function cssPixels(value: string) {
