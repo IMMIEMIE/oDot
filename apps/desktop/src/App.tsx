@@ -4066,7 +4066,6 @@ function TimelineItemView({
   onRecoverAgent: (actionId: string) => Promise<void>;
 }) {
   const { t } = useTranslation();
-  const hiddenDetails = item.details.filter((event) => event.id !== item.event?.id);
   const icon = timelineItemIcon(item);
   const isReasoningItem = item.kind === "reasoning";
 
@@ -4186,7 +4185,6 @@ function TimelineItemView({
             <span>{item.hiddenSummary}</span>
           </div>
         )}
-        {!isReasoningItem && <HiddenDetails events={hiddenDetails} />}
       </div>
     </article>
   );
@@ -4406,40 +4404,6 @@ function CodeChangeList({
           onRollbackSnapshots={onRollbackSnapshots}
         />
       ))}
-    </div>
-  );
-}
-
-function HiddenDetails({ events }: { events: EventRecord[] }) {
-  const { t } = useTranslation();
-  const [expanded, setExpanded] = useState(false);
-  if (!events.length) {
-    return null;
-  }
-  return (
-    <div className="hiddenDetails">
-      <button
-        type="button"
-        className="detailsToggle"
-        onClick={() => setExpanded(!expanded)}
-      >
-        {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-        {t("common.viewDetails")}
-        <span>{events.length}</span>
-      </button>
-      {expanded && (
-        <div className="detailsList">
-          {events.map((event) => (
-            <details className="rawEventDetail" key={event.id}>
-              <summary>
-                <span>{eventLabel(event)}</span>
-                <small>#{event.seq}</small>
-              </summary>
-              <pre>{JSON.stringify(event.data, null, 2)}</pre>
-            </details>
-          ))}
-        </div>
-      )}
     </div>
   );
 }

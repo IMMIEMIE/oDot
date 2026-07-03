@@ -67,12 +67,15 @@ const FLOAT_BALL_WINDOW_SIZE = 72;
 const FLOAT_BALL_CENTER = FLOAT_BALL_WINDOW_SIZE / 2;
 const FLOAT_PROMPT_WIDTH = 332;
 const FLOAT_PROMPT_INPUT_MIN_HEIGHT = 22;
+const FLOAT_PROMPT_INPUT_MAX_HEIGHT = 116;
 const FLOAT_PROMPT_CHROME_HEIGHT = 70;
+const FLOAT_WINDOW_SCREEN_MARGIN = 8;
 const FLOAT_APPROVAL_WIDTH = 332;
 const FLOAT_APPROVAL_HEIGHT = 166;
 const FLOAT_REPLY_WIDTH = 332;
 const FLOAT_REPLY_HEIGHT = 112;
 const FLOAT_REPLY_ANCHOR_OFFSET = 36;
+let promptTextMeasureContext: CanvasRenderingContext2D | null | undefined;
 
 export function FloatBall() {
   const { t } = useTranslation();
@@ -98,6 +101,7 @@ export function FloatBall() {
   const promptDraftUpdatedAtRef = useRef(readPromptDraft()?.updatedAt ?? 0);
   const floatWindowAnchor = useRef<FloatWindowAnchor | null>(null);
   const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const resizeRequestId = useRef(0);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -378,6 +382,7 @@ export function FloatBall() {
       promptDraftUpdatedAtRef.current = draft.updatedAt;
       setPromptText(draft.text);
     }
+    setPromptInputHeight(FLOAT_PROMPT_INPUT_MIN_HEIGHT);
     setExpandedMode("prompt");
     setPanelError("");
   }
@@ -527,11 +532,11 @@ export function FloatBall() {
     Boolean(promptText.trim() || attachments.length) &&
     Boolean(agentStatus.sessionId) &&
     !isSubmittingPrompt;
-  const promptWindowHeight =
+  const promptInputChromeHeight =
     FLOAT_PROMPT_CHROME_HEIGHT +
-    promptInputHeight +
     (attachments.length ? 32 : 0) +
     (panelError ? 20 : 0);
+  const promptWindowHeight = promptInputChromeHeight + promptInputHeight;
 
   useLayoutEffect(() => {
     if (!isPromptCapsuleOpen) {
@@ -542,10 +547,10 @@ export function FloatBall() {
     if (!input) {
       return;
     }
-    input.style.height = "0px";
-    const nextHeight = input.value.trim().length
-      ? Math.max(FLOAT_PROMPT_INPUT_MIN_HEIGHT, input.scrollHeight)
-      : FLOAT_PROMPT_INPUT_MIN_HEIGHT;
+    const nextHeight = Math.min(
+      FLOAT_PROMPT_INPUT_MAX_HEIGHT,
+      promptInputContentHeight(input, input.value)
+    );
     input.style.height = `${nextHeight}px`;
     setPromptInputHeight((current) => current === nextHeight ? current : nextHeight);
   }, [isPromptCapsuleOpen, promptText]);
@@ -590,7 +595,12 @@ export function FloatBall() {
   const approvalTitle = agentStatus.pendingApproval?.command.trim();
 
   useEffect(() => {
-    void resizeFloatWindow(floatWindowMetrics, floatWindowAnchor).catch(() => undefined);
+    const requestId = ++resizeRequestId.current;
+    void resizeFloatWindow(
+      floatWindowMetrics,
+      floatWindowAnchor,
+      () => requestId === resizeRequestId.current
+    ).catch(() => undefined);
   }, [
     floatWindowMetrics.anchorX,
     floatWindowMetrics.anchorY,
@@ -868,9 +878,84 @@ function floatWindowLayoutMetrics(
   };
 }
 
+function promptInputContentHeight(input: HTMLTextAreaElement, value: string) {
+  const text = value.trimEnd();
+  if (!text) {
+    return FLOAT_PROMPT_INPUT_MIN_HEIGHT;
+  }
+
+  const style = window.getComputedStyle(input);
+  const lineHeight = cssPixels(style.lineHeight)
+    ?? (cssPixels(style.fontSize) ?? 12) * 1.45;
+  const paddingTop = cssPixels(style.paddingTop) ?? 0;
+  const paddingBottom = cssPixels(style.paddingBottom) ?? 0;
+  const paddingLeft = cssPixels(style.paddingLeft) ?? 0;
+  const paddingRight = cssPixels(style.paddingRight) ?? 0;
+  const inputWidth =
+    input.clientWidth ||
+    input.getBoundingClientRect().width ||
+    FLOAT_PROMPT_WIDTH - 74;
+  const contentWidth = Math.max(1, inputWidth - paddingLeft - paddingRight);
+  const rows = promptInputWrappedRows(
+    text,
+    style.font || `${style.fontSize} ${style.fontFamily}`,
+    contentWidth
+  );
+
+  return Math.max(
+    FLOAT_PROMPT_INPUT_MIN_HEIGHT,
+    Math.ceil(rows * lineHeight + paddingTop + paddingBottom)
+  );
+}
+
+function promptInputWrappedRows(text: string, font: string, width: number) {
+  const context = promptMeasureContext();
+  if (!context) {
+    return Math.max(1, text.split(/\r?\n/).length);
+  }
+
+  context.font = font;
+  let rows = 0;
+  for (const line of text.split(/\r?\n/)) {
+    if (!line) {
+      rows += 1;
+      continue;
+    }
+
+    let lineRows = 1;
+    let currentWidth = 0;
+    for (const char of Array.from(line)) {
+      const charWidth = context.measureText(char).width;
+      if (currentWidth > 0 && currentWidth + charWidth > width) {
+        lineRows += 1;
+        currentWidth = charWidth;
+      } else {
+        currentWidth += charWidth;
+      }
+    }
+    rows += lineRows;
+  }
+
+  return Math.max(1, rows);
+}
+
+function promptMeasureContext() {
+  if (promptTextMeasureContext !== undefined) {
+    return promptTextMeasureContext;
+  }
+  promptTextMeasureContext = document.createElement("canvas").getContext("2d");
+  return promptTextMeasureContext;
+}
+
+function cssPixels(value: string) {
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 async function resizeFloatWindow(
   metrics: FloatWindowMetrics,
-  anchorRef: { current: FloatWindowAnchor | null }
+  anchorRef: { current: FloatWindowAnchor | null },
+  isCurrent: () => boolean = () => true
 ) {
   const floatWin = getCurrentWindow();
   const scaleFactor = window.devicePixelRatio || 1;
@@ -878,6 +963,10 @@ async function resizeFloatWindow(
     floatWin.outerPosition(),
     floatWin.outerSize()
   ]);
+  const monitor = await currentMonitor();
+  if (!isCurrent()) {
+    return;
+  }
   const currentAnchor = anchorRef.current ?? {
     x: size.width / scaleFactor / 2,
     y: size.height / scaleFactor / 2
@@ -886,13 +975,51 @@ async function resizeFloatWindow(
   const anchorY = position.y + currentAnchor.y * scaleFactor;
   const nextX = Math.round(anchorX - metrics.anchorX * scaleFactor);
   const nextY = Math.round(anchorY - metrics.anchorY * scaleFactor);
+  const nextPosition = clampFloatWindowPosition(nextX, nextY, metrics, scaleFactor, monitor);
 
   await floatWin.setSize(new LogicalSize(metrics.width, metrics.height));
-  await floatWin.setPosition(new PhysicalPosition(nextX, nextY));
+  if (!isCurrent()) {
+    return;
+  }
+  await floatWin.setPosition(new PhysicalPosition(nextPosition.x, nextPosition.y));
+  if (!isCurrent()) {
+    return;
+  }
   anchorRef.current = {
     x: metrics.anchorX,
     y: metrics.anchorY
   };
+}
+
+function clampFloatWindowPosition(
+  x: number,
+  y: number,
+  metrics: FloatWindowMetrics,
+  scaleFactor: number,
+  monitor: Awaited<ReturnType<typeof currentMonitor>>
+) {
+  if (!monitor) {
+    return { x, y };
+  }
+
+  const margin = FLOAT_WINDOW_SCREEN_MARGIN * scaleFactor;
+  const left = monitor.workArea.position.x + margin;
+  const top = monitor.workArea.position.y + margin;
+  const right = monitor.workArea.position.x + monitor.workArea.size.width - margin;
+  const bottom = monitor.workArea.position.y + monitor.workArea.size.height - margin;
+  const width = metrics.width * scaleFactor;
+  const height = metrics.height * scaleFactor;
+  const maxX = Math.max(left, right - width);
+  const maxY = Math.max(top, bottom - height);
+
+  return {
+    x: Math.round(clampNumber(x, left, maxX)),
+    y: Math.round(clampNumber(y, top, maxY))
+  };
+}
+
+function clampNumber(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max);
 }
 
 async function resolveSideBubbleDirection(): Promise<SideBubbleDirection> {
