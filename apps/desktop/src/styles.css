@@ -3679,7 +3679,7 @@ body.float-window-body {
   outline: 0 !important;
   background: transparent !important;
   box-shadow: none !important;
-  overflow: visible;
+  overflow: hidden;
 }
 
 .floatBallContainer {
@@ -3693,6 +3693,68 @@ body.float-window-body {
   border: none;
   overflow: visible;
   pointer-events: none;
+}
+
+.floatCapsule {
+  box-sizing: border-box;
+  position: relative;
+  width: 50px;
+  height: 50px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: visible;
+  pointer-events: auto;
+  -webkit-app-region: no-drag;
+}
+
+.floatCapsule--expanded {
+  width: calc(100vw - 8px);
+  height: calc(100vh - 8px);
+  min-width: 0;
+  min-height: 0;
+  padding: 8px;
+  border: 1px solid color-mix(in srgb, var(--accent-border) 58%, var(--border));
+  border-radius: 999px;
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--surface) 94%, var(--accent-soft)), var(--surface));
+  color: var(--ink);
+  box-shadow:
+    0 16px 42px rgba(15, 23, 42, 0.22),
+    0 0 0 1px rgba(255, 255, 255, 0.42) inset;
+  overflow: hidden;
+  animation: floatCapsuleGrow 0.22s cubic-bezier(0.2, 0.82, 0.18, 1) both;
+}
+
+.floatCapsule--prompt,
+.floatCapsule--approval {
+  align-items: stretch;
+  justify-content: stretch;
+  transform-origin: center;
+}
+
+.floatCapsule--reply {
+  gap: 10px;
+  align-items: center;
+  justify-content: flex-start;
+}
+
+.floatCapsule--reply.floatCapsule--right {
+  flex-direction: row;
+  transform-origin: 36px center;
+}
+
+.floatCapsule--reply.floatCapsule--left {
+  flex-direction: row-reverse;
+  transform-origin: calc(100% - 36px) center;
+}
+
+.floatCapsulePanel {
+  box-sizing: border-box;
+  min-width: 0;
+  min-height: 0;
+  position: relative;
+  z-index: 2;
 }
 
 .floatBall {
@@ -3716,9 +3778,14 @@ body.float-window-body {
     0 0 0 1px var(--float-ball-ring),
     2px 2px 4px var(--float-ball-shadow);
   transition:
+    width 0.2s ease,
+    height 0.2s ease,
+    padding 0.2s ease,
+    border-radius 0.2s ease,
     background-color 0.16s ease,
     color 0.16s ease,
-    box-shadow 0.16s ease;
+    box-shadow 0.16s ease,
+    transform 0.16s ease;
   user-select: none;
   -webkit-user-select: none;
   pointer-events: auto;
@@ -3726,6 +3793,47 @@ body.float-window-body {
   position: relative;
   overflow: visible;
   z-index: 20;
+}
+
+.floatBall--inCapsule {
+  width: 38px;
+  height: 38px;
+  padding: 7px;
+  flex: 0 0 auto;
+  cursor: pointer;
+  box-shadow:
+    0 0 0 1px var(--float-ball-ring),
+    0 8px 24px var(--float-ball-shadow);
+}
+
+.floatBall--inCapsule > svg {
+  width: 22px;
+  height: 22px;
+}
+
+.floatCapsule--prompt .floatBall--inCapsule {
+  position: absolute;
+  left: 12px;
+  top: 12px;
+  z-index: 4;
+}
+
+.floatCapsule--approval .floatBall--inCapsule {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  z-index: 4;
+}
+
+.floatCapsule--reply .floatBall--inCapsule {
+  width: 44px;
+  height: 44px;
+  padding: 8px;
+}
+
+.floatCapsule--reply .floatBall--inCapsule > svg {
+  width: 24px;
+  height: 24px;
 }
 
 .floatBall > svg {
@@ -3948,6 +4056,189 @@ body.float-window-body {
   text-align: left;
 }
 
+.floatPromptCapsule {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 6px 6px 62px;
+}
+
+.floatPromptCapsule .floatPromptInput {
+  box-sizing: border-box;
+  flex: 0 0 auto;
+  min-height: 22px;
+  max-height: none;
+  padding: 2px 4px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--ink);
+  line-height: 1.45;
+  overflow: hidden;
+  scrollbar-width: none;
+}
+
+.floatPromptCapsule .floatPromptInput:focus {
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.floatPromptCapsule .floatPromptInput::-webkit-scrollbar {
+  display: none;
+}
+
+.floatPromptCapsule .floatAttachmentList {
+  max-height: 28px;
+  margin-top: 0;
+  overflow: hidden;
+}
+
+.floatPromptCapsule .floatPanelError {
+  margin-top: 0;
+}
+
+.floatPromptCapsule .floatPromptFooter {
+  min-height: 28px;
+  margin-top: 0;
+  padding-left: 0;
+  gap: 7px;
+}
+
+.floatPromptCapsule .floatPromptFooter > span {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.floatApprovalCapsule {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 7px 6px 6px 44px;
+}
+
+.floatApprovalTitle {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.2;
+}
+
+.floatApprovalCapsule .floatCommandPreview {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 6px 7px;
+  border-radius: 12px;
+  -webkit-line-clamp: 2;
+}
+
+.floatApprovalCapsule .floatPanelError {
+  margin-top: 0;
+}
+
+.floatApprovalCapsule .floatApprovalActions {
+  justify-content: flex-end;
+  margin-top: 0;
+}
+
+.floatApprovalActions > .floatDecisionButton {
+  flex: 0 0 30px;
+}
+
+.floatApprovalActions > .floatWindowModeButton {
+  flex: 0 0 30px;
+}
+
+.floatDecisionButton {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--surface-soft);
+  color: var(--ink);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease,
+    color 0.15s ease,
+    transform 0.15s ease;
+}
+
+.floatDecisionButton:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 18px rgba(15, 23, 42, 0.16);
+}
+
+.floatDecisionButton--approve {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent-border) 76%, var(--border));
+}
+
+.floatDecisionButton--allow {
+  color: #247a64;
+  border-color: color-mix(in srgb, #247a64 34%, var(--border));
+}
+
+.floatDecisionButton--reject {
+  color: var(--danger-text);
+  border-color: rgba(189, 58, 45, 0.24);
+}
+
+.floatDecisionButton:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.floatReplyCapsule {
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.floatReplyHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 5px;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.2;
+}
+
+.floatCapsule--left .floatReplyHeader {
+  justify-content: flex-end;
+}
+
+.floatReplyTextStream {
+  overflow: hidden;
+  animation: floatReplyTextStreamRight 0.72s steps(22, end) both;
+}
+
+.floatCapsule--left .floatReplyTextStream {
+  animation-name: floatReplyTextStreamLeft;
+}
+
+.floatReplyCapsule .floatThinkingBubbleText {
+  -webkit-line-clamp: 3;
+}
+
+.floatReplyCapsule .floatThinkingBubbleMarkdown {
+  max-height: 66px;
+}
+
 .floatCompletionBubble {
   position: absolute;
   top: 50%;
@@ -4046,6 +4337,53 @@ body.float-window-body {
 .floatBall--dragging > svg line,
 .floatBall--dragging > svg polyline {
   animation: none;
+}
+
+@keyframes floatCapsuleGrow {
+  0% {
+    opacity: 0;
+    border-radius: 999px;
+    transform: scale(0.42);
+    filter: blur(1.5px);
+  }
+
+  62% {
+    opacity: 1;
+    border-radius: 28px;
+    transform: scale(1.015);
+    filter: blur(0);
+  }
+
+  100% {
+    opacity: 1;
+    border-radius: 26px;
+    transform: scale(1);
+    filter: blur(0);
+  }
+}
+
+@keyframes floatReplyTextStreamRight {
+  0% {
+    clip-path: inset(0 100% 0 0);
+    opacity: 0.58;
+  }
+
+  100% {
+    clip-path: inset(0 0 0 0);
+    opacity: 1;
+  }
+}
+
+@keyframes floatReplyTextStreamLeft {
+  0% {
+    clip-path: inset(0 0 0 100%);
+    opacity: 0.58;
+  }
+
+  100% {
+    clip-path: inset(0 0 0 0);
+    opacity: 1;
+  }
 }
 
 @keyframes floatBallWorkPulse {
@@ -4375,6 +4713,23 @@ body.float-window-body {
 .floatPanelIconButton:hover {
   color: var(--ink);
   border-color: var(--accent-border);
+}
+
+.floatWindowModeButton {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  color: var(--accent);
+}
+
+.floatWindowModeButton:hover {
+  color: var(--accent-hover);
+}
+
+.floatWindowModeButton--approval {
+  width: 30px;
+  height: 30px;
+  margin-right: auto;
 }
 
 .floatPromptInput {

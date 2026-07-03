@@ -1,19 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
-import { currentMonitor, getCurrentWindow } from "@tauri-apps/api/window";
-import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import {
-  ArrowDown,
-  ArrowLeft,
-  ArrowRight,
-  ArrowUp,
-  AlertTriangle,
-  Check,
-  KeyRound,
-  Send,
-  X
-} from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+  currentMonitor,
+  getCurrentWindow,
+  LogicalSize,
+  PhysicalPosition
+} from "@tauri-apps/api/window";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { AlertTriangle, Check, KeyRound, Maximize2, Send, ShieldCheck, X } from "lucide-react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ClipboardEvent as ReactClipboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import ReactMarkdown from "react-markdown";
@@ -53,31 +48,46 @@ import {
 
 type ThemeMode = "system" | "light" | "dark";
 type ResolvedTheme = "light" | "dark";
-type PromptPanelDirection = "up" | "right" | "down" | "left";
 type SideBubbleDirection = "right" | "left";
+type FloatExpansionMode = "prompt" | "approval";
+type FloatWindowLayoutKind = "ball" | "prompt" | "approval" | "reply";
+type FloatWindowAnchor = { x: number; y: number };
+type FloatWindowMetrics = {
+  width: number;
+  height: number;
+  anchorX: number;
+  anchorY: number;
+};
 
 const DRAG_THRESHOLD = 4;
 const THEME_STORAGE_KEY = "odot.themeMode";
 const COMPLETE_CHECK_DURATION_MS = 1_800;
 const FLOAT_SLEEP_DELAY_MS = 30_000;
+const FLOAT_BALL_WINDOW_SIZE = 72;
+const FLOAT_BALL_CENTER = FLOAT_BALL_WINDOW_SIZE / 2;
+const FLOAT_PROMPT_WIDTH = 332;
+const FLOAT_PROMPT_INPUT_MIN_HEIGHT = 22;
+const FLOAT_PROMPT_CHROME_HEIGHT = 70;
+const FLOAT_APPROVAL_WIDTH = 332;
+const FLOAT_APPROVAL_HEIGHT = 166;
+const FLOAT_REPLY_WIDTH = 332;
+const FLOAT_REPLY_HEIGHT = 112;
+const FLOAT_REPLY_ANCHOR_OFFSET = 36;
 
 export function FloatBall() {
   const { t } = useTranslation();
   const [isDragging, setIsDragging] = useState(false);
   const [agentStatus, setAgentStatus] = useState(loadFloatAgentStatus);
-  const [promptDirection, setPromptDirection] = useState<PromptPanelDirection | null>(null);
+  const [expandedMode, setExpandedMode] = useState<FloatExpansionMode | null>(null);
   const [promptText, setPromptText] = useState(() => readPromptDraft()?.text ?? "");
   const [attachments, setAttachments] = useState<PromptAttachment[]>([]);
   const [panelError, setPanelError] = useState("");
   const [isSubmittingPrompt, setIsSubmittingPrompt] = useState(false);
   const [isResolvingApproval, setIsResolvingApproval] = useState(false);
-  const [isActionRingVisible, setIsActionRingVisible] = useState(false);
+  const [promptInputHeight, setPromptInputHeight] = useState(FLOAT_PROMPT_INPUT_MIN_HEIGHT);
   const [isSleeping, setIsSleeping] = useState(false);
   const [showCompleteCheck, setShowCompleteCheck] = useState(false);
   const [thinkingBubbleDirection, setThinkingBubbleDirection] =
-    useState<SideBubbleDirection>("right");
-  const [isApprovalPanelOpen, setIsApprovalPanelOpen] = useState(false);
-  const [approvalBubbleDirection, setApprovalBubbleDirection] =
     useState<SideBubbleDirection>("right");
   const pointerStart = useRef<{ id: number; x: number; y: number } | null>(null);
   const didDrag = useRef(false);
@@ -86,6 +96,8 @@ export function FloatBall() {
   const cancelledErrorSession = useRef<string | undefined>(undefined);
   const previousStatusKind = useRef<FloatAgentStatusKind>(agentStatus.kind);
   const promptDraftUpdatedAtRef = useRef(readPromptDraft()?.updatedAt ?? 0);
+  const floatWindowAnchor = useRef<FloatWindowAnchor | null>(null);
+  const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -249,9 +261,15 @@ export function FloatBall() {
   }, [agentStatus.kind]);
 
   useEffect(() => {
-    if (agentStatus.kind !== "approval") {
-      setIsApprovalPanelOpen(false);
-    }
+    setExpandedMode((current) => {
+      if (current === "approval" && agentStatus.kind !== "approval") {
+        return null;
+      }
+      if (current === "prompt" && agentStatus.kind !== "idle" && agentStatus.kind !== "complete") {
+        return null;
+      }
+      return current;
+    });
   }, [agentStatus.kind]);
 
   useEffect(() => {
@@ -322,7 +340,10 @@ export function FloatBall() {
     setIsDragging(true);
     resetPointer(event.currentTarget, event.pointerId);
     void invoke("start_float_drag")
-      .finally(() => setIsDragging(false));
+      .finally(() => {
+        setIsDragging(false);
+        void resolveSideBubbleDirection().then(setThinkingBubbleDirection);
+      });
   };
 
   const handlePointerUp = (event: ReactPointerEvent<HTMLButtonElement>) => {
@@ -333,13 +354,15 @@ export function FloatBall() {
     if (dragged) {
       return;
     }
-    if (agentStatus.kind === "approval") {
-      setIsActionRingVisible(false);
-      setPanelError("");
-      setIsApprovalPanelOpen((current) => !current);
-      void resolveSideBubbleDirection().then(setApprovalBubbleDirection);
-    } else {
-      void restoreMainWindow();
+    if (agentStatus.kind === "approval" && agentStatus.pendingApproval) {
+      if (expandedMode !== "approval") {
+        setPanelError("");
+        setExpandedMode("approval");
+      }
+      return;
+    }
+    if ((agentStatus.kind === "idle" || agentStatus.kind === "complete") && expandedMode !== "prompt") {
+      openPromptPanel();
     }
   };
 
@@ -349,19 +372,18 @@ export function FloatBall() {
     didDrag.current = false;
   };
 
-  function openPromptPanel(direction: PromptPanelDirection) {
+  function openPromptPanel() {
     const draft = readPromptDraft();
     if (draft && draft.updatedAt >= promptDraftUpdatedAtRef.current) {
       promptDraftUpdatedAtRef.current = draft.updatedAt;
       setPromptText(draft.text);
     }
-    setIsActionRingVisible(false);
-    setPromptDirection(direction);
+    setExpandedMode("prompt");
     setPanelError("");
   }
 
   function closePromptPanel() {
-    setPromptDirection(null);
+    setExpandedMode(null);
     setPanelError("");
   }
 
@@ -468,6 +490,7 @@ export function FloatBall() {
       if (agentStatus.sessionId) {
         await notifyMainSessionRefresh(agentStatus.sessionId);
       }
+      setExpandedMode(null);
       setAgentStatus((current) => syncLocalStatus({
         ...current,
         kind: action === "reject" ? "idle" : "working",
@@ -494,21 +517,54 @@ export function FloatBall() {
   const showSleepingIcon =
     isSleeping && !isAgentActive && !isApprovalPending && !isError && !showCompleteCheck;
   const liveMessage = agentStatus.message?.trim() || agentStatus.label;
-  const showThinkingBubble = isAgentActive && liveMessage.length > 0;
+  const isPromptCapsuleOpen = expandedMode === "prompt" && canOpenPrompt;
+  const isApprovalCapsuleOpen =
+    expandedMode === "approval" && isApprovalPending && Boolean(agentStatus.pendingApproval);
+  const showReplyCapsule =
+    !isPromptCapsuleOpen && !isApprovalCapsuleOpen && isAgentActive && liveMessage.length > 0;
   const shouldRenderMarkdown = agentStatus.kind === "working";
-  const showApprovalPanel =
-    isApprovalPending && isApprovalPanelOpen && Boolean(agentStatus.pendingApproval);
-  const promptPanelClass = promptDirection
-    ? `floatPromptPanel floatPromptPanel--${promptDirection}`
-    : "floatPromptPanel";
   const canSendPrompt =
     Boolean(promptText.trim() || attachments.length) &&
     Boolean(agentStatus.sessionId) &&
     !isSubmittingPrompt;
+  const promptWindowHeight =
+    FLOAT_PROMPT_CHROME_HEIGHT +
+    promptInputHeight +
+    (attachments.length ? 32 : 0) +
+    (panelError ? 20 : 0);
+
+  useLayoutEffect(() => {
+    if (!isPromptCapsuleOpen) {
+      setPromptInputHeight(FLOAT_PROMPT_INPUT_MIN_HEIGHT);
+      return;
+    }
+    const input = promptInputRef.current;
+    if (!input) {
+      return;
+    }
+    input.style.height = "0px";
+    const nextHeight = input.value.trim().length
+      ? Math.max(FLOAT_PROMPT_INPUT_MIN_HEIGHT, input.scrollHeight)
+      : FLOAT_PROMPT_INPUT_MIN_HEIGHT;
+    input.style.height = `${nextHeight}px`;
+    setPromptInputHeight((current) => current === nextHeight ? current : nextHeight);
+  }, [isPromptCapsuleOpen, promptText]);
+
+  const floatLayoutKind: FloatWindowLayoutKind = isPromptCapsuleOpen
+    ? "prompt"
+    : isApprovalCapsuleOpen
+      ? "approval"
+      : showReplyCapsule
+        ? "reply"
+        : "ball";
+  const floatWindowMetrics = floatWindowLayoutMetrics(
+    floatLayoutKind,
+    thinkingBubbleDirection,
+    promptWindowHeight
+  );
   const containerClassName = [
     "floatBallContainer",
-    promptDirection ? "floatBallContainer--panelOpen" : "",
-    isActionRingVisible ? "floatBallContainer--actionsVisible" : "",
+    floatLayoutKind !== "ball" ? "floatBallContainer--expanded" : "",
     isAgentActive ? "floatBallContainer--active" : "",
     isApprovalPending ? "floatBallContainer--approval" : "",
     isError ? "floatBallContainer--error" : ""
@@ -520,67 +576,31 @@ export function FloatBall() {
     isAgentActive ? "floatBall--working" : "",
     isApprovalPending ? "floatBall--approval" : "",
     isError ? "floatBall--error" : "",
-    showCompleteCheck ? "floatBall--complete" : ""
+    showCompleteCheck ? "floatBall--complete" : "",
+    floatLayoutKind !== "ball" ? "floatBall--inCapsule" : ""
+  ].filter(Boolean).join(" ");
+  const capsuleClassName = [
+    "floatCapsule",
+    floatLayoutKind !== "ball" ? "floatCapsule--expanded" : "",
+    isPromptCapsuleOpen ? "floatCapsule--prompt" : "",
+    isApprovalCapsuleOpen ? "floatCapsule--approval" : "",
+    showReplyCapsule ? "floatCapsule--reply" : "",
+    showReplyCapsule ? `floatCapsule--${thinkingBubbleDirection}` : ""
   ].filter(Boolean).join(" ");
   const approvalTitle = agentStatus.pendingApproval?.command.trim();
 
+  useEffect(() => {
+    void resizeFloatWindow(floatWindowMetrics, floatWindowAnchor).catch(() => undefined);
+  }, [
+    floatWindowMetrics.anchorX,
+    floatWindowMetrics.anchorY,
+    floatWindowMetrics.height,
+    floatWindowMetrics.width
+  ]);
+
   return (
-    <div
-      className={containerClassName}
-      onPointerLeave={() => setIsActionRingVisible(false)}
-    >
-      {canOpenPrompt && (
-        <div className="floatActionRing" aria-hidden={isActionRingVisible ? undefined : "true"}>
-          <button
-            type="button"
-            className="floatArrow floatArrow--up"
-            aria-label={t("prompt.openUp")}
-            onPointerDown={(event) => event.stopPropagation()}
-            onClick={(event) => {
-              event.stopPropagation();
-              openPromptPanel("up");
-            }}
-          >
-            <ArrowUp size={15} />
-          </button>
-          <button
-            type="button"
-            className="floatArrow floatArrow--right"
-            aria-label={t("prompt.openRight")}
-            onPointerDown={(event) => event.stopPropagation()}
-            onClick={(event) => {
-              event.stopPropagation();
-              openPromptPanel("right");
-            }}
-          >
-            <ArrowRight size={15} />
-          </button>
-          <button
-            type="button"
-            className="floatArrow floatArrow--down"
-            aria-label={t("prompt.openDown")}
-            onPointerDown={(event) => event.stopPropagation()}
-            onClick={(event) => {
-              event.stopPropagation();
-              openPromptPanel("down");
-            }}
-          >
-            <ArrowDown size={15} />
-          </button>
-          <button
-            type="button"
-            className="floatArrow floatArrow--left"
-            aria-label={t("prompt.openLeft")}
-            onPointerDown={(event) => event.stopPropagation()}
-            onClick={(event) => {
-              event.stopPropagation();
-              openPromptPanel("left");
-            }}
-          >
-            <ArrowLeft size={15} />
-          </button>
-        </div>
-      )}
+    <div className={containerClassName}>
+      <section className={capsuleClassName}>
 
       <button
         type="button"
@@ -591,10 +611,7 @@ export function FloatBall() {
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerCancel}
-        onPointerEnter={() => {
-          recordFloatMouseEvent();
-          setIsActionRingVisible(true);
-        }}
+        onPointerEnter={recordFloatMouseEvent}
         title={approvalTitle || agentStatus.label}
       >
         {isError ? (
@@ -615,38 +632,50 @@ export function FloatBall() {
         )}
       </button>
 
-      {showThinkingBubble && (
-        <section
-          className={`floatThinkingBubble floatThinkingBubble--${thinkingBubbleDirection}`}
-          aria-live="polite"
-        >
-          <div className="floatThinkingBubbleHeader">
+      {showReplyCapsule && (
+        <div className="floatCapsulePanel floatReplyCapsule" aria-live="polite">
+          <div className="floatReplyHeader">
             <span>{agentStatus.label}</span>
+            <button
+              type="button"
+              className="floatPanelIconButton floatWindowModeButton"
+              aria-label={t("common.expand")}
+              title={t("common.expand")}
+              onClick={(event) => {
+                event.stopPropagation();
+                void restoreMainWindow();
+              }}
+            >
+              <Maximize2 size={13} />
+            </button>
           </div>
-          {shouldRenderMarkdown ? (
-            <div className="floatThinkingBubbleMarkdown">
-              <ReactMarkdown
-                remarkPlugins={[remarkGfm]}
-                components={{
-                  table: ({ children, ...props }) => (
-                    <div className="floatMarkdownTableScroll">
-                      <table {...props}>{children}</table>
-                    </div>
-                  )
-                }}
-              >
-                {liveMessage}
-              </ReactMarkdown>
-            </div>
-          ) : (
-            <p className="floatThinkingBubbleText">{liveMessage}</p>
-          )}
-        </section>
+          <div className="floatReplyTextStream" key={liveMessage}>
+            {shouldRenderMarkdown ? (
+              <div className="floatThinkingBubbleMarkdown">
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm]}
+                  components={{
+                    table: ({ children, ...props }) => (
+                      <div className="floatMarkdownTableScroll">
+                        <table {...props}>{children}</table>
+                      </div>
+                    )
+                  }}
+                >
+                  {liveMessage}
+                </ReactMarkdown>
+              </div>
+            ) : (
+              <p className="floatThinkingBubbleText">{liveMessage}</p>
+            )}
+          </div>
+        </div>
       )}
 
-      {promptDirection && (
+      {isPromptCapsuleOpen && (
         <form
-          className={promptPanelClass}
+          className="floatCapsulePanel floatPromptCapsule"
+          onClick={(event) => event.stopPropagation()}
           onPointerDown={(event) => {
             event.stopPropagation();
           }}
@@ -655,18 +684,8 @@ export function FloatBall() {
             void sendPrompt();
           }}
         >
-          <div className="floatPanelHeader">
-            <span>{t("prompt.continueSession")}</span>
-            <button
-              type="button"
-              className="floatPanelIconButton"
-              aria-label={t("prompt.closePanel")}
-              onClick={closePromptPanel}
-            >
-              <X size={13} />
-            </button>
-          </div>
           <textarea
+            ref={promptInputRef}
             className="floatPromptInput"
             value={promptText}
             placeholder={t("prompt.placeholder")}
@@ -676,9 +695,6 @@ export function FloatBall() {
               setPromptText(value);
               savePromptDraft(value, "float");
               promptDraftUpdatedAtRef.current = readPromptDraft()?.updatedAt ?? Date.now();
-            }}
-            onFocus={() => {
-              setIsActionRingVisible(false);
             }}
             onPaste={(event) => void handlePaste(event)}
             onKeyDown={(event) => {
@@ -712,6 +728,27 @@ export function FloatBall() {
           <div className="floatPromptFooter">
             <span>{isSubmittingPrompt ? t("common.sending") : t("prompt.pasteAttachments")}</span>
             <button
+              type="button"
+              className="floatPanelIconButton floatWindowModeButton"
+              aria-label={t("common.expand")}
+              title={t("common.expand")}
+              onClick={(event) => {
+                event.stopPropagation();
+                void restoreMainWindow();
+              }}
+            >
+              <Maximize2 size={13} />
+            </button>
+            <button
+              type="button"
+              className="floatPanelIconButton"
+              aria-label={t("prompt.closePanel")}
+              title={t("prompt.closePanel")}
+              onClick={closePromptPanel}
+            >
+              <X size={13} />
+            </button>
+            <button
               type="submit"
               className="floatPrimaryButton"
               disabled={!canSendPrompt}
@@ -723,14 +760,11 @@ export function FloatBall() {
         </form>
       )}
 
-      {showApprovalPanel && agentStatus.pendingApproval && (
+      {isApprovalCapsuleOpen && agentStatus.pendingApproval && (
         <section
-          className={`floatApprovalPanel floatApprovalPanel--${approvalBubbleDirection}`}
-          onPointerDown={(event) => event.stopPropagation()}
+          className="floatCapsulePanel floatApprovalCapsule"
         >
-          <div className="floatPanelHeader">
-            <span>{t("prompt.waitingApproval")}</span>
-          </div>
+          <span className="floatApprovalTitle">{t("prompt.waitingApproval")}</span>
           <code className="floatCommandPreview">
             {agentStatus.pendingApproval.command}
           </code>
@@ -738,33 +772,127 @@ export function FloatBall() {
           <div className="floatApprovalActions">
             <button
               type="button"
-              className="floatPrimaryButton"
-              disabled={isResolvingApproval}
-              onClick={() => void resolveApproval("approve")}
+              className="floatPanelIconButton floatWindowModeButton floatWindowModeButton--approval"
+              aria-label={t("common.expand")}
+              title={t("common.expand")}
+              onClick={(event) => {
+                event.stopPropagation();
+                void restoreMainWindow();
+              }}
             >
-              {t("common.approve")}
+              <Maximize2 size={13} />
             </button>
             <button
               type="button"
-              className="floatSecondaryButton"
+              className="floatDecisionButton floatDecisionButton--approve"
+              aria-label={t("common.approve")}
+              title={t("common.approve")}
               disabled={isResolvingApproval}
-              onClick={() => void resolveApproval("allow")}
+              onClick={(event) => {
+                event.stopPropagation();
+                void resolveApproval("approve");
+              }}
             >
-              {t("common.addToAllowlist")}
+              <Check size={15} />
             </button>
             <button
               type="button"
-              className="floatDangerButton"
+              className="floatDecisionButton floatDecisionButton--reject"
+              aria-label={t("common.reject")}
+              title={t("common.reject")}
               disabled={isResolvingApproval}
-              onClick={() => void resolveApproval("reject")}
+              onClick={(event) => {
+                event.stopPropagation();
+                void resolveApproval("reject");
+              }}
             >
-              {t("common.reject")}
+              <X size={15} />
+            </button>
+            <button
+              type="button"
+              className="floatDecisionButton floatDecisionButton--allow"
+              aria-label={t("common.addToAllowlist")}
+              title={t("common.addToAllowlist")}
+              disabled={isResolvingApproval}
+              onClick={(event) => {
+                event.stopPropagation();
+                void resolveApproval("allow");
+              }}
+            >
+              <ShieldCheck size={15} />
             </button>
           </div>
         </section>
       )}
+      </section>
     </div>
   );
+}
+
+function floatWindowLayoutMetrics(
+  kind: FloatWindowLayoutKind,
+  direction: SideBubbleDirection,
+  promptHeight: number
+): FloatWindowMetrics {
+  if (kind === "prompt") {
+    return {
+      width: FLOAT_PROMPT_WIDTH,
+      height: promptHeight,
+      anchorX: FLOAT_PROMPT_WIDTH / 2,
+      anchorY: promptHeight / 2
+    };
+  }
+  if (kind === "approval") {
+    return {
+      width: FLOAT_APPROVAL_WIDTH,
+      height: FLOAT_APPROVAL_HEIGHT,
+      anchorX: FLOAT_APPROVAL_WIDTH / 2,
+      anchorY: FLOAT_APPROVAL_HEIGHT / 2
+    };
+  }
+  if (kind === "reply") {
+    return {
+      width: FLOAT_REPLY_WIDTH,
+      height: FLOAT_REPLY_HEIGHT,
+      anchorX: direction === "left"
+        ? FLOAT_REPLY_WIDTH - FLOAT_REPLY_ANCHOR_OFFSET
+        : FLOAT_REPLY_ANCHOR_OFFSET,
+      anchorY: FLOAT_REPLY_HEIGHT / 2
+    };
+  }
+  return {
+    width: FLOAT_BALL_WINDOW_SIZE,
+    height: FLOAT_BALL_WINDOW_SIZE,
+    anchorX: FLOAT_BALL_CENTER,
+    anchorY: FLOAT_BALL_CENTER
+  };
+}
+
+async function resizeFloatWindow(
+  metrics: FloatWindowMetrics,
+  anchorRef: { current: FloatWindowAnchor | null }
+) {
+  const floatWin = getCurrentWindow();
+  const scaleFactor = window.devicePixelRatio || 1;
+  const [position, size] = await Promise.all([
+    floatWin.outerPosition(),
+    floatWin.outerSize()
+  ]);
+  const currentAnchor = anchorRef.current ?? {
+    x: size.width / scaleFactor / 2,
+    y: size.height / scaleFactor / 2
+  };
+  const anchorX = position.x + currentAnchor.x * scaleFactor;
+  const anchorY = position.y + currentAnchor.y * scaleFactor;
+  const nextX = Math.round(anchorX - metrics.anchorX * scaleFactor);
+  const nextY = Math.round(anchorY - metrics.anchorY * scaleFactor);
+
+  await floatWin.setSize(new LogicalSize(metrics.width, metrics.height));
+  await floatWin.setPosition(new PhysicalPosition(nextX, nextY));
+  anchorRef.current = {
+    x: metrics.anchorX,
+    y: metrics.anchorY
+  };
 }
 
 async function resolveSideBubbleDirection(): Promise<SideBubbleDirection> {
