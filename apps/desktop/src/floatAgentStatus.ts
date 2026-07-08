@@ -116,7 +116,8 @@ export function deriveFloatAgentStatus({
       sessionId,
       allowedAttachmentKinds,
       null,
-      latestAssistantMessage
+      latestAssistantMessage,
+      eventTimestampMs(latestStatus)
     );
   }
 
@@ -127,7 +128,8 @@ export function deriveFloatAgentStatus({
       sessionId,
       allowedAttachmentKinds,
       null,
-      latestAssistantMessage
+      latestAssistantMessage,
+      eventTimestampMs(latestStatus) ?? timestampMs(session.updatedAt)
     );
   }
 
@@ -146,9 +148,10 @@ export function mergeFloatAgentStatusForStorage(
     return { ...next, completedAt: undefined };
   }
   const completedAt =
-    previous.sessionId === next.sessionId && previous.completedAt
+    next.completedAt ??
+    (previous.sessionId === next.sessionId && previous.completedAt
       ? previous.completedAt
-      : Date.now();
+      : Date.now());
   return { ...next, completedAt };
 }
 
@@ -204,7 +207,8 @@ function floatAgentStatus(
   sessionId: string,
   allowedAttachmentKinds: PromptAttachmentKind[],
   pendingApproval: FloatPendingApproval | null = null,
-  message = ""
+  message = "",
+  completedAt?: number
 ): FloatAgentStatusRecord {
   return {
     kind,
@@ -213,8 +217,29 @@ function floatAgentStatus(
     allowedAttachmentKinds,
     message,
     pendingApproval,
+    completedAt,
     updatedAt: Date.now()
   };
+}
+
+function eventTimestampMs(event: EventRecord | undefined) {
+  return timestampMs(event?.createdAt);
+}
+
+function timestampMs(value: string | undefined) {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  if (/^\d+$/.test(trimmed)) {
+    const numeric = Number(trimmed);
+    if (!Number.isFinite(numeric)) {
+      return undefined;
+    }
+    return numeric > 1_000_000_000_000 ? numeric : numeric * 1000;
+  }
+  const parsed = Date.parse(trimmed);
+  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 function unresolvedPendingTool(events: EventRecord[]): FloatPendingApproval | null {

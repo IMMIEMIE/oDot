@@ -181,6 +181,68 @@ button:focus-visible {
   animation: appShellIn 0.28s ease-out both;
 }
 
+.windowDragStrip {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 170px;
+  height: 12px;
+  z-index: 80;
+}
+
+.windowActionBar {
+  position: fixed;
+  top: 8px;
+  right: 8px;
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  user-select: none;
+}
+
+.windowControls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid color-mix(in srgb, var(--border) 84%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface-elevated) 88%, transparent);
+  box-shadow: 0 10px 26px rgba(20, 35, 31, 0.14);
+  backdrop-filter: blur(16px);
+}
+
+.windowControlButton {
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  transition:
+    background 0.16s ease,
+    color 0.16s ease,
+    transform 0.16s ease;
+}
+
+.windowControlButton:hover {
+  background: var(--surface-strong);
+  color: var(--ink);
+}
+
+.windowControlButton:active {
+  transform: translateY(1px);
+}
+
+.windowControlButton.danger:hover {
+  background: var(--red);
+  color: #fff;
+}
+
 .leftPane,
 .rightPane {
   height: 100vh;
@@ -202,34 +264,6 @@ button:focus-visible {
   box-shadow:
     -10px 0 30px rgba(20, 35, 31, 0.05),
     var(--inset-line);
-}
-
-.rightPaneToggle {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  border: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--text-soft);
-  display: grid;
-  place-items: center;
-  z-index: 6;
-  box-shadow: var(--shadow-card);
-  transition:
-    transform 0.16s ease,
-    border-color 0.16s ease,
-    color 0.16s ease,
-    background-color 0.16s ease;
-}
-
-.rightPaneToggle:hover {
-  border-color: var(--accent-border);
-  background: var(--accent-soft);
-  color: var(--accent);
-  transform: translateY(-1px);
 }
 
 .resizeHandle {
@@ -2297,8 +2331,16 @@ pre {
   border-radius: 8px;
   background: var(--surface-elevated);
   box-shadow: var(--shadow-soft);
-  overflow: auto;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  overflow: hidden;
   animation: menuLiftIn 0.16s ease-out both;
+}
+
+.composerModelList {
+  min-height: 0;
+  overflow: auto;
+  padding-right: 2px;
 }
 
 .composerModelOption,
@@ -4064,7 +4106,7 @@ body.float-window-body {
 .floatCapsule--approval .floatBall--inCapsule {
   position: absolute;
   left: 12px;
-  bottom: 12px;
+  top: 12px;
   z-index: 4;
 }
 
@@ -4402,10 +4444,11 @@ body.float-window-body {
 .floatApprovalCapsule {
   width: 100%;
   height: 100%;
+  position: relative;
   display: flex;
   flex-direction: column;
-  gap: 7px;
-  padding: 7px 6px 6px 44px;
+  gap: 8px;
+  padding: 14px 12px 50px 66px;
 }
 
 .floatApprovalTitle {
@@ -4419,9 +4462,9 @@ body.float-window-body {
 .floatApprovalCapsule .floatCommandPreview {
   flex: 1 1 auto;
   min-height: 0;
-  padding: 6px 7px;
+  padding: 7px 8px;
   border-radius: 12px;
-  -webkit-line-clamp: 2;
+  -webkit-line-clamp: 4;
 }
 
 .floatApprovalCapsule .floatPanelError {
@@ -4429,8 +4472,12 @@ body.float-window-body {
 }
 
 .floatApprovalCapsule .floatApprovalActions {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
   justify-content: flex-end;
   margin-top: 0;
+  z-index: 5;
 }
 
 .floatApprovalActions > .floatDecisionButton {
@@ -5073,7 +5120,6 @@ body.float-window-body {
 .floatWindowModeButton--approval {
   width: 30px;
   height: 30px;
-  margin-right: auto;
 }
 
 .floatPromptInput {

@@ -15,7 +15,9 @@ import {
   History,
   KeyRound,
   Loader2,
+  Maximize2,
   MessageSquare,
+  Minus,
   Network,
   Pencil,
   Plus,
@@ -524,6 +526,24 @@ export function App() {
     () => sessions.find((session) => session.id === selectedSessionId),
     [sessions, selectedSessionId]
   );
+
+  function handleWindowMinimize(event: ReactMouseEvent<HTMLButtonElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    void getCurrentWindow().minimize();
+  }
+
+  function handleWindowToggleMaximize(event: ReactMouseEvent<HTMLButtonElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    void getCurrentWindow().toggleMaximize();
+  }
+
+  function handleWindowClose(event: ReactMouseEvent<HTMLButtonElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    void getCurrentWindow().close();
+  }
 
   const availableSessions = useMemo(
     () =>
@@ -1319,21 +1339,38 @@ export function App() {
     return createCurrentSession();
   }
 
-  async function createCurrentSession() {
+  async function createCurrentSessionInDirectory() {
+    const selected = await pickProjectDirectory();
+    if (!selected) {
+      return undefined;
+    }
+    setProjectRoot(selected);
+    setSelectedSessionId("");
+    setEventsResponse(EMPTY_EVENTS);
+    const config = await loadProviderConfig(selected, selectedConfigPathForProject(selected));
+    setConfigPath(config.path);
+    setConfigContent(config.content);
+    setProviders(config.providers);
+    setSelectedProviderId(preferredConfigProviderId(config));
+    await loadFiles(selected);
+    return createCurrentSession(selected, config.path);
+  }
+
+  async function createCurrentSession(root = projectRoot, targetConfigPath = configPath) {
     setIsCreatingSession(true);
     try {
       const session = await createSession({
-        projectRoot,
+        projectRoot: root,
         mode,
         providerId: selectedProviderId,
       shellMode,
-      configPath: configPath || selectedConfigPathForProject(projectRoot) || null
+      configPath: targetConfigPath || selectedConfigPathForProject(root) || null
     });
       await refreshSessions();
       setSelectedSessionId(session.id);
       setNotice({ tone: "success", text: t("notice.sessionCreated") });
       setEventsResponse(EMPTY_EVENTS);
-      await refreshProjectCapabilities(projectRoot, configPath || selectedConfigPathForProject(projectRoot));
+      await refreshProjectCapabilities(root, targetConfigPath || selectedConfigPathForProject(root));
       return session;
     } catch (error) {
       reportError(error);
@@ -2320,15 +2357,14 @@ export function App() {
       <>
         <button
           className="commandButton"
-          disabled={
-            isCreatingSession ||
-            isAgentWorking ||
-            !selectedProviderId ||
-            !projectRoot.trim()
-          }
+          disabled={isCreatingSession || isAgentWorking || !selectedProviderId}
           onClick={() =>
-            void createCurrentSession()
-              .then(() => setIsSessionsOpen(false))
+            void createCurrentSessionInDirectory()
+              .then((session) => {
+                if (session) {
+                  setIsSessionsOpen(false);
+                }
+              })
               .catch(() => undefined)
           }
         >
@@ -2411,6 +2447,7 @@ export function App() {
         gridTemplateColumns: `${leftWidth}px 6px minmax(0, 1fr) ${isRightPaneCollapsed ? 0 : 344}px`
       }}
     >
+      <div className="windowDragStrip" data-tauri-drag-region aria-hidden="true" />
       <aside className="leftPane">
         <header className="brandRow" onClick={() => void switchToFloatWindow()}>
           <span className="brandIcon">
@@ -2505,7 +2542,6 @@ export function App() {
             <ConversationTimeline
               events={eventsResponse.events}
               snapshots={eventsResponse.snapshots}
-              streamingEventId={streamingEventId ?? ""}
               executablePlanEventId={latestExecutablePlanEvent?.id ?? ""}
               canExecutePlan={!isPromptLocked && !isMutating}
               onExecutePlan={stableExecutePlan}
@@ -2678,25 +2714,27 @@ export function App() {
                     </button>
                     {isModelMenuOpen && !isPromptLocked && (
                       <div className="composerModelMenu" role="listbox" aria-label={t("nav.selectModel")}>
-                        {!providers.length && (
-                          <div className="composerModelEmpty">{t("empty.noModelConfigured")}</div>
-                        )}
-                        {providers.map((provider) => {
-                          const isSelected = provider.id === selectedProviderId;
-                          return (
-                            <button
-                              type="button"
-                              key={provider.id}
-                              className={`composerModelOption ${isSelected ? "active" : ""}`}
-                              role="option"
-                              aria-selected={isSelected}
-                              onClick={() => selectProviderForCurrentSession(provider.id, true)}
-                            >
-                              <span>{providerModelLabel(provider)}</span>
-                              {isSelected && <Check size={15} />}
-                            </button>
-                          );
-                        })}
+                        <div className="composerModelList">
+                          {!providers.length && (
+                            <div className="composerModelEmpty">{t("empty.noModelConfigured")}</div>
+                          )}
+                          {providers.map((provider) => {
+                            const isSelected = provider.id === selectedProviderId;
+                            return (
+                              <button
+                                type="button"
+                                key={provider.id}
+                                className={`composerModelOption ${isSelected ? "active" : ""}`}
+                                role="option"
+                                aria-selected={isSelected}
+                                onClick={() => selectProviderForCurrentSession(provider.id, true)}
+                              >
+                                <span>{providerModelLabel(provider)}</span>
+                                {isSelected && <Check size={15} />}
+                              </button>
+                            );
+                          })}
+                        </div>
                         <div className="composerReasoningPanel">
                           <div className="composerReasoningHeader">
                             <span>
@@ -2869,14 +2907,50 @@ export function App() {
         </section>
       </main>
 
-      <button
-        className="rightPaneToggle"
-        type="button"
-        aria-label={isRightPaneCollapsed ? t("nav.expandRightPane") : t("nav.collapseRightPane")}
-        onClick={() => setIsRightPaneCollapsed((current) => !current)}
-      >
-        {isRightPaneCollapsed ? <ChevronLeft size={16} /> : <ChevronRight size={16} />}
-      </button>
+      <div className="windowActionBar">
+        <div
+          className="windowControls"
+          role="group"
+          aria-label="Window actions"
+        >
+          <button
+            className="windowControlButton"
+            type="button"
+            aria-label={isRightPaneCollapsed ? t("nav.expandRightPane") : t("nav.collapseRightPane")}
+            title={isRightPaneCollapsed ? t("nav.expandRightPane") : t("nav.collapseRightPane")}
+            onClick={() => setIsRightPaneCollapsed((current) => !current)}
+          >
+            {isRightPaneCollapsed ? <ChevronLeft size={16} /> : <ChevronRight size={16} />}
+          </button>
+          <button
+            type="button"
+            className="windowControlButton"
+            aria-label="Minimize window"
+            title="Minimize"
+            onClick={handleWindowMinimize}
+          >
+            <Minus size={13} />
+          </button>
+          <button
+            type="button"
+            className="windowControlButton"
+            aria-label="Maximize window"
+            title="Maximize"
+            onClick={handleWindowToggleMaximize}
+          >
+            <Maximize2 size={13} />
+          </button>
+          <button
+            type="button"
+            className="windowControlButton danger"
+            aria-label="Close window"
+            title="Close"
+            onClick={handleWindowClose}
+          >
+            <X size={13} />
+          </button>
+        </div>
+      </div>
 
       <aside className={`rightPane ${isRightPaneCollapsed ? "collapsed" : ""}`}>
 
@@ -4620,7 +4694,6 @@ function ContextUsageMeter({ usage }: { usage: ContextUsage }) {
 function ConversationTimelineImpl({
   events,
   snapshots,
-  streamingEventId,
   executablePlanEventId,
   canExecutePlan,
   onExecutePlan,
@@ -4631,7 +4704,6 @@ function ConversationTimelineImpl({
 }: {
   events: EventRecord[];
   snapshots: SnapshotRecord[];
-  streamingEventId: string;
   executablePlanEventId: string;
   canExecutePlan: boolean;
   onExecutePlan: (event: EventRecord) => Promise<void>;
@@ -4651,7 +4723,7 @@ function ConversationTimelineImpl({
         <TimelineItemView
           key={item.id}
           item={item}
-          stream={item.event?.id === streamingEventId}
+          stream={item.status === "running"}
           canExecutePlan={
             canExecutePlan &&
             item.kind === "assistantReply" &&
@@ -5137,9 +5209,10 @@ function MarkdownTextImpl({
     ? Array.from(text).slice(0, visibleLength).join("")
     : normalizedText;
   const markdownText = stream ? normalizeInlineMarkdownTables(displayText) : displayText;
+  const canCollapse = isLong && !stream;
 
   return (
-    <div className={`markdownFrame ${isLong && !expanded ? "collapsed" : ""}`}>
+    <div className={`markdownFrame ${canCollapse && !expanded ? "collapsed" : ""}`}>
       <div className="markdownBody">
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
@@ -5154,7 +5227,7 @@ function MarkdownTextImpl({
           {markdownText}
         </ReactMarkdown>
       </div>
-      {isLong && (
+      {canCollapse && (
         <button
           type="button"
           className="collapseToggle"
