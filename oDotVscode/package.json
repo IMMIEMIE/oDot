@@ -13,6 +13,7 @@
     "Other"
   ],
   "activationEvents": [
+    "onStartupFinished",
     "onCommand:odot.sendReferenceToPrompt",
     "onCommand:odot.sendResourceToPrompt",
     "onCommand:odot.checkBridge"

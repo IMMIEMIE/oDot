@@ -106,6 +106,15 @@
     "sessionBoundModel": "Session is bound to a model; switch before creating a new one",
     "selectModelFirst": "Select a model first"
   },
+  "externalProjectSessions": {
+    "title": "VS Code project sessions",
+    "dismiss": "Dismiss VS Code project sessions",
+    "create": "New session from current directory",
+    "createInstead": "Create another session for this directory",
+    "autoCreating": "No matched session; creating one now",
+    "selected": "Switched to the VS Code project session",
+    "notFound": "This VS Code project session no longer exists"
+  },
   "prompt": {
     "agentWorking": "Agent is working. Send again after it finishes.",
     "agentStopping": "Agent is stopping. Send again after truncation is confirmed.",

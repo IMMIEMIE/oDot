@@ -1940,6 +1940,121 @@ pre {
     var(--inset-line);
 }
 
+.externalProjectSessionPicker {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--accent-border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent-soft) 46%, var(--surface));
+}
+
+.externalProjectSessionHeader,
+.floatExternalProjectSessionHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.externalProjectSessionHeader span,
+.floatExternalProjectSessionHeader span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.externalProjectSessionDismiss,
+.floatExternalProjectSessionHeader button {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.externalProjectSessionDismiss:hover,
+.floatExternalProjectSessionHeader button:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.externalProjectSessionList {
+  display: flex;
+  gap: 7px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.externalProjectSessionOption {
+  flex: 0 0 min(238px, 58vw);
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text-soft);
+  display: grid;
+  gap: 2px;
+  text-align: left;
+  cursor: pointer;
+  box-shadow: var(--inset-line);
+}
+
+.externalProjectSessionOption:hover,
+.externalProjectSessionOption.active {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+
+.externalProjectSessionOption:disabled {
+  cursor: progress;
+  opacity: 0.72;
+}
+
+.externalProjectSessionOption--create {
+  border-style: dashed;
+  border-color: var(--accent-border);
+  background: color-mix(in srgb, var(--accent-soft) 38%, var(--surface));
+}
+
+.externalProjectSessionTitle,
+.externalProjectSessionMeta,
+.externalProjectSessionOption small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.externalProjectSessionTitle {
+  color: var(--ink);
+  font-weight: 800;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.externalProjectSessionMeta,
+.externalProjectSessionOption small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .promptInputRow {
   display: flex;
   align-items: flex-start;
@@ -4396,6 +4511,76 @@ body.float-window-body {
   margin: 0 2px;
   max-width: 180px;
   vertical-align: baseline;
+}
+
+.floatExternalProjectSessionPicker {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 6px;
+  border: 1px solid color-mix(in srgb, var(--accent-border) 82%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--float-glass-strong) 88%, var(--accent-soft));
+}
+
+.floatExternalProjectSessionHeader {
+  font-size: 11px;
+}
+
+.floatExternalProjectSessionList {
+  display: grid;
+  gap: 5px;
+  max-height: 64px;
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+
+.floatExternalProjectSessionList::-webkit-scrollbar {
+  display: none;
+}
+
+.floatExternalProjectSessionOption {
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--surface) 80%, transparent);
+  color: var(--text-soft);
+  display: grid;
+  gap: 1px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.floatExternalProjectSessionOption:hover {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+
+.floatExternalProjectSessionOption--create {
+  border-style: dashed;
+  border-color: var(--accent-border);
+  background: color-mix(in srgb, var(--accent-soft) 42%, var(--surface));
+}
+
+.floatExternalProjectSessionOption span,
+.floatExternalProjectSessionOption small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.floatExternalProjectSessionOption span {
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.floatExternalProjectSessionOption small {
+  color: var(--muted);
+  font-size: 10px;
 }
 
 .floatPromptCapsule .floatAttachmentList {

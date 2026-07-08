@@ -143,6 +143,12 @@ export type SessionRecord = {
   updatedAt: string;
 };
 
+export type ExternalProjectSessionsPayload = {
+  workspaceRoot?: string | null;
+  source?: string | null;
+  sessions: SessionRecord[];
+};
+
 export type EventRecord = {
   id: string;
   sessionId: string;

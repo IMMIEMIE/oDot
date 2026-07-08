@@ -25,13 +25,22 @@ type BridgeConfig = {
 };
 
 const sourceName = "vscode";
+let publishWorkspaceTimer: NodeJS.Timeout | undefined;
+let lastPublishedWorkspaceRoot = "";
 
 export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand("odot.sendReferenceToPrompt", sendReferenceToPrompt),
     vscode.commands.registerCommand("odot.sendResourceToPrompt", sendResourceToPrompt),
-    vscode.commands.registerCommand("odot.checkBridge", checkBridge)
+    vscode.commands.registerCommand("odot.checkBridge", checkBridge),
+    vscode.window.onDidChangeActiveTextEditor(() => {
+      schedulePublishWorkspaceSessions();
+    }),
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      schedulePublishWorkspaceSessions(true);
+    })
   );
+  schedulePublishWorkspaceSessions(true);
 }
 
 export function deactivate() {
@@ -91,6 +100,52 @@ async function checkBridge() {
     }
     vscode.window.showInformationMessage(`oDot Bridge is reachable on ${config.host}:${config.port}.`);
   });
+}
+
+function schedulePublishWorkspaceSessions(force = false) {
+  if (publishWorkspaceTimer) {
+    clearTimeout(publishWorkspaceTimer);
+  }
+  publishWorkspaceTimer = setTimeout(() => {
+    publishWorkspaceTimer = undefined;
+    void publishWorkspaceSessions(force);
+  }, 120);
+}
+
+async function publishWorkspaceSessions(force = false) {
+  const folder = currentWorkspaceFolder();
+  if (!folder) {
+    return;
+  }
+  const workspaceRoot = normalizeWorkspaceRoot(folder.uri.fsPath);
+  if (!force && workspaceRoot === lastPublishedWorkspaceRoot) {
+    return;
+  }
+  const config = bridgeConfig();
+  try {
+    await requestJson(config, "POST", "/v1/project-sessions", {
+      workspaceRoot: folder.uri.fsPath,
+      source: sourceName
+    });
+    lastPublishedWorkspaceRoot = workspaceRoot;
+  } catch {
+    // oDot may not be running yet; keep activation quiet.
+  }
+}
+
+function currentWorkspaceFolder() {
+  const editorUri = vscode.window.activeTextEditor?.document.uri;
+  if (editorUri?.scheme === "file") {
+    const folder = vscode.workspace.getWorkspaceFolder(editorUri);
+    if (folder) {
+      return folder;
+    }
+  }
+  return vscode.workspace.workspaceFolders?.[0] ?? null;
+}
+
+function normalizeWorkspaceRoot(value: string) {
+  return value.trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
 }
 
 async function runCommand(command: () => Promise<void>) {

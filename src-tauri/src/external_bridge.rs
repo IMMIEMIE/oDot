@@ -1,3 +1,4 @@
+use crate::{storage, types::SessionRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -14,6 +15,7 @@ use tokio::{
 const DEFAULT_BRIDGE_PORT: u16 = 39871;
 const MAX_REQUEST_BYTES: usize = 1_250_000;
 const BRIDGE_EVENT: &str = "odot:external-prompt-references";
+const PROJECT_SESSIONS_EVENT: &str = "odot:external-project-sessions";
 const ENV_PORT: &str = "ODOT_BRIDGE_PORT";
 
 static BRIDGE_STATUS: OnceLock<Arc<Mutex<BridgeStatus>>> = OnceLock::new();
@@ -48,6 +50,23 @@ pub struct ExternalPromptReferenceItem {
     pub language: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalProjectSessionsRequest {
+    pub workspace_root: String,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalProjectSessionsPayload {
+    pub workspace_root: String,
+    #[serde(default)]
+    pub source: Option<String>,
+    pub sessions: Vec<SessionRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +203,9 @@ fn route_request(app: AppHandle, request: HttpRequest) -> String {
             json!({ "ok": true, "name": "oDot bridge", "status": status() }),
         );
     }
+    if request.method == "POST" && request.path == "/v1/project-sessions" {
+        return route_project_sessions(app, request);
+    }
     if request.method != "POST" || request.path != "/v1/prompt-references" {
         return json_response(404, json!({ "ok": false, "error": "Not found." }));
     }
@@ -218,6 +240,68 @@ fn route_request(app: AppHandle, request: HttpRequest) -> String {
     }
 
     json_response(200, json!({ "ok": true, "accepted": payload.items.len() }))
+}
+
+fn route_project_sessions(app: AppHandle, request: HttpRequest) -> String {
+    let payload = match serde_json::from_slice::<ExternalProjectSessionsRequest>(&request.body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return json_response(400, json!({ "ok": false, "error": error.to_string() }));
+        }
+    };
+    let workspace_root = payload.workspace_root.trim();
+    if workspace_root.is_empty() {
+        return json_response(
+            400,
+            json!({ "ok": false, "error": "workspaceRoot cannot be empty." }),
+        );
+    }
+    let normalized_workspace = normalize_project_path(workspace_root);
+    let conn = match storage::open_db(&app) {
+        Ok(conn) => conn,
+        Err(error) => {
+            return json_response(500, json!({ "ok": false, "error": error }));
+        }
+    };
+    let mut sessions = match storage::list_sessions(&conn) {
+        Ok(sessions) => sessions
+            .into_iter()
+            .filter(|session| normalize_project_path(&session.project_root) == normalized_workspace)
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            return json_response(500, json!({ "ok": false, "error": error }));
+        }
+    };
+    sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    let response_payload = ExternalProjectSessionsPayload {
+        workspace_root: workspace_root.to_string(),
+        source: payload.source,
+        sessions,
+    };
+    if let Err(error) = app.emit(PROJECT_SESSIONS_EVENT, response_payload.clone()) {
+        return json_response(500, json!({ "ok": false, "error": error.to_string() }));
+    }
+
+    json_response(
+        200,
+        json!({
+            "ok": true,
+            "workspaceRoot": response_payload.workspace_root,
+            "source": response_payload.source,
+            "sessions": response_payload.sessions
+        }),
+    )
+}
+
+fn normalize_project_path(path: &str) -> String {
+    let mut normalized = path.trim().replace('\\', "/");
+    while normalized.len() > 1 && normalized.ends_with('/') {
+        normalized.pop();
+    }
+    if cfg!(windows) {
+        normalized = normalized.to_ascii_lowercase();
+    }
+    normalized
 }
 
 async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {

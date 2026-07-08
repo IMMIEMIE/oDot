@@ -7,7 +7,7 @@ import {
   PhysicalPosition
 } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { AlertTriangle, Check, KeyRound, Maximize2, Send, ShieldCheck, X } from "lucide-react";
+import { AlertTriangle, Check, FolderOpen, KeyRound, Maximize2, Send, ShieldCheck, X } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type {
@@ -29,8 +29,15 @@ import {
   rejectToolCall,
   replyPermission,
   saveShellPolicy,
+  type ExternalProjectSessionsPayload,
   type ExternalPromptReferencePayload
 } from "./api";
+import {
+  clearExternalProjectSessions,
+  EXTERNAL_PROJECT_SESSIONS_STORAGE_KEY,
+  readExternalProjectSessions,
+  saveExternalProjectSessions
+} from "./externalProjectSessions";
 import {
   appendPromptReferenceSections,
   externalPromptReferenceKind,
@@ -114,8 +121,15 @@ export function FloatBall() {
   const [externalPromptReferences, setExternalPromptReferences] = useState<
     ExternalPromptReference[]
   >(() => readPromptReferences()?.references ?? []);
+  const [externalProjectSessions, setExternalProjectSessions] =
+    useState<ExternalProjectSessionsPayload | null>(
+      () => readExternalProjectSessions()?.payload ?? null
+    );
   const promptReferencesDraftUpdatedAtRef = useRef(
     readPromptReferences()?.updatedAt ?? 0
+  );
+  const externalProjectSessionsUpdatedAtRef = useRef(
+    readExternalProjectSessions()?.updatedAt ?? 0
   );
   const [panelError, setPanelError] = useState("");
   const [isSubmittingPrompt, setIsSubmittingPrompt] = useState(false);
@@ -620,6 +634,38 @@ export function FloatBall() {
     setPanelError("");
   }
 
+  function selectExternalProjectSession(sessionId: string) {
+    setAgentStatus((current) => syncLocalStatus({
+      ...current,
+      kind: "idle",
+      label: t("floatStatus.idle"),
+      sessionId,
+      allowedAttachmentKinds: [],
+      message: "",
+      pendingApproval: null,
+      completedAt: undefined
+    }));
+    setExternalProjectSessions(null);
+    clearExternalProjectSessions("float");
+    externalProjectSessionsUpdatedAtRef.current =
+      readExternalProjectSessions()?.updatedAt ?? Date.now();
+    setPanelError("");
+    void emit("odot:float-select-session", { sessionId });
+  }
+
+  function requestExternalProjectSessionCreate(workspaceRoot: string) {
+    const root = workspaceRoot.trim();
+    if (!root) {
+      return;
+    }
+    setExternalProjectSessions(null);
+    clearExternalProjectSessions("float");
+    externalProjectSessionsUpdatedAtRef.current =
+      readExternalProjectSessions()?.updatedAt ?? Date.now();
+    setPanelError("");
+    void emit("odot:float-create-session", { workspaceRoot: root });
+  }
+
   function floatPromptInlineReferences(): PromptInlineReference[] {
     return buildFloatPromptInlineReferences();
   }
@@ -951,8 +997,76 @@ export function FloatBall() {
     };
   }, [canOpenPrompt, isSubmittingPrompt, t]);
 
+  useEffect(() => {
+    const applyExternalProjectSessions = () => {
+      const draft = readExternalProjectSessions();
+      if (
+        !draft ||
+        draft.source === "float" ||
+        draft.updatedAt <= externalProjectSessionsUpdatedAtRef.current
+      ) {
+        return;
+      }
+      externalProjectSessionsUpdatedAtRef.current = draft.updatedAt;
+      setExternalProjectSessions(
+        draft.payload.sessions.length || draft.payload.workspaceRoot
+          ? draft.payload
+          : null
+      );
+    };
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === EXTERNAL_PROJECT_SESSIONS_STORAGE_KEY) {
+        applyExternalProjectSessions();
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    window.addEventListener("focus", applyExternalProjectSessions);
+    return () => {
+      window.removeEventListener("storage", onStorage);
+      window.removeEventListener("focus", applyExternalProjectSessions);
+    };
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<ExternalProjectSessionsPayload>(
+      "odot:external-project-sessions",
+      async ({ payload }) => {
+        if (disposed) {
+          return;
+        }
+        const isVisible = await getCurrentWindow().isVisible().catch(() => true);
+        if (disposed || !isVisible) {
+          return;
+        }
+        setExternalProjectSessions(
+          payload.sessions.length || payload.workspaceRoot ? payload : null
+        );
+        saveExternalProjectSessions(payload, "float");
+        externalProjectSessionsUpdatedAtRef.current =
+          readExternalProjectSessions()?.updatedAt ?? Date.now();
+        if (payload.sessions.length && canOpenPrompt && !isSubmittingPrompt) {
+          setExpandedMode("prompt");
+          setPanelError("");
+        }
+      }
+    ).then((dispose) => {
+      if (disposed) {
+        dispose();
+      } else {
+        unlisten = dispose;
+      }
+    }).catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [canOpenPrompt, isSubmittingPrompt]);
+
   const promptInputChromeHeight =
     FLOAT_PROMPT_CHROME_HEIGHT +
+    (externalProjectSessions?.sessions.length || externalProjectSessions?.workspaceRoot ? 82 : 0) +
     (attachments.length ? 32 : 0) +
     (panelError ? 20 : 0);
   const promptWindowHeight = promptInputChromeHeight + promptInputHeight;
@@ -1117,6 +1231,55 @@ export function FloatBall() {
             void sendPrompt();
           }}
         >
+          {(externalProjectSessions?.sessions.length || externalProjectSessions?.workspaceRoot) ? (
+            <div className="floatExternalProjectSessionPicker">
+              <div className="floatExternalProjectSessionHeader">
+                <span>
+                  <FolderOpen size={12} />
+                  {t("externalProjectSessions.title")}
+                </span>
+                <button
+                  type="button"
+                  aria-label={t("externalProjectSessions.dismiss")}
+                  onClick={() => {
+                    setExternalProjectSessions(null);
+                    clearExternalProjectSessions("float");
+                    externalProjectSessionsUpdatedAtRef.current =
+                      readExternalProjectSessions()?.updatedAt ?? Date.now();
+                  }}
+                >
+                  <X size={11} />
+                </button>
+              </div>
+              <div className="floatExternalProjectSessionList">
+                {externalProjectSessions.sessions.map((session) => (
+                  <button
+                    type="button"
+                    key={session.id}
+                    className="floatExternalProjectSessionOption"
+                    onClick={() => selectExternalProjectSession(session.id)}
+                  >
+                    <span>{session.title}</span>
+                    <small>{appT(`mode.${session.mode}`)} / {session.status}</small>
+                  </button>
+                ))}
+                {externalProjectSessions.workspaceRoot?.trim() ? (
+                  <button
+                    type="button"
+                    className="floatExternalProjectSessionOption floatExternalProjectSessionOption--create"
+                    onClick={() =>
+                      requestExternalProjectSessionCreate(
+                        externalProjectSessions.workspaceRoot ?? ""
+                      )
+                    }
+                  >
+                    <span>{t("externalProjectSessions.create")}</span>
+                    <small>{externalProjectSessions.workspaceRoot}</small>
+                  </button>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
           <div
             ref={promptInputRef}
             className={`floatPromptInput promptRichInput ${

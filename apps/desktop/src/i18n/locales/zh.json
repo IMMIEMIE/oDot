@@ -103,6 +103,15 @@
     "sessionBoundModel": "当前会话已绑定模型，新会话前可切换",
     "selectModelFirst": "请先选择模型"
   },
+  "externalProjectSessions": {
+    "title": "VS Code \u9879\u76ee\u4f1a\u8bdd",
+    "dismiss": "\u5173\u95ed VS Code \u9879\u76ee\u4f1a\u8bdd",
+    "create": "\u4ee5\u5f53\u524d\u76ee\u5f55\u65b0\u5efa\u4f1a\u8bdd",
+    "createInstead": "\u4e3a\u8be5\u76ee\u5f55\u518d\u65b0\u5efa\u4e00\u4e2a\u4f1a\u8bdd",
+    "autoCreating": "\u672a\u627e\u5230\u5339\u914d\u4f1a\u8bdd\uff0c\u6b63\u5728\u81ea\u52a8\u65b0\u5efa",
+    "selected": "\u5df2\u5207\u6362\u5230 VS Code \u9879\u76ee\u4f1a\u8bdd",
+    "notFound": "\u8be5 VS Code \u9879\u76ee\u4f1a\u8bdd\u5df2\u4e0d\u5b58\u5728"
+  },
   "prompt": {
     "agentWorking": "Agent 正在工作，结束后才能继续发送。",
     "agentStopping": "Agent 正在停止，确认截断后才能继续发送。",

@@ -99,6 +99,7 @@ import {
   type AgentMode,
   type BackgroundJobRecord,
   type EventRecord,
+  type ExternalProjectSessionsPayload,
   type ExternalPromptReferencePayload,
   type LoadedSkill,
   type McpConfigFileResponse,
@@ -136,6 +137,12 @@ import {
   savePromptReferences,
   type ExternalPromptReference
 } from "./externalPromptReferences";
+import {
+  clearExternalProjectSessions,
+  EXTERNAL_PROJECT_SESSIONS_STORAGE_KEY,
+  readExternalProjectSessions,
+  saveExternalProjectSessions
+} from "./externalProjectSessions";
 import {
   extractPromptEditorText,
   insertTextAtSelection,
@@ -192,6 +199,7 @@ type ResolvedTheme = "light" | "dark";
 type PromptAttachmentSummary = Omit<PromptAttachment, "id" | "content">;
 
 const PROJECT_ROOT_STORAGE_KEY = "odot.projectRoot";
+const LAST_SESSION_STORAGE_KEY = "odot.lastSessionId";
 
 type TreeNode = {
   type: "dir" | "file";
@@ -298,6 +306,7 @@ export function App() {
   const rollbackInFlightRef = useRef(false);
   const promptDraftHydratedRef = useRef(false);
   const promptDraftUpdatedAtRef = useRef(readPromptDraft()?.updatedAt ?? 0);
+  const autoCreatingExternalProjectRootRef = useRef<string | null>(null);
   const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
   const [isShellModeMenuOpen, setIsShellModeMenuOpen] = useState(false);
   const [composerReasoningEfforts, setComposerReasoningEfforts] = useState<ReasoningEffort[]>([]);
@@ -311,6 +320,13 @@ export function App() {
   >(() => readPromptReferences()?.references ?? []);
   const promptReferencesDraftUpdatedAtRef = useRef(
     readPromptReferences()?.updatedAt ?? 0
+  );
+  const [externalProjectSessions, setExternalProjectSessions] =
+    useState<ExternalProjectSessionsPayload | null>(
+      () => readExternalProjectSessions()?.payload ?? null
+    );
+  const externalProjectSessionsUpdatedAtRef = useRef(
+    readExternalProjectSessions()?.updatedAt ?? 0
   );
   const [projectCapabilities, setProjectCapabilities] =
     useState<ProjectCapabilities | null>(null);
@@ -906,6 +922,114 @@ export function App() {
   }, [isPromptLocked, t]);
 
   useEffect(() => {
+    const applyExternalProjectSessions = () => {
+      const draft = readExternalProjectSessions();
+      if (
+        !draft ||
+        draft.source === "main" ||
+        draft.updatedAt <= externalProjectSessionsUpdatedAtRef.current
+      ) {
+        return;
+      }
+      externalProjectSessionsUpdatedAtRef.current = draft.updatedAt;
+      setExternalProjectSessions(
+        draft.payload.sessions.length || draft.payload.workspaceRoot
+          ? draft.payload
+          : null
+      );
+    };
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === EXTERNAL_PROJECT_SESSIONS_STORAGE_KEY) {
+        applyExternalProjectSessions();
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    window.addEventListener("focus", applyExternalProjectSessions);
+    return () => {
+      window.removeEventListener("storage", onStorage);
+      window.removeEventListener("focus", applyExternalProjectSessions);
+    };
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<ExternalProjectSessionsPayload>(
+      "odot:external-project-sessions",
+      ({ payload }) => {
+        if (disposed) {
+          return;
+        }
+        setExternalProjectSessions(
+          payload.sessions.length || payload.workspaceRoot ? payload : null
+        );
+        saveExternalProjectSessions(payload, "main");
+        externalProjectSessionsUpdatedAtRef.current =
+          readExternalProjectSessions()?.updatedAt ?? Date.now();
+        if (!payload.sessions.length && payload.workspaceRoot?.trim()) {
+          void autoCreateExternalProjectSession(payload.workspaceRoot);
+        }
+      }
+    ).then((dispose) => {
+      if (disposed) {
+        dispose();
+      } else {
+        unlisten = dispose;
+      }
+    }).catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [mode, shellMode]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{ sessionId: string }>("odot:float-select-session", async ({ payload }) => {
+      if (disposed) {
+        return;
+      }
+      const nextSessions = sessions.length ? sessions : await refreshSessions();
+      const session = nextSessions.find((item) => item.id === payload.sessionId);
+      if (session) {
+        await selectSession(session).catch(reportError);
+      }
+    }).then((dispose) => {
+      if (disposed) {
+        dispose();
+      } else {
+        unlisten = dispose;
+      }
+    }).catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [sessions]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{ workspaceRoot: string }>("odot:float-create-session", async ({ payload }) => {
+      if (disposed) {
+        return;
+      }
+      await createExternalProjectSession(payload.workspaceRoot).catch(reportError);
+    }).then((dispose) => {
+      if (disposed) {
+        dispose();
+      } else {
+        unlisten = dispose;
+      }
+    }).catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [mode, shellMode]);
+
+  useEffect(() => {
     persistFloatAgentStatus(loadFloatAgentStatus(), floatAgentStatus);
   }, [floatAgentStatus]);
 
@@ -1042,9 +1166,12 @@ export function App() {
       if (preferredProviderId) {
         setSelectedProviderId(preferredProviderId);
       }
-      const restorableSession = nextSessions.find((session) =>
-        config.providers.some((provider) => provider.id === session.providerId)
-      );
+      const lastSessionId = localStorage.getItem(LAST_SESSION_STORAGE_KEY) ?? "";
+      const restorableSession =
+        nextSessions.find((session) => session.id === lastSessionId) ??
+        nextSessions.find((session) =>
+          config.providers.some((provider) => provider.id === session.providerId)
+        );
       if (restorableSession) {
         await selectSession(restorableSession);
       } else {
@@ -1196,6 +1323,7 @@ export function App() {
     setProviders(config.providers);
 
     setSelectedSessionId(session.id);
+    rememberLastSessionId(session.id);
     setProjectRoot(session.projectRoot);
     setMode(session.mode);
     setShellMode(session.shellMode);
@@ -1213,6 +1341,50 @@ export function App() {
     ]);
     if (!sessionProviderExists) {
       setNotice({ tone: "error", text: t("notice.sessionProviderMissing") });
+    }
+  }
+
+  async function selectExternalProjectSession(sessionId: string) {
+    const nextSessions = sessions.length ? sessions : await refreshSessions();
+    const session = nextSessions.find((item) => item.id === sessionId);
+    if (!session) {
+      setNotice({ tone: "error", text: t("externalProjectSessions.notFound") });
+      return;
+    }
+    await selectSession(session);
+    setExternalProjectSessions(null);
+    clearExternalProjectSessions("main");
+    externalProjectSessionsUpdatedAtRef.current =
+      readExternalProjectSessions()?.updatedAt ?? Date.now();
+    setNotice({ tone: "success", text: t("externalProjectSessions.selected") });
+  }
+
+  async function createExternalProjectSession(workspaceRoot: string) {
+    const root = workspaceRoot.trim();
+    if (!root) {
+      return;
+    }
+    await createSessionForProjectRoot(root);
+    setExternalProjectSessions(null);
+    clearExternalProjectSessions("main");
+    externalProjectSessionsUpdatedAtRef.current =
+      readExternalProjectSessions()?.updatedAt ?? Date.now();
+  }
+
+  async function autoCreateExternalProjectSession(workspaceRoot: string) {
+    const key = normalizeProjectRootKey(workspaceRoot);
+    if (!key || autoCreatingExternalProjectRootRef.current === key) {
+      return;
+    }
+    autoCreatingExternalProjectRootRef.current = key;
+    try {
+      await createExternalProjectSession(workspaceRoot);
+    } catch (error) {
+      reportError(error);
+    } finally {
+      if (autoCreatingExternalProjectRootRef.current === key) {
+        autoCreatingExternalProjectRootRef.current = null;
+      }
     }
   }
 
@@ -1344,16 +1516,53 @@ export function App() {
     if (!selected) {
       return undefined;
     }
-    setProjectRoot(selected);
-    setSelectedSessionId("");
-    setEventsResponse(EMPTY_EVENTS);
-    const config = await loadProviderConfig(selected, selectedConfigPathForProject(selected));
-    setConfigPath(config.path);
-    setConfigContent(config.content);
-    setProviders(config.providers);
-    setSelectedProviderId(preferredConfigProviderId(config));
-    await loadFiles(selected);
-    return createCurrentSession(selected, config.path);
+    return createSessionForProjectRoot(selected);
+  }
+
+  async function createSessionForProjectRoot(root: string) {
+    const targetRoot = root.trim();
+    if (!targetRoot) {
+      throw new Error(t("error.selectProject"));
+    }
+    setIsCreatingSession(true);
+    try {
+      const config = await loadProviderConfig(
+        targetRoot,
+        selectedConfigPathForProject(targetRoot)
+      );
+      const providerId = preferredConfigProviderId(config);
+      if (!providerId) {
+        throw new Error(t("error.providerMissing"));
+      }
+      setProjectRoot(targetRoot);
+      setSelectedSessionId("");
+      setEventsResponse(EMPTY_EVENTS);
+      setConfigPath(config.path);
+      rememberConfigPathForProject(targetRoot, config.path);
+      setConfigContent(config.content);
+      setProviders(config.providers);
+      setSelectedProviderId(providerId);
+      await loadFiles(targetRoot);
+      const session = await createSession({
+        projectRoot: targetRoot,
+        mode,
+        providerId,
+        shellMode,
+        configPath: config.path || selectedConfigPathForProject(targetRoot) || null
+      });
+      await refreshSessions();
+      setSelectedSessionId(session.id);
+      rememberLastSessionId(session.id);
+      setNotice({ tone: "success", text: t("notice.sessionCreated") });
+      setEventsResponse(EMPTY_EVENTS);
+      await refreshProjectCapabilities(targetRoot, config.path);
+      return session;
+    } catch (error) {
+      reportError(error);
+      throw error;
+    } finally {
+      setIsCreatingSession(false);
+    }
   }
 
   async function createCurrentSession(root = projectRoot, targetConfigPath = configPath) {
@@ -1368,6 +1577,7 @@ export function App() {
     });
       await refreshSessions();
       setSelectedSessionId(session.id);
+      rememberLastSessionId(session.id);
       setNotice({ tone: "success", text: t("notice.sessionCreated") });
       setEventsResponse(EMPTY_EVENTS);
       await refreshProjectCapabilities(root, targetConfigPath || selectedConfigPathForProject(root));
@@ -1537,6 +1747,75 @@ export function App() {
 
   function removeLoadedSkill(path: string) {
     setLoadedSkills((current) => current.filter((skill) => skill.path !== path));
+  }
+
+  function renderExternalProjectSessionPicker() {
+    const workspaceRoot = externalProjectSessions?.workspaceRoot?.trim() ?? "";
+    const sessions = externalProjectSessions?.sessions ?? [];
+    if (!workspaceRoot && !sessions.length) {
+      return null;
+    }
+    return (
+      <div className="externalProjectSessionPicker">
+        <div className="externalProjectSessionHeader">
+          <span>
+            <FolderOpen size={13} />
+            {t("externalProjectSessions.title")}
+          </span>
+          <button
+            type="button"
+            className="externalProjectSessionDismiss"
+            aria-label={t("externalProjectSessions.dismiss")}
+            onClick={() => {
+              setExternalProjectSessions(null);
+              clearExternalProjectSessions("main");
+              externalProjectSessionsUpdatedAtRef.current =
+                readExternalProjectSessions()?.updatedAt ?? Date.now();
+            }}
+          >
+            <X size={12} />
+          </button>
+        </div>
+        <div className="externalProjectSessionList">
+          {sessions.map((session) => {
+            const isCurrent = session.id === selectedSessionId;
+            return (
+              <button
+                type="button"
+                key={session.id}
+                className={`externalProjectSessionOption ${isCurrent ? "active" : ""}`}
+                onClick={() => void selectExternalProjectSession(session.id)}
+              >
+                <span className="externalProjectSessionTitle">{session.title}</span>
+                <span className="externalProjectSessionMeta">
+                  {modeLabel(session.mode)} / {t(`shellMode.${session.shellMode}`)} / {session.status}
+                </span>
+                <small>{formatSessionUpdatedAt(session.updatedAt)}</small>
+              </button>
+            );
+          })}
+          {workspaceRoot && (
+            <button
+              type="button"
+              className="externalProjectSessionOption externalProjectSessionOption--create"
+              disabled={isCreatingSession}
+              onClick={() => void createExternalProjectSession(workspaceRoot)}
+            >
+              <span className="externalProjectSessionTitle">
+                <Plus size={13} />
+                {t("externalProjectSessions.create")}
+              </span>
+              <span className="externalProjectSessionMeta">{workspaceRoot}</span>
+              <small>
+                {sessions.length
+                  ? t("externalProjectSessions.createInstead")
+                  : t("externalProjectSessions.autoCreating")}
+              </small>
+            </button>
+          )}
+        </div>
+      </div>
+    );
   }
 
   async function handleSubmitPrompt() {
@@ -2252,6 +2531,7 @@ export function App() {
     setIsMutating(true);
     try {
       await deleteSession(sessionId);
+      clearLastSessionId(sessionId);
       const nextSessions = await listSessions();
       setSessions(nextSessions);
       if (selectedSessionId === sessionId) {
@@ -2569,6 +2849,7 @@ export function App() {
                 accept={attachmentAccept}
                 onChange={(event) => void handleAttachmentInputChange(event)}
               />
+              {renderExternalProjectSessionPicker()}
               <div className="promptInputRow">
                 {loadedSkills.length > 0 && (
                   <div className="promptSkillTags">
@@ -2888,6 +3169,7 @@ export function App() {
                         : (!prompt.trim() &&
                             !promptAttachments.length &&
                             !selectedPaths.size &&
+                            !externalPromptReferences.length &&
                             !loadedSkills.length) ||
                           isPromptLocked ||
                           !selectedProviderId
@@ -6961,6 +7243,18 @@ function rememberConfigPathForProject(projectRoot: string, configPath: string) {
   }
 }
 
+function rememberLastSessionId(sessionId: string) {
+  if (sessionId.trim()) {
+    localStorage.setItem(LAST_SESSION_STORAGE_KEY, sessionId);
+  }
+}
+
+function clearLastSessionId(sessionId: string) {
+  if (localStorage.getItem(LAST_SESSION_STORAGE_KEY) === sessionId) {
+    localStorage.removeItem(LAST_SESSION_STORAGE_KEY);
+  }
+}
+
 function latestPlanExecutionEvents(events: EventRecord[]) {
   let startIndex = -1;
   for (let index = events.length - 1; index >= 0; index -= 1) {
@@ -6984,6 +7278,23 @@ function modeLabel(value: AgentMode) {
 
 function shellModeLabel(value: ShellMode) {
   return appT(`shellMode.${value}Long`);
+}
+
+function formatSessionUpdatedAt(value: string) {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) {
+    return value;
+  }
+  return new Intl.DateTimeFormat(undefined, {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  }).format(timestamp);
+}
+
+function normalizeProjectRootKey(value: string) {
+  return value.trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
 }
 
 function toolLabel(value: string) {
