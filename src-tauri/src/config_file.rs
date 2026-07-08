@@ -1,9 +1,9 @@
 use crate::{
     storage,
     types::{
-        McpConfigFileResponse, McpServerConfig, OpenAiApiMode, ProviderConfigFileResponse,
-        ProviderInput, ProviderKind, ProviderPricing, ProviderRecord, ProviderRequestConfig,
-        ToolMode,
+        McpConfigFileResponse, McpServerConfig, ModelReasoningEffortsResponse, OpenAiApiMode,
+        ProviderConfigFileResponse, ProviderInput, ProviderKind, ProviderPricing, ProviderRecord,
+        ProviderRequestConfig, ReasoningEffort, ToolMode,
     },
 };
 use serde::Deserialize;
@@ -93,6 +93,10 @@ struct ConfigModel {
     provider: Option<ModelProvider>,
     #[serde(default, rename = "toolMode", alias = "tool_mode")]
     tool_mode: Option<ToolMode>,
+    #[serde(default, rename = "reasoningEfforts", alias = "reasoning_efforts")]
+    reasoning_efforts: Vec<String>,
+    #[serde(default)]
+    variants: HashMap<String, HashMap<String, Value>>,
     limit: Option<ModelLimit>,
     pricing: Option<ModelPricing>,
     request: Option<ConfigRequest>,
@@ -163,6 +167,51 @@ pub fn load_provider_config_for_project(
         providers,
         selected_provider_id,
     })
+}
+
+pub fn model_reasoning_efforts(
+    content: &str,
+    provider_id: &str,
+    model_id: &str,
+) -> Result<ModelReasoningEffortsResponse, String> {
+    let config = parse_config(content)?;
+    let provider = config
+        .provider
+        .get(provider_id)
+        .ok_or_else(|| format!("找不到 AI 服务配置: {provider_id}"))?;
+    let default_model;
+    let model = if provider.models.is_empty() && (model_id.is_empty() || model_id == "default") {
+        default_model = ConfigModel {
+            id: None,
+            name: None,
+            provider: None,
+            tool_mode: None,
+            reasoning_efforts: Vec::new(),
+            variants: HashMap::new(),
+            limit: None,
+            pricing: None,
+            request: None,
+            options: HashMap::new(),
+        };
+        &default_model
+    } else {
+        provider
+            .models
+            .get(model_id)
+            .ok_or_else(|| format!("找不到 AI 模型配置: {provider_id}/{model_id}"))?
+    };
+
+    let current = current_reasoning_effort(model);
+    let mut efforts = explicit_reasoning_efforts(model)
+        .or_else(|| variant_reasoning_efforts(model))
+        .unwrap_or_else(|| inferred_reasoning_efforts(provider_id, provider, model, model_id));
+    if let Some(current) = current {
+        if !efforts.contains(&current) {
+            efforts.push(current);
+            efforts = ordered_reasoning_efforts(efforts).unwrap_or_default();
+        }
+    }
+    Ok(ModelReasoningEffortsResponse { efforts, current })
 }
 
 pub fn save_provider_config(
@@ -639,6 +688,8 @@ where
             name: None,
             provider: None,
             tool_mode: None,
+            reasoning_efforts: Vec::new(),
+            variants: HashMap::new(),
             limit: None,
             pricing: None,
             request: None,
@@ -903,6 +954,8 @@ fn model_entries(provider: &ConfigProvider) -> Vec<(String, ConfigModel)> {
                 name: None,
                 provider: None,
                 tool_mode: None,
+                reasoning_efforts: Vec::new(),
+                variants: HashMap::new(),
                 limit: None,
                 pricing: None,
                 request: None,
@@ -1122,6 +1175,170 @@ fn provider_option_string(provider: &ConfigProvider, key: &str) -> Option<String
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+fn current_reasoning_effort(model: &ConfigModel) -> Option<ReasoningEffort> {
+    model
+        .options
+        .get("reasoningEffort")
+        .and_then(reasoning_effort_value)
+}
+
+fn explicit_reasoning_efforts(model: &ConfigModel) -> Option<Vec<ReasoningEffort>> {
+    ordered_reasoning_efforts(
+        model
+            .reasoning_efforts
+            .iter()
+            .filter_map(|item| ReasoningEffort::from_str(item))
+            .collect(),
+    )
+}
+
+fn variant_reasoning_efforts(model: &ConfigModel) -> Option<Vec<ReasoningEffort>> {
+    let mut efforts = Vec::new();
+    for (key, body) in &model.variants {
+        if let Some(effort) = ReasoningEffort::from_str(key) {
+            efforts.push(effort);
+            continue;
+        }
+        for candidate in [
+            body.get("reasoningEffort"),
+            body.get("reasoning_effort"),
+            body.get("effort"),
+            body.get("maxReasoningEffort"),
+            body.get("thinkingLevel"),
+            body.get("reasoning").and_then(|value| value.get("effort")),
+            body.get("output_config")
+                .and_then(|value| value.get("effort")),
+            body.get("thinkingConfig")
+                .and_then(|value| value.get("thinkingLevel")),
+        ] {
+            if let Some(effort) = candidate.and_then(reasoning_effort_value) {
+                efforts.push(effort);
+                break;
+            }
+        }
+    }
+    ordered_reasoning_efforts(efforts)
+}
+
+fn reasoning_effort_value(value: &Value) -> Option<ReasoningEffort> {
+    value.as_str().and_then(ReasoningEffort::from_str)
+}
+
+fn ordered_reasoning_efforts(efforts: Vec<ReasoningEffort>) -> Option<Vec<ReasoningEffort>> {
+    if efforts.is_empty() {
+        return None;
+    }
+    let mut seen: HashSet<ReasoningEffort> = efforts.into_iter().collect();
+    let ordered = ReasoningEffort::ORDERED
+        .iter()
+        .copied()
+        .filter(|effort| seen.remove(effort))
+        .collect::<Vec<_>>();
+    (!ordered.is_empty()).then_some(ordered)
+}
+
+fn inferred_reasoning_efforts(
+    provider_id: &str,
+    provider: &ConfigProvider,
+    model: &ConfigModel,
+    model_id: &str,
+) -> Vec<ReasoningEffort> {
+    let api_id = model.id.as_deref().unwrap_or(model_id);
+    let npm = model
+        .provider
+        .as_ref()
+        .and_then(|provider| provider.npm.as_deref())
+        .or(provider.npm.as_deref())
+        .unwrap_or_default();
+    let api = model
+        .provider
+        .as_ref()
+        .and_then(|provider| provider.api.as_deref())
+        .or(provider.api.as_deref())
+        .or_else(|| provider.options.get("baseURL").and_then(Value::as_str))
+        .or_else(|| provider.options.get("base_url").and_then(Value::as_str))
+        .unwrap_or_default();
+    let id = format!("{provider_id} {npm} {api} {model_id} {api_id}").to_ascii_lowercase();
+
+    let efforts = if id.contains("anthropic") || id.contains("claude") {
+        if is_anthropic_adaptive_model(&id) {
+            vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::Xhigh,
+                ReasoningEffort::Max,
+            ]
+        } else {
+            vec![ReasoningEffort::High, ReasoningEffort::Max]
+        }
+    } else if id.contains("gemini") {
+        if id.contains("2.5") {
+            vec![ReasoningEffort::High, ReasoningEffort::Max]
+        } else if id.contains("flash") {
+            vec![
+                ReasoningEffort::Minimal,
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+            ]
+        } else {
+            vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+            ]
+        }
+    } else if is_openai_reasoning_model(&id) || is_openai_compatible_reasoning_model(&id) {
+        vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+        ]
+    } else {
+        Vec::new()
+    };
+
+    ordered_reasoning_efforts(efforts).unwrap_or_default()
+}
+
+fn is_anthropic_adaptive_model(id: &str) -> bool {
+    [
+        "opus-4.7", "opus-4-7", "opus-4.8", "opus-4-8", "sonnet-5", "5-sonnet", "fable-5",
+        "mythos-5",
+    ]
+    .iter()
+    .any(|needle| id.contains(needle))
+}
+
+fn is_openai_reasoning_model(id: &str) -> bool {
+    id.contains("gpt-5")
+        || id.contains("o1")
+        || id.contains("o3")
+        || id.contains("o4")
+        || id.contains("deep-research")
+        || id.contains("codex")
+}
+
+fn is_openai_compatible_reasoning_model(id: &str) -> bool {
+    [
+        "reason",
+        "thinking",
+        "deepseek-r1",
+        "deepseek-v4",
+        "qwen3",
+        "qwq",
+        "glm",
+        "grok-3-mini",
+        "grok-4",
+        "minimax-m3",
+        "kimi-k2",
+        "k2p",
+    ]
+    .iter()
+    .any(|needle| id.contains(needle))
 }
 
 fn default_config() -> &'static str {
@@ -1510,6 +1727,101 @@ mod tests {
         assert_eq!(request.body.get("top_p"), Some(&json!(0.8)));
         assert!(!request.body.contains_key("apiKey"));
         assert!(!request.body.contains_key("baseURL"));
+    }
+
+    #[test]
+    fn model_reasoning_efforts_prefers_explicit_config() {
+        let config = r#"{
+  "model": "openai/gpt-5",
+  "provider": {
+    "openai": {
+      "options": { "apiKey": "openai-key" },
+      "models": {
+        "gpt-5": {
+          "reasoningEfforts": ["low", "medium", "high", "max"],
+          "options": { "reasoningEffort": "medium" }
+        }
+      }
+    }
+  }
+}"#;
+
+        let result = model_reasoning_efforts(config, "openai", "gpt-5").unwrap();
+
+        assert_eq!(result.current, Some(ReasoningEffort::Medium));
+        assert_eq!(
+            result.efforts,
+            vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::Max
+            ]
+        );
+    }
+
+    #[test]
+    fn model_reasoning_efforts_reads_opencode_style_variants() {
+        let config = r#"{
+  "model": "openrouter/grok",
+  "provider": {
+    "openrouter": {
+      "options": {
+        "baseURL": "https://openrouter.ai/api/v1",
+        "apiKey": "openrouter-key"
+      },
+      "models": {
+        "grok": {
+          "variants": {
+            "low": { "reasoning": { "effort": "low" } },
+            "high": { "reasoning": { "effort": "high" } }
+          }
+        }
+      }
+    }
+  }
+}"#;
+
+        let result = model_reasoning_efforts(config, "openrouter", "grok").unwrap();
+
+        assert_eq!(
+            result.efforts,
+            vec![ReasoningEffort::Low, ReasoningEffort::High]
+        );
+    }
+
+    #[test]
+    fn model_reasoning_efforts_infers_reasoning_and_non_reasoning_models() {
+        let config = r#"{
+  "model": "openai-compatible/deepseek-r1",
+  "provider": {
+    "openai-compatible": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "https://example.com/v1",
+        "apiKey": "key"
+      },
+      "models": {
+        "deepseek-r1": {},
+        "gpt-4.1-mini": {}
+      }
+    }
+  }
+}"#;
+
+        let reasoning =
+            model_reasoning_efforts(config, "openai-compatible", "deepseek-r1").unwrap();
+        let plain = model_reasoning_efforts(config, "openai-compatible", "gpt-4.1-mini").unwrap();
+
+        assert_eq!(
+            reasoning.efforts,
+            vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High
+            ]
+        );
+        assert!(plain.efforts.is_empty());
     }
 
     #[test]

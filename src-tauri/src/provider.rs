@@ -5,14 +5,22 @@ use crate::{
     },
     types::{
         McpToolDefinition, ModelTurn, OpenAiApiMode, ProviderKind, ProviderRequestConfig,
-        ToolCallRequest, ToolMode,
+        ReasoningEffort, ToolCallRequest, ToolMode,
     },
 };
 use futures_util::StreamExt;
 use reqwest::StatusCode;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
+use std::sync::OnceLock;
 
 const KEYRING_SERVICE: &str = "dev.odot.desktop";
+
+/// Shared HTTP client so we reuse the connection pool / TLS config and keep-alive
+/// across steps and retries instead of rebuilding them on every request.
+fn http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
 
 #[derive(Debug, Clone)]
 pub struct ProviderCompletion {
@@ -105,7 +113,7 @@ where
             OpenAiStreamParser::Responses(OpenAiResponsesStreamParser::new()),
         ),
     };
-    let client = reqwest::Client::new();
+    let client = http_client();
     let mut request = client.post(&endpoint);
     for (key, value) in &provider.headers {
         request = request.header(key, value);
@@ -195,7 +203,7 @@ async fn complete_openai_compatible(
     let native_tools = supports_native_tools(provider);
     let body = openai_request_body(provider, system_prompt, user_prompt);
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let mut request = client.post(&endpoint);
     for (key, value) in &provider.headers {
         request = request.header(key, value);
@@ -234,7 +242,7 @@ async fn complete_openai_responses(
     let native_tools = supports_native_tools(provider);
     let body = openai_responses_request_body(provider, system_prompt, user_prompt);
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let mut request = client.post(&endpoint);
     for (key, value) in &provider.headers {
         request = request.header(key, value);
@@ -292,6 +300,7 @@ fn openai_messages_body(
 fn openai_base_body(provider: &ProviderRequestConfig) -> serde_json::Map<String, Value> {
     let mut body = provider.body.clone();
     body.remove("response_format");
+    normalize_openai_chat_reasoning(&mut body, provider);
     body.insert("model".to_string(), json!(provider.model));
     body.entry("temperature".to_string()).or_insert(json!(0.2));
     if let Some(limit) = provider.output_token_limit {
@@ -307,6 +316,7 @@ fn openai_responses_base_body(provider: &ProviderRequestConfig) -> serde_json::M
     body.remove("messages");
     body.remove("max_tokens");
     body.remove("max_completion_tokens");
+    normalize_openai_responses_reasoning(&mut body, provider);
     body.insert("model".to_string(), json!(provider.model));
     body.entry("temperature".to_string()).or_insert(json!(0.2));
     if let Some(limit) = provider.output_token_limit {
@@ -314,6 +324,151 @@ fn openai_responses_base_body(provider: &ProviderRequestConfig) -> serde_json::M
             .or_insert(json!(limit));
     }
     body
+}
+
+fn normalize_openai_chat_reasoning(
+    body: &mut Map<String, Value>,
+    provider: &ProviderRequestConfig,
+) {
+    let Some(effort) = take_unified_reasoning_effort(body) else {
+        return;
+    };
+    let summary = take_reasoning_summary(body);
+    if body.contains_key("reasoning_effort")
+        || body.contains_key("reasoning")
+        || body.contains_key("thinkingConfig")
+    {
+        return;
+    }
+    if is_gemini_provider(provider) {
+        insert_gemini_thinking_config(body, provider, effort);
+    } else if is_openrouter_provider(provider) {
+        insert_reasoning_object(body, openai_wire_effort(provider, effort), summary);
+    } else {
+        body.insert(
+            "reasoning_effort".to_string(),
+            json!(openai_wire_effort(provider, effort)),
+        );
+    }
+}
+
+fn normalize_openai_responses_reasoning(
+    body: &mut Map<String, Value>,
+    provider: &ProviderRequestConfig,
+) {
+    let Some(effort) = take_unified_reasoning_effort(body) else {
+        return;
+    };
+    let summary = take_reasoning_summary(body);
+    if body.contains_key("reasoning") || body.contains_key("thinkingConfig") {
+        return;
+    }
+    if is_gemini_provider(provider) {
+        insert_gemini_thinking_config(body, provider, effort);
+    } else {
+        insert_reasoning_object(body, openai_wire_effort(provider, effort), summary);
+    }
+}
+
+fn take_unified_reasoning_effort(body: &mut Map<String, Value>) -> Option<ReasoningEffort> {
+    body.remove("reasoningEffort")
+        .and_then(|value| value.as_str().and_then(ReasoningEffort::from_str))
+}
+
+fn take_reasoning_summary(body: &mut Map<String, Value>) -> Option<Value> {
+    body.remove("reasoningSummary")
+        .or_else(|| body.remove("reasoning_summary"))
+        .filter(|value| {
+            value
+                .as_str()
+                .map(|item| !item.trim().is_empty())
+                .unwrap_or(true)
+        })
+}
+
+fn openai_wire_effort(provider: &ProviderRequestConfig, effort: ReasoningEffort) -> &'static str {
+    if matches!(provider.kind, ProviderKind::OpenAi) && effort == ReasoningEffort::Max {
+        ReasoningEffort::High.as_str()
+    } else {
+        effort.as_str()
+    }
+}
+
+fn insert_reasoning_object(body: &mut Map<String, Value>, effort: &str, summary: Option<Value>) {
+    let mut reasoning = Map::new();
+    reasoning.insert("effort".to_string(), json!(effort));
+    if let Some(summary) = summary {
+        reasoning.insert("summary".to_string(), summary);
+    }
+    body.insert("reasoning".to_string(), Value::Object(reasoning));
+}
+
+fn is_openrouter_provider(provider: &ProviderRequestConfig) -> bool {
+    provider
+        .base_url
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .contains("openrouter.ai")
+}
+
+fn is_gemini_provider(provider: &ProviderRequestConfig) -> bool {
+    let base_url = provider
+        .base_url
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let model = provider.model.to_ascii_lowercase();
+    model.contains("gemini") || base_url.contains("generativelanguage.googleapis.com")
+}
+
+fn insert_gemini_thinking_config(
+    body: &mut Map<String, Value>,
+    provider: &ProviderRequestConfig,
+    effort: ReasoningEffort,
+) {
+    let model = provider.model.to_ascii_lowercase();
+    if effort == ReasoningEffort::None {
+        body.insert(
+            "thinkingConfig".to_string(),
+            json!({ "includeThoughts": false, "thinkingBudget": 0 }),
+        );
+        return;
+    }
+
+    if model.contains("2.5") {
+        body.insert(
+            "thinkingConfig".to_string(),
+            json!({
+                "includeThoughts": true,
+                "thinkingBudget": gemini_thinking_budget(provider, effort)
+            }),
+        );
+        return;
+    }
+
+    body.insert(
+        "thinkingConfig".to_string(),
+        json!({
+            "includeThoughts": true,
+            "thinkingLevel": effort.as_str()
+        }),
+    );
+}
+
+fn gemini_thinking_budget(provider: &ProviderRequestConfig, effort: ReasoningEffort) -> u64 {
+    let cap = if provider.model.to_ascii_lowercase().contains("pro") {
+        32_768
+    } else {
+        24_576
+    };
+    match effort {
+        ReasoningEffort::None => 0,
+        ReasoningEffort::Minimal | ReasoningEffort::Low => 1_024,
+        ReasoningEffort::Medium => 8_192,
+        ReasoningEffort::High => 16_000,
+        ReasoningEffort::Xhigh | ReasoningEffort::Max => cap,
+    }
 }
 
 fn openai_request_body(
@@ -524,18 +679,9 @@ async fn complete_anthropic_compatible(
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("https://api.anthropic.com/v1"),
     );
-    let mut body = provider.body.clone();
-    body.insert("model".to_string(), json!(provider.model));
-    body.entry("max_tokens".to_string()).or_insert(json!(4096));
-    body.insert("system".to_string(), json!(system_prompt));
-    body.insert(
-        "messages".to_string(),
-        json!([
-            { "role": "user", "content": user_prompt }
-        ]),
-    );
+    let body = anthropic_request_body(provider, system_prompt, user_prompt);
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let mut request = client.post(&endpoint);
     for (key, value) in &provider.headers {
         request = request.header(key, value);
@@ -567,6 +713,96 @@ async fn complete_anthropic_compatible(
         raw_response: content,
         turn: None,
     })
+}
+
+fn anthropic_request_body(
+    provider: &ProviderRequestConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Map<String, Value> {
+    let mut body = provider.body.clone();
+    body.insert("model".to_string(), json!(provider.model));
+    body.entry("max_tokens".to_string()).or_insert(json!(4096));
+    body.insert("system".to_string(), json!(system_prompt));
+    body.insert(
+        "messages".to_string(),
+        json!([
+            { "role": "user", "content": user_prompt }
+        ]),
+    );
+    normalize_anthropic_reasoning(&mut body, provider);
+    body
+}
+
+fn normalize_anthropic_reasoning(body: &mut Map<String, Value>, provider: &ProviderRequestConfig) {
+    let Some(effort) = take_unified_reasoning_effort(body) else {
+        return;
+    };
+    if body.contains_key("thinking") || body.contains_key("output_config") {
+        return;
+    }
+    if effort == ReasoningEffort::None {
+        body.insert("thinking".to_string(), json!({ "type": "disabled" }));
+        return;
+    }
+
+    if anthropic_uses_adaptive_effort(&provider.model) {
+        body.insert("thinking".to_string(), json!({ "type": "adaptive" }));
+        body.insert(
+            "output_config".to_string(),
+            json!({ "effort": effort.as_str() }),
+        );
+        return;
+    }
+
+    body.insert(
+        "thinking".to_string(),
+        json!({
+            "type": "enabled",
+            "budget_tokens": anthropic_budget_tokens(body, effort)
+        }),
+    );
+}
+
+fn anthropic_uses_adaptive_effort(model: &str) -> bool {
+    let id = model.to_ascii_lowercase();
+    [
+        "opus-4.7", "opus-4-7", "opus-4.8", "opus-4-8", "sonnet-5", "5-sonnet", "fable-5",
+        "mythos-5",
+    ]
+    .iter()
+    .any(|needle| id.contains(needle))
+}
+
+fn anthropic_budget_tokens(body: &Map<String, Value>, effort: ReasoningEffort) -> u64 {
+    let max_tokens = body
+        .get("max_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(4096);
+    let desired = match effort {
+        ReasoningEffort::None => 0,
+        ReasoningEffort::Minimal | ReasoningEffort::Low => 4_096,
+        ReasoningEffort::Medium => 8_192,
+        ReasoningEffort::High => 16_000,
+        ReasoningEffort::Xhigh | ReasoningEffort::Max => 31_999,
+    };
+    if desired == 0 {
+        return 0;
+    }
+    let limit = max_tokens.saturating_sub(1).max(1);
+    let half_limit = max_tokens.saturating_div(2).saturating_sub(1).max(1);
+    let cap = if matches!(
+        effort,
+        ReasoningEffort::Minimal
+            | ReasoningEffort::Low
+            | ReasoningEffort::Medium
+            | ReasoningEffort::High
+    ) {
+        half_limit
+    } else {
+        limit
+    };
+    desired.min(cap).max(1)
 }
 
 fn parse_openai_compatible_turn(payload: &Value) -> Result<Option<ModelTurn>, String> {
@@ -1259,6 +1495,150 @@ mod tests {
         assert!(!body.contains_key("max_tokens"));
         assert!(!body.contains_key("max_completion_tokens"));
         assert!(body.get("tools").and_then(Value::as_array).is_some());
+    }
+
+    #[test]
+    fn chat_reasoning_effort_uses_snake_case_wire_field() {
+        let mut provider = test_provider(ProviderKind::OpenAi, ToolMode::Json);
+        provider
+            .body
+            .insert("reasoningEffort".to_string(), json!("high"));
+
+        let body = openai_request_body(&provider, "system", "user");
+
+        assert_eq!(body.get("reasoning_effort"), Some(&json!("high")));
+        assert!(!body.contains_key("reasoningEffort"));
+    }
+
+    #[test]
+    fn responses_reasoning_effort_uses_nested_reasoning_field() {
+        let mut provider = test_provider(ProviderKind::OpenAi, ToolMode::Native);
+        provider
+            .body
+            .insert("reasoningEffort".to_string(), json!("medium"));
+
+        let body = openai_responses_request_body(&provider, "system", "user");
+
+        assert_eq!(
+            body.get("reasoning").and_then(|value| value.get("effort")),
+            Some(&json!("medium"))
+        );
+        assert!(!body.contains_key("reasoningEffort"));
+    }
+
+    #[test]
+    fn native_reasoning_shape_is_not_overwritten() {
+        let mut provider = test_provider(ProviderKind::OpenAi, ToolMode::Native);
+        provider
+            .body
+            .insert("reasoningEffort".to_string(), json!("high"));
+        provider
+            .body
+            .insert("reasoning".to_string(), json!({ "effort": "low" }));
+
+        let body = openai_responses_request_body(&provider, "system", "user");
+
+        assert_eq!(
+            body.get("reasoning").and_then(|value| value.get("effort")),
+            Some(&json!("low"))
+        );
+        assert!(!body.contains_key("reasoningEffort"));
+    }
+
+    #[test]
+    fn openrouter_chat_reasoning_effort_uses_nested_shape() {
+        let mut provider = test_provider(ProviderKind::OpenAiCompatible, ToolMode::Json);
+        provider.base_url = Some("https://openrouter.ai/api/v1".to_string());
+        provider
+            .body
+            .insert("reasoningEffort".to_string(), json!("high"));
+
+        let body = openai_request_body(&provider, "system", "user");
+
+        assert_eq!(
+            body.get("reasoning").and_then(|value| value.get("effort")),
+            Some(&json!("high"))
+        );
+        assert!(!body.contains_key("reasoning_effort"));
+    }
+
+    #[test]
+    fn anthropic_adaptive_reasoning_effort_uses_output_config() {
+        let mut provider = test_provider(ProviderKind::Anthropic, ToolMode::Json);
+        provider.model = "claude-opus-4.7".to_string();
+        provider
+            .body
+            .insert("reasoningEffort".to_string(), json!("xhigh"));
+
+        let body = anthropic_request_body(&provider, "system", "user");
+
+        assert_eq!(
+            body.get("thinking").and_then(|value| value.get("type")),
+            Some(&json!("adaptive"))
+        );
+        assert_eq!(
+            body.get("output_config")
+                .and_then(|value| value.get("effort")),
+            Some(&json!("xhigh"))
+        );
+        assert!(!body.contains_key("reasoningEffort"));
+    }
+
+    #[test]
+    fn anthropic_budget_reasoning_effort_uses_budget_tokens() {
+        let mut provider = test_provider(ProviderKind::Anthropic, ToolMode::Json);
+        provider.model = "claude-3-7-sonnet-latest".to_string();
+        provider
+            .body
+            .insert("max_tokens".to_string(), json!(32_000));
+        provider
+            .body
+            .insert("reasoningEffort".to_string(), json!("max"));
+
+        let body = anthropic_request_body(&provider, "system", "user");
+
+        assert_eq!(
+            body.get("thinking").and_then(|value| value.get("type")),
+            Some(&json!("enabled"))
+        );
+        assert_eq!(
+            body.get("thinking")
+                .and_then(|value| value.get("budget_tokens")),
+            Some(&json!(31_999))
+        );
+    }
+
+    #[test]
+    fn anthropic_native_thinking_is_not_overwritten() {
+        let mut provider = test_provider(ProviderKind::Anthropic, ToolMode::Json);
+        provider
+            .body
+            .insert("reasoningEffort".to_string(), json!("high"));
+        provider.body.insert(
+            "thinking".to_string(),
+            json!({ "type": "enabled", "budget_tokens": 1000 }),
+        );
+
+        let body = anthropic_request_body(&provider, "system", "user");
+
+        assert_eq!(
+            body.get("thinking")
+                .and_then(|value| value.get("budget_tokens")),
+            Some(&json!(1000))
+        );
+        assert!(!body.contains_key("output_config"));
+        assert!(!body.contains_key("reasoningEffort"));
+    }
+
+    #[test]
+    fn auto_reasoning_effort_adds_no_reasoning_field() {
+        let provider = test_provider(ProviderKind::OpenAiCompatible, ToolMode::Json);
+
+        let body = openai_request_body(&provider, "system", "user");
+
+        assert!(!body.contains_key("reasoningEffort"));
+        assert!(!body.contains_key("reasoning_effort"));
+        assert!(!body.contains_key("reasoning"));
     }
 
     #[test]

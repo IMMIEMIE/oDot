@@ -265,7 +265,7 @@ fn hash_bytes(bytes: &[u8]) -> String {
 fn lock_for_path(path: &Path) -> Result<Arc<Mutex<()>>, String> {
     let key = path.to_string_lossy().to_string();
     let locks = PATH_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = locks.lock().map_err(|error| error.to_string())?;
+    let mut guard = locks.lock().unwrap_or_else(|error| error.into_inner());
     Ok(guard
         .entry(key)
         .or_insert_with(|| Arc::new(Mutex::new(())))

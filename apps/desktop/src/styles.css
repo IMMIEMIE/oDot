@@ -2350,6 +2350,66 @@ pre {
   color: var(--muted);
 }
 
+.composerReasoningPanel {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+  margin-top: 6px;
+  padding: 10px 9px 8px;
+  border-top: 1px solid var(--border);
+}
+
+.composerReasoningHeader {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--text-soft);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.composerReasoningHeader span,
+.composerReasoningHeader strong {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composerReasoningHeader strong {
+  color: var(--text);
+}
+
+.composerReasoningPanel input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.composerReasoningTicks {
+  display: grid;
+  gap: 3px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.2;
+  text-align: center;
+}
+
+.composerReasoningTicks span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.composerReasoningStatus {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+
 .composerRunConfigSelect {
   position: relative;
   width: auto;
@@ -3085,13 +3145,157 @@ pre {
   gap: 12px;
 }
 
-.settingsGrid label {
+.settingsGrid label,
+.settingsGrid .settingsField {
   min-width: 0;
   display: grid;
   gap: 6px;
   color: var(--text-soft);
   font-size: 12px;
   font-weight: 700;
+}
+
+.modelReasoningPicker {
+  position: relative;
+  min-width: 0;
+}
+
+.modelPickerTrigger {
+  width: 100%;
+  height: 38px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-soft);
+  color: var(--text);
+  box-shadow: var(--inset-line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 10px;
+  font-size: 13px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.modelPickerTrigger span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.modelPickerTrigger svg {
+  flex-shrink: 0;
+}
+
+.modelPickerPanel {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 35;
+  min-width: min(520px, calc(100vw - 72px));
+  display: grid;
+  grid-template-columns: minmax(130px, 0.9fr) minmax(0, 1.15fr);
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-elevated);
+  box-shadow: var(--shadow-strong);
+}
+
+.modelPickerList {
+  min-width: 0;
+  max-height: 226px;
+  overflow: auto;
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  padding-right: 10px;
+  border-right: 1px solid var(--border);
+}
+
+.modelPickerList button {
+  min-width: 0;
+  min-height: 30px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-soft);
+  text-align: left;
+  padding: 6px 8px;
+  font-size: 12px;
+  font-weight: 650;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.modelPickerList button:hover,
+.modelPickerList button.active {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.reasoningSliderPanel {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 10px;
+}
+
+.reasoningSliderHeader {
+  min-width: 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
+.reasoningSliderHeader span,
+.reasoningSliderHeader strong {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reasoningSliderHeader strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.reasoningSliderPanel input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.reasoningTicks {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.25;
+  text-align: center;
+}
+
+.reasoningTicks span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.reasoningStatus {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
 }
 
 .settingsWide {
@@ -3601,6 +3805,23 @@ pre {
 }
 
 @media (max-width: 760px) {
+  .settingsGrid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .modelPickerPanel {
+    min-width: 0;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .modelPickerList {
+    max-height: 160px;
+    padding-right: 0;
+    padding-bottom: 10px;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+
   .codeChangeSummaryTop {
     grid-template-columns: minmax(0, 1fr);
   }

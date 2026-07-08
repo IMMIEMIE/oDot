@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     fs,
+    io::Read,
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -94,8 +95,14 @@ pub fn resolve_writable_inside(root: &Path, relative_path: &str) -> Result<PathB
 }
 
 pub fn is_likely_text_file(path: &Path) -> Result<bool, String> {
-    let content = fs::read(path).map_err(|error| error.to_string())?;
-    Ok(!content.iter().take(512).any(|byte| *byte == 0))
+    // Only read the first 512 bytes for the NUL-byte binary sniff instead of
+    // slurping the whole file into memory.
+    let file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut prefix = Vec::with_capacity(512);
+    file.take(512)
+        .read_to_end(&mut prefix)
+        .map_err(|error| error.to_string())?;
+    Ok(!prefix.iter().any(|byte| *byte == 0))
 }
 
 pub fn ignored_directories() -> HashSet<&'static str> {

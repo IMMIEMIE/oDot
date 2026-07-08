@@ -45,6 +45,20 @@ export type ProviderConfigFileResponse = {
   selectedProviderId?: string | null;
 };
 
+export type ReasoningEffort =
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max";
+
+export type ModelReasoningEffortsResponse = {
+  efforts: ReasoningEffort[];
+  current?: ReasoningEffort | null;
+};
+
 export type PromptAttachmentInput = {
   name: string;
   mime: string;
@@ -310,6 +324,19 @@ export async function saveProviderConfig(
     content,
     projectRoot: projectRoot?.trim() || null,
     configPath: configPath?.trim() || null
+  });
+}
+
+export async function getModelReasoningEfforts(
+  content: string,
+  providerId: string,
+  modelId: string
+): Promise<ModelReasoningEffortsResponse> {
+  assertTauri();
+  return invoke<ModelReasoningEffortsResponse>("get_model_reasoning_efforts", {
+    content,
+    providerId,
+    modelId
   });
 }
 

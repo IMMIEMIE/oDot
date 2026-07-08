@@ -28,11 +28,12 @@ use std::{
 use tauri::{AppHandle, Emitter};
 use types::{
     ContextSummaryRecord, CreateSessionInput, EventRecord, McpConfigFileResponse, McpServerConfig,
-    McpToolDefinition, PersistPlanInput, ProjectCapabilities, ProjectCapabilityError, ProjectFile,
-    PromptSessionInput, ProviderConfigFileResponse, ProviderInput, ProviderRecord,
-    RecoverBackgroundTaskInput, RecoverSessionInput, ReplyPermissionInput, RevealPathInput,
-    SessionEventsResponse, SessionRecord, ShellPolicy, SkillRecord, SnapshotRecord,
-    SubmitPromptInput, TailSessionEventsInput, UpdateSessionModeInput, UpdateSessionTitleInput,
+    McpToolDefinition, ModelReasoningEffortsResponse, PersistPlanInput, ProjectCapabilities,
+    ProjectCapabilityError, ProjectFile, PromptSessionInput, ProviderConfigFileResponse,
+    ProviderInput, ProviderRecord, RecoverBackgroundTaskInput, RecoverSessionInput,
+    ReplyPermissionInput, RevealPathInput, SessionEventsResponse, SessionRecord, ShellPolicy,
+    SkillRecord, SnapshotRecord, SubmitPromptInput, TailSessionEventsInput, UpdateSessionModeInput,
+    UpdateSessionTitleInput,
 };
 
 const FLOAT_WINDOW_LABEL: &str = "float";
@@ -165,6 +166,15 @@ fn save_provider_config(
     config_path: Option<String>,
 ) -> Result<ProviderConfigFileResponse, String> {
     config_file::save_provider_config(&app, content, project_root, config_path)
+}
+
+#[tauri::command]
+fn get_model_reasoning_efforts(
+    content: String,
+    provider_id: String,
+    model_id: String,
+) -> Result<ModelReasoningEffortsResponse, String> {
+    config_file::model_reasoning_efforts(&content, &provider_id, &model_id)
 }
 
 #[tauri::command]
@@ -776,6 +786,7 @@ pub fn run() {
             delete_provider,
             load_provider_config,
             save_provider_config,
+            get_model_reasoning_efforts,
             find_opencode_config,
             list_project_capabilities,
             save_mcp_server,

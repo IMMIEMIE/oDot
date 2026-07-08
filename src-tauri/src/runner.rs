@@ -1239,6 +1239,9 @@ fn build_stream_messages(
 ) -> Result<Vec<Value>, String> {
     let events = load_context_events(conn, session_id, provider)?;
     let tool_call_ids = provider_tool_call_ids(&events);
+    // Fetch the session once up front — every `prompt.submitted` event below only
+    // needs its `project_root`, so there is no reason to re-query it per event.
+    let project_root = storage::get_session(conn, session_id)?.project_root;
     let mut messages = vec![json!({
         "role": "system",
         "content": system_prompt
@@ -1257,7 +1260,7 @@ fn build_stream_messages(
                 let attachments = prompt_event_attachments(conn, event)?;
                 let loaded_skills = prompt_event_loaded_skills(conn, event)?;
                 let loaded_skill_context = skills::loaded_skills_context_with_sources(
-                    &storage::get_session(conn, session_id)?.project_root,
+                    &project_root,
                     &loaded_skills,
                     skill_sources,
                 );

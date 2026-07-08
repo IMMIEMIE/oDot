@@ -7,7 +7,9 @@ export default defineConfig({
   server: {
     host: "127.0.0.1",
     port: 5173,
-    strictPort: false,
+    // Tauri's devUrl is hard-pinned to 127.0.0.1:5173; fail loudly if the port is
+    // taken instead of silently shifting to one Tauri won't load.
+    strictPort: true,
     proxy: {
       "/api": {
         target: "http://127.0.0.1:4317",

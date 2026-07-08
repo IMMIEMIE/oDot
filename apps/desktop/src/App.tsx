@@ -35,7 +35,15 @@ import { OdodBotIcon } from "./OdodBotIcon";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState
+} from "react";
 import { useTranslation } from "react-i18next";
 import type {
   ChangeEvent,
@@ -60,6 +68,7 @@ import {
   deleteSkill,
   fetchProjectFiles,
   findOpencodeConfig,
+  getModelReasoningEfforts,
   getSessionEvents,
   importSkill,
   tailSessionEvents,
@@ -99,6 +108,7 @@ import {
   type ProjectCapabilities,
   type ProviderConfigFileResponse,
   type ProviderRecord,
+  type ReasoningEffort,
   type SessionEventsResponse,
   type SessionInputRecord,
   type SessionRecord,
@@ -189,6 +199,32 @@ type TreeNode = {
   children: TreeNode[];
 };
 
+// Returns a callback with a stable identity that always invokes the latest version
+// of `callback`. Lets us pass handlers into memoized children without recreating
+// them every render (which would defeat `memo`) and without the stale-closure risk
+// of hand-writing `useCallback` dependency lists for large handlers.
+function useStableCallback<Args extends unknown[], Result>(
+  callback: (...args: Args) => Result
+): (...args: Args) => Result {
+  const ref = useRef(callback);
+  useLayoutEffect(() => {
+    ref.current = callback;
+  });
+  return useCallback((...args: Args) => ref.current(...args), []);
+}
+
+// Memoized timeline leaf components. Each `App` re-render (one per streamed token)
+// would otherwise re-render every timeline item and re-parse all of its markdown;
+// wrapping them in `memo` (with stable callbacks from `useCallback`) lets only the
+// items whose props actually changed re-render. The `*Impl` functions are hoisted,
+// so referencing them here is safe.
+const ConversationTimeline = memo(ConversationTimelineImpl);
+const TimelineItemView = memo(TimelineItemViewImpl);
+const CodeChangeCard = memo(CodeChangeCardImpl);
+const CodeChangeSummaryCard = memo(CodeChangeSummaryCardImpl);
+const McpToolCard = memo(McpToolCardImpl);
+const MarkdownText = memo(MarkdownTextImpl);
+
 export function App() {
   const { t } = useTranslation();
   const [providers, setProviders] = useState<ProviderRecord[]>([]);
@@ -251,6 +287,10 @@ export function App() {
   const modelMenuRef = useRef<HTMLDivElement | null>(null);
   const shellModeMenuRef = useRef<HTMLDivElement | null>(null);
   const realtimeTailTimerRef = useRef<number | undefined>(undefined);
+  const composerReasoningLoadSeq = useRef(0);
+  const composerReasoningSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const composerReasoningSaveInFlight = useRef(false);
+  const pendingComposerReasoningSave = useRef<string | null>(null);
   const activeRunIdRef = useRef(0);
   const stopBaselineSeqRef = useRef(0);
   const rollbackInFlightRef = useRef(false);
@@ -258,6 +298,11 @@ export function App() {
   const promptDraftUpdatedAtRef = useRef(readPromptDraft()?.updatedAt ?? 0);
   const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
   const [isShellModeMenuOpen, setIsShellModeMenuOpen] = useState(false);
+  const [composerReasoningEfforts, setComposerReasoningEfforts] = useState<ReasoningEffort[]>([]);
+  const [composerReasoningEffort, setComposerReasoningEffort] =
+    useState<ReasoningEffortSetting>("");
+  const [isComposerReasoningLoading, setIsComposerReasoningLoading] = useState(false);
+  const [isComposerReasoningSaving, setIsComposerReasoningSaving] = useState(false);
   const [promptAttachments, setPromptAttachments] = useState<PromptAttachment[]>([]);
   const [externalPromptReferences, setExternalPromptReferences] = useState<
     ExternalPromptReference[]
@@ -282,11 +327,32 @@ export function App() {
   const [isRightPaneCollapsed, setIsRightPaneCollapsed] = useState(true);
   const [isPlanDockDismissed, setIsPlanDockDismissed] = useState(false);
 
+  // Stable-identity handlers for the memoized timeline (see `useStableCallback`).
+  const stableExecutePlan = useStableCallback((event: EventRecord) =>
+    handleExecutePlan(event)
+  );
+  const stableRecoverAgent = useStableCallback((actionId: string) =>
+    handleRecoverAgent(actionId)
+  );
+  const stableRollbackSnapshot = useStableCallback(
+    (snapshotId: string) => void handleRollback(snapshotId)
+  );
+  const stableRollbackSnapshots = useStableCallback(
+    (snapshotIds: string[], successText?: string) =>
+      void handleRollbackMany(
+        snapshotIds,
+        successText ?? t("notice.rolledBackBeforePrompt")
+      )
+  );
+
   useEffect(() => {
     void bootstrap();
     return () => {
       if (realtimeTailTimerRef.current) {
         window.clearTimeout(realtimeTailTimerRef.current);
+      }
+      if (composerReasoningSaveTimer.current) {
+        clearTimeout(composerReasoningSaveTimer.current);
       }
     };
   }, []);
@@ -410,6 +476,18 @@ export function App() {
   const selectedModelLabel = selectedProvider
     ? providerModelLabel(selectedProvider)
     : t("session.noModelSelected");
+  const composerReasoningSliderOptions = useMemo<ReasoningEffortSetting[]>(
+    () => ["", ...composerReasoningEfforts],
+    [composerReasoningEfforts]
+  );
+  const composerReasoningSelectedValue: ReasoningEffortSetting =
+    composerReasoningEffort && composerReasoningSliderOptions.includes(composerReasoningEffort)
+      ? composerReasoningEffort
+      : "";
+  const composerReasoningSelectedIndex = Math.max(
+    0,
+    composerReasoningSliderOptions.indexOf(composerReasoningSelectedValue)
+  );
   const allowedAttachmentKinds = useMemo(
     () => attachmentKindsFromConfig(configContent, selectedProviderId),
     [configContent, selectedProviderId]
@@ -603,16 +681,24 @@ export function App() {
     isRightPaneCollapsed,
   ]);
 
-  const contextUsage = useMemo(
+  const contextUsageFromEventsMemo = useMemo(
+    () => contextUsageFromEvents(eventsResponse),
+    [eventsResponse]
+  );
+  const contextEstimateBase = useMemo(
     () =>
-      contextUsageFromEvents(eventsResponse) ??
-      estimateContextUsage({
+      estimateContextBase({
         eventsResponse,
         configContent,
-        selectedProviderId,
-        draftPrompt: prompt
+        selectedProviderId
       }),
-    [configContent, eventsResponse, prompt, selectedProviderId]
+    [configContent, eventsResponse, selectedProviderId]
+  );
+  const contextUsage = useMemo(
+    () =>
+      contextUsageFromEventsMemo ??
+      estimateContextUsage(contextEstimateBase, prompt),
+    [contextEstimateBase, contextUsageFromEventsMemo, prompt]
   );
 
   const latestExecutablePlanEvent = useMemo(() => {
@@ -639,7 +725,11 @@ export function App() {
   );
 
   const planRightPaneRef = useRef(isRightPaneCollapsed);
-  planRightPaneRef.current = isRightPaneCollapsed;
+  // Keep the "latest value" ref in sync via a layout effect (runs before the plan
+  // effect below reads it) instead of mutating it during render.
+  useLayoutEffect(() => {
+    planRightPaneRef.current = isRightPaneCollapsed;
+  });
 
   useEffect(() => {
     if (planExecutionEvents.length > 0 || eventsResponse.todos.length > 0 || planArtifact) {
@@ -953,7 +1043,8 @@ export function App() {
   async function saveSettings(
     content: string,
     policy: ShellPolicy,
-    targetConfigPath?: string | null
+    targetConfigPath?: string | null,
+    options: { keepOpen?: boolean; silent?: boolean } = {}
   ) {
     setIsSavingConfig(true);
     try {
@@ -975,10 +1066,16 @@ export function App() {
         setSelectedSessionId("");
         setEventsResponse(EMPTY_EVENTS);
       }
-      setIsSettingsOpen(false);
-      setNotice({ tone: "success", text: t("notice.settingsSaved") });
+      if (!options.keepOpen) {
+        setIsSettingsOpen(false);
+      }
+      if (!options.silent) {
+        setNotice({ tone: "success", text: t("notice.settingsSaved") });
+      }
     } catch (error) {
-      reportError(error);
+      if (!options.silent) {
+        reportError(error);
+      }
       throw error;
     } finally {
       setIsSavingConfig(false);
@@ -1949,9 +2046,120 @@ export function App() {
     }
   }
 
-  function selectProviderForCurrentSession(providerId: string) {
+  async function loadComposerReasoningEfforts(providerRecordId = selectedProviderId) {
+    const selected = splitProviderRecordId(providerRecordId);
+    if (!selected.providerId || !selected.modelId) {
+      setComposerReasoningEfforts([]);
+      setComposerReasoningEffort("");
+      return;
+    }
+    const seq = composerReasoningLoadSeq.current + 1;
+    composerReasoningLoadSeq.current = seq;
+    setIsComposerReasoningLoading(true);
+    try {
+      const result = await getModelReasoningEfforts(
+        configContent,
+        selected.providerId,
+        selected.modelId
+      );
+      if (composerReasoningLoadSeq.current !== seq) {
+        return;
+      }
+      setComposerReasoningEfforts(result.efforts);
+      setComposerReasoningEffort(result.current ?? "");
+    } catch (error) {
+      if (composerReasoningLoadSeq.current === seq) {
+        setComposerReasoningEfforts([]);
+        setComposerReasoningEffort("");
+        reportError(error);
+      }
+    } finally {
+      if (composerReasoningLoadSeq.current === seq) {
+        setIsComposerReasoningLoading(false);
+      }
+    }
+  }
+
+  function openComposerModelMenu() {
+    setIsModelMenuOpen((open) => {
+      const nextOpen = !open;
+      if (nextOpen) {
+        void loadComposerReasoningEfforts();
+      }
+      return nextOpen;
+    });
+  }
+
+  function scheduleComposerReasoningSave(content: string) {
+    pendingComposerReasoningSave.current = content;
+    if (composerReasoningSaveTimer.current) {
+      clearTimeout(composerReasoningSaveTimer.current);
+    }
+    composerReasoningSaveTimer.current = setTimeout(() => {
+      composerReasoningSaveTimer.current = null;
+      void flushComposerReasoningSave();
+    }, 300);
+  }
+
+  async function flushComposerReasoningSave() {
+    if (composerReasoningSaveInFlight.current) {
+      return;
+    }
+    const content = pendingComposerReasoningSave.current;
+    if (!content) {
+      return;
+    }
+    pendingComposerReasoningSave.current = null;
+    composerReasoningSaveInFlight.current = true;
+    setIsComposerReasoningSaving(true);
+    try {
+      const config = await saveProviderConfig(content, projectRoot, configPath || null);
+      rememberConfigPathForProject(projectRoot, config.path);
+      setConfigPath(config.path);
+      setConfigContent(config.content);
+      setProviders(config.providers);
+    } catch (error) {
+      reportError(error);
+    } finally {
+      composerReasoningSaveInFlight.current = false;
+      setIsComposerReasoningSaving(false);
+      if (pendingComposerReasoningSave.current) {
+        if (composerReasoningSaveTimer.current) {
+          clearTimeout(composerReasoningSaveTimer.current);
+        }
+        composerReasoningSaveTimer.current = setTimeout(() => {
+          composerReasoningSaveTimer.current = null;
+          void flushComposerReasoningSave();
+        }, 300);
+      }
+    }
+  }
+
+  function changeComposerReasoningEffort(nextEffort: ReasoningEffortSetting) {
+    if (!selectedProviderId) {
+      return;
+    }
+    setComposerReasoningEffort(nextEffort);
+    composerReasoningLoadSeq.current += 1;
+    try {
+      const fields = parseProviderSettings(configContent, selectedProviderId);
+      const nextContent = buildProviderConfigContent(configContent, {
+        ...fields,
+        reasoningEffort: nextEffort
+      });
+      setConfigContent(nextContent);
+      scheduleComposerReasoningSave(nextContent);
+    } catch (error) {
+      reportError(error);
+    }
+  }
+
+  function selectProviderForCurrentSession(providerId: string, keepModelMenuOpen = false) {
     setSelectedProviderId(providerId);
-    setIsModelMenuOpen(false);
+    setIsModelMenuOpen(keepModelMenuOpen);
+    if (keepModelMenuOpen) {
+      void loadComposerReasoningEfforts(providerId);
+    }
     if (selectedSessionId) {
       void updateSessionMode({
         sessionId: selectedSessionId,
@@ -2300,13 +2508,11 @@ export function App() {
               streamingEventId={streamingEventId ?? ""}
               executablePlanEventId={latestExecutablePlanEvent?.id ?? ""}
               canExecutePlan={!isPromptLocked && !isMutating}
-              onExecutePlan={handleExecutePlan}
+              onExecutePlan={stableExecutePlan}
               rollbackDisabled={isMutating}
-              onRollbackSnapshot={(snapshotId) => void handleRollback(snapshotId)}
-              onRollbackSnapshots={(snapshotIds, successText) =>
-                void handleRollbackMany(snapshotIds, successText ?? t("notice.rolledBackBeforePrompt"))
-              }
-              onRecoverAgent={handleRecoverAgent}
+              onRollbackSnapshot={stableRollbackSnapshot}
+              onRollbackSnapshots={stableRollbackSnapshots}
+              onRecoverAgent={stableRecoverAgent}
             />
             {!eventsResponse.events.length && (
               <div className="emptyTimeline">
@@ -2465,7 +2671,7 @@ export function App() {
                       aria-haspopup="listbox"
                       aria-expanded={isModelMenuOpen}
                       aria-label={t("nav.selectModel")}
-                      onClick={() => setIsModelMenuOpen((open) => !open)}
+                      onClick={openComposerModelMenu}
                     >
                       <span>{selectedProvider ? selectedModelLabel : t("empty.noModelConfigured")}</span>
                       <ChevronDown size={15} />
@@ -2484,13 +2690,64 @@ export function App() {
                               className={`composerModelOption ${isSelected ? "active" : ""}`}
                               role="option"
                               aria-selected={isSelected}
-                              onClick={() => selectProviderForCurrentSession(provider.id)}
+                              onClick={() => selectProviderForCurrentSession(provider.id, true)}
                             >
                               <span>{providerModelLabel(provider)}</span>
                               {isSelected && <Check size={15} />}
                             </button>
                           );
                         })}
+                        <div className="composerReasoningPanel">
+                          <div className="composerReasoningHeader">
+                            <span>
+                              <BrainCircuit size={14} />
+                              {t("settings.reasoningEffort")}
+                            </span>
+                            <strong>
+                              {reasoningEffortLabel(composerReasoningSelectedValue, t)}
+                            </strong>
+                          </div>
+                          <input
+                            type="range"
+                            min={0}
+                            max={Math.max(0, composerReasoningSliderOptions.length - 1)}
+                            step={1}
+                            value={composerReasoningSelectedIndex}
+                            disabled={
+                              isComposerReasoningLoading ||
+                              composerReasoningSliderOptions.length <= 1
+                            }
+                            onChange={(event) => {
+                              const nextIndex = Number(event.target.value);
+                              changeComposerReasoningEffort(
+                                composerReasoningSliderOptions[nextIndex] ?? ""
+                              );
+                            }}
+                          />
+                          <div
+                            className="composerReasoningTicks"
+                            style={{
+                              gridTemplateColumns: `repeat(${composerReasoningSliderOptions.length}, minmax(0, 1fr))`
+                            }}
+                          >
+                            {composerReasoningSliderOptions.map((item) => (
+                              <span key={item || "auto"}>
+                                {reasoningEffortLabel(item, t)}
+                              </span>
+                            ))}
+                          </div>
+                          {(isComposerReasoningLoading ||
+                            isComposerReasoningSaving ||
+                            composerReasoningEfforts.length === 0) && (
+                            <small className="composerReasoningStatus">
+                              {isComposerReasoningLoading
+                                ? t("settings.reasoningLoading")
+                                : isComposerReasoningSaving
+                                  ? t("settings.reasoningSaving")
+                                  : t("settings.reasoningUnavailable")}
+                            </small>
+                          )}
+                        </div>
                       </div>
                     )}
                   </div>
@@ -2979,7 +3236,12 @@ function SettingsModal({
   onThemeModeChange: (mode: ThemeMode) => void;
   onLocaleChange: (locale: AppLocale) => void;
   onClose: () => void;
-  onSave: (content: string, policy: ShellPolicy, configPath?: string | null) => Promise<void>;
+  onSave: (
+    content: string,
+    policy: ShellPolicy,
+    configPath?: string | null,
+    options?: { keepOpen?: boolean; silent?: boolean }
+  ) => Promise<void>;
   onLoadConfigFile: (configPath: string) => Promise<ProviderConfigFileResponse>;
   onRefreshCapabilities: (configPath?: string | null) => Promise<ProjectCapabilities | null>;
   onMcpConfigChanged: (response: McpConfigFileResponse) => void;
@@ -2988,6 +3250,13 @@ function SettingsModal({
   const initial = parseProviderSettings(configContent, selectedProviderId);
   const [providerId, setProviderId] = useState(initial.providerId);
   const [modelId, setModelId] = useState(initial.modelId);
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffortSetting>(
+    initial.reasoningEffort
+  );
+  const [reasoningEfforts, setReasoningEfforts] = useState<ReasoningEffort[]>([]);
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
+  const [isReasoningLoading, setIsReasoningLoading] = useState(false);
+  const [isReasoningSaving, setIsReasoningSaving] = useState(false);
   const [name, setName] = useState(initial.name);
   const [baseUrl, setBaseUrl] = useState(initial.baseUrl);
   const [apiKey, setApiKey] = useState(initial.apiKey);
@@ -3026,6 +3295,14 @@ function SettingsModal({
   const [skills, setSkills] = useState<SkillRecord[]>(projectCapabilities?.skills ?? []);
   const [skillExpanded, setSkillExpanded] = useState<string | null>(null);
   const [skillContents, setSkillContents] = useState<Record<string, string>>({});
+  const reasoningLoadSeq = useRef(0);
+  const reasoningSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reasoningSaveInFlight = useRef(false);
+  const pendingReasoningSave = useRef<{
+    content: string;
+    policy: ShellPolicy;
+    configPath: string | null;
+  } | null>(null);
 
   useEffect(() => {
     setMcpServers(projectCapabilities?.mcpServers ?? []);
@@ -3037,6 +3314,14 @@ function SettingsModal({
     );
   }, [projectCapabilities]);
 
+  useEffect(() => {
+    return () => {
+      if (reasoningSaveTimer.current) {
+        clearTimeout(reasoningSaveTimer.current);
+      }
+    };
+  }, []);
+
   const providerOptions = useMemo(
     () => providerChoices(jsonText, providers, providerId),
     [jsonText, providerId, providers]
@@ -3046,7 +3331,9 @@ function SettingsModal({
     [jsonText, providerId, modelId]
   );
 
-  function currentFields(): ProviderSettingsFields {
+  function currentFields(
+    overrides: Partial<ProviderSettingsFields> = {}
+  ): ProviderSettingsFields {
     return {
       providerId,
       modelId,
@@ -3054,7 +3341,9 @@ function SettingsModal({
       baseUrl,
       apiKey,
       supportsResponses,
-      responsesSource
+      responsesSource,
+      reasoningEffort,
+      ...overrides
     };
   }
 
@@ -3062,6 +3351,125 @@ function SettingsModal({
     const next = buildProviderConfigContent(jsonText, currentFields());
     setJsonText(next);
     return next;
+  }
+
+  function currentPolicy(): ShellPolicy {
+    return {
+      autoAllowlist: allowlistText
+        .split("\n")
+        .map((item) => item.trim())
+        .filter(Boolean)
+    };
+  }
+
+  async function loadReasoningEfforts(
+    content = jsonText,
+    nextProviderId = providerId,
+    nextModelId = modelId
+  ) {
+    if (!nextProviderId || !nextModelId) {
+      setReasoningEfforts([]);
+      return;
+    }
+    const seq = reasoningLoadSeq.current + 1;
+    reasoningLoadSeq.current = seq;
+    setIsReasoningLoading(true);
+    try {
+      const result = await getModelReasoningEfforts(content, nextProviderId, nextModelId);
+      if (reasoningLoadSeq.current !== seq) {
+        return;
+      }
+      setReasoningEfforts(result.efforts);
+      setReasoningEffort(result.current ?? "");
+    } catch (loadError) {
+      if (reasoningLoadSeq.current === seq) {
+        setReasoningEfforts([]);
+        setError(errorMessage(loadError));
+      }
+    } finally {
+      if (reasoningLoadSeq.current === seq) {
+        setIsReasoningLoading(false);
+      }
+    }
+  }
+
+  function openModelPicker(nextOpen: boolean) {
+    setModelPickerOpen(nextOpen);
+    if (!nextOpen) {
+      return;
+    }
+    setError("");
+    try {
+      const draft = flushCurrentProviderDraft();
+      void loadReasoningEfforts(draft, providerId, modelId);
+    } catch (openError) {
+      setError(errorMessage(openError));
+    }
+  }
+
+  function scheduleReasoningSave(content: string) {
+    pendingReasoningSave.current = {
+      content,
+      policy: currentPolicy(),
+      configPath: selectedConfigPath || null
+    };
+    if (reasoningSaveTimer.current) {
+      clearTimeout(reasoningSaveTimer.current);
+    }
+    reasoningSaveTimer.current = setTimeout(() => {
+      reasoningSaveTimer.current = null;
+      void flushReasoningSave();
+    }, 300);
+  }
+
+  async function flushReasoningSave() {
+    if (reasoningSaveInFlight.current) {
+      return;
+    }
+    const pending = pendingReasoningSave.current;
+    if (!pending) {
+      return;
+    }
+    pendingReasoningSave.current = null;
+    reasoningSaveInFlight.current = true;
+    setIsReasoningSaving(true);
+    try {
+      await onSave(pending.content, pending.policy, pending.configPath, {
+        keepOpen: true,
+        silent: true
+      });
+      setError("");
+    } catch (saveError) {
+      setError(errorMessage(saveError));
+    } finally {
+      reasoningSaveInFlight.current = false;
+      setIsReasoningSaving(false);
+      if (pendingReasoningSave.current) {
+        if (reasoningSaveTimer.current) {
+          clearTimeout(reasoningSaveTimer.current);
+        }
+        reasoningSaveTimer.current = setTimeout(() => {
+          reasoningSaveTimer.current = null;
+          void flushReasoningSave();
+        }, 300);
+      }
+    }
+  }
+
+  function handleReasoningEffortChange(nextEffort: ReasoningEffortSetting) {
+    setError("");
+    setReasoningEffort(nextEffort);
+    reasoningLoadSeq.current += 1;
+    try {
+      const nextContent = buildProviderConfigContent(
+        jsonText,
+        currentFields({ reasoningEffort: nextEffort })
+      );
+      setJsonText(nextContent);
+      scheduleReasoningSave(nextContent);
+    } catch (saveError) {
+      setError(errorMessage(saveError));
+    }
   }
 
   function syncFromSelection(nextProviderId: string, nextModelId?: string) {
@@ -3077,18 +3485,17 @@ function SettingsModal({
     setApiKey(parsed.apiKey);
     setSupportsResponses(parsed.supportsResponses);
     setResponsesSource(parsed.responsesSource);
+    setReasoningEffort(parsed.reasoningEffort);
+    if (modelPickerOpen) {
+      void loadReasoningEfforts(nextText, parsed.providerId || nextProviderId, parsed.modelId);
+    }
   }
 
   async function handleSave() {
     setError("");
     try {
       const nextContent = flushCurrentProviderDraft();
-      const nextPolicy = {
-        autoAllowlist: allowlistText
-          .split("\n")
-          .map((item) => item.trim())
-          .filter(Boolean)
-      };
+      const nextPolicy = currentPolicy();
       await onSave(nextContent, nextPolicy, selectedConfigPath);
     } catch (saveError) {
       setError(errorMessage(saveError));
@@ -3104,6 +3511,7 @@ function SettingsModal({
     setApiKey(parsed.apiKey);
     setSupportsResponses(parsed.supportsResponses);
     setResponsesSource(parsed.responsesSource);
+    setReasoningEffort(parsed.reasoningEffort);
   }
 
   function handleAddProvider() {
@@ -3474,26 +3882,28 @@ function SettingsModal({
                 ))}
               </select>
             </label>
-            <label>
+            <div className="settingsField">
               <span>{t("settings.model")}</span>
-              <select
-                value={modelId}
-                onChange={(event) => {
+              <ModelReasoningPicker
+                isOpen={modelPickerOpen}
+                modelId={modelId}
+                modelOptions={modelOptions}
+                efforts={reasoningEfforts}
+                value={reasoningEffort}
+                isLoading={isReasoningLoading}
+                isSaving={isReasoningSaving}
+                onOpenChange={openModelPicker}
+                onSelectModel={(nextModelId) => {
                   setError("");
                   try {
-                    syncFromSelection(providerId, event.target.value);
+                    syncFromSelection(providerId, nextModelId);
                   } catch (selectionError) {
                     setError(errorMessage(selectionError));
                   }
                 }}
-              >
-                {modelOptions.map((item) => (
-                  <option key={item} value={item}>
-                    {item}
-                  </option>
-                ))}
-              </select>
-            </label>
+                onChangeEffort={handleReasoningEffortChange}
+              />
+            </div>
             <label>
               <span>{t("settings.name")}</span>
               <input value={name} onChange={(event) => setName(event.target.value)} />
@@ -3588,6 +3998,14 @@ function SettingsModal({
                 setApiKey(parsed.apiKey);
                 setSupportsResponses(parsed.supportsResponses);
                 setResponsesSource(parsed.responsesSource);
+                setReasoningEffort(parsed.reasoningEffort);
+                if (modelPickerOpen) {
+                  void loadReasoningEfforts(
+                    event.target.value,
+                    parsed.providerId,
+                    parsed.modelId
+                  );
+                }
               }}
               spellCheck={false}
             />
@@ -3857,6 +4275,143 @@ function SettingsModal({
   );
 }
 
+function ModelReasoningPicker({
+  isOpen,
+  modelId,
+  modelOptions,
+  efforts,
+  value,
+  isLoading,
+  isSaving,
+  onOpenChange,
+  onSelectModel,
+  onChangeEffort
+}: {
+  isOpen: boolean;
+  modelId: string;
+  modelOptions: string[];
+  efforts: ReasoningEffort[];
+  value: ReasoningEffortSetting;
+  isLoading: boolean;
+  isSaving: boolean;
+  onOpenChange: (open: boolean) => void;
+  onSelectModel: (modelId: string) => void;
+  onChangeEffort: (effort: ReasoningEffortSetting) => void;
+}) {
+  const { t } = useTranslation();
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const sliderOptions = useMemo<ReasoningEffortSetting[]>(
+    () => ["", ...efforts],
+    [efforts]
+  );
+  const selectedValue: ReasoningEffortSetting =
+    value && sliderOptions.includes(value) ? value : "";
+  const selectedIndex = Math.max(0, sliderOptions.indexOf(selectedValue));
+
+  useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
+    const closeOnOutside = (event: globalThis.MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) {
+        onOpenChange(false);
+      }
+    };
+    window.addEventListener("mousedown", closeOnOutside);
+    return () => window.removeEventListener("mousedown", closeOnOutside);
+  }, [isOpen, onOpenChange]);
+
+  return (
+    <div className="modelReasoningPicker" ref={rootRef}>
+      <button
+        className="modelPickerTrigger"
+        type="button"
+        onClick={() => onOpenChange(!isOpen)}
+        aria-expanded={isOpen}
+        aria-label={t("settings.modelPickerOpen")}
+      >
+        <span>{modelId || t("settings.model")}</span>
+        <ChevronDown size={15} />
+      </button>
+
+      {isOpen && (
+        <div className="modelPickerPanel">
+          <div className="modelPickerList">
+            {modelOptions.map((item) => (
+              <button
+                key={item}
+                type="button"
+                className={item === modelId ? "active" : ""}
+                onClick={() => onSelectModel(item)}
+              >
+                {item}
+              </button>
+            ))}
+          </div>
+
+          <div className="reasoningSliderPanel">
+            <div className="reasoningSliderHeader">
+              <span>
+                <BrainCircuit size={14} />
+                {t("settings.reasoningEffort")}
+              </span>
+              <strong>{reasoningEffortLabel(selectedValue, t)}</strong>
+            </div>
+            <input
+              type="range"
+              min={0}
+              max={Math.max(0, sliderOptions.length - 1)}
+              step={1}
+              value={selectedIndex}
+              disabled={isLoading || sliderOptions.length <= 1}
+              onChange={(event) => {
+                const nextIndex = Number(event.target.value);
+                onChangeEffort(sliderOptions[nextIndex] ?? "");
+              }}
+            />
+            <div
+              className="reasoningTicks"
+              style={{ gridTemplateColumns: `repeat(${sliderOptions.length}, minmax(0, 1fr))` }}
+            >
+              {sliderOptions.map((item) => (
+                <span key={item || "auto"}>{reasoningEffortLabel(item, t)}</span>
+              ))}
+            </div>
+            {(isLoading || isSaving || efforts.length === 0) && (
+              <small className="reasoningStatus">
+                {isLoading
+                  ? t("settings.reasoningLoading")
+                  : isSaving
+                    ? t("settings.reasoningSaving")
+                    : t("settings.reasoningUnavailable")}
+              </small>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function reasoningEffortLabel(
+  effort: ReasoningEffortSetting,
+  t: (key: string) => string
+) {
+  if (!effort) {
+    return t("settings.reasoningAuto");
+  }
+  const labels: Record<ReasoningEffort, string> = {
+    none: t("settings.reasoningNone"),
+    minimal: t("settings.reasoningMinimal"),
+    low: t("settings.reasoningLow"),
+    medium: t("settings.reasoningMedium"),
+    high: t("settings.reasoningHigh"),
+    xhigh: t("settings.reasoningXhigh"),
+    max: t("settings.reasoningMax")
+  };
+  return labels[effort];
+}
+
 function FileTreeNode({
   node,
   depth,
@@ -4062,7 +4617,7 @@ function ContextUsageMeter({ usage }: { usage: ContextUsage }) {
   );
 }
 
-function ConversationTimeline({
+function ConversationTimelineImpl({
   events,
   snapshots,
   streamingEventId,
@@ -4113,7 +4668,7 @@ function ConversationTimeline({
   );
 }
 
-function TimelineItemView({
+function TimelineItemViewImpl({
   item,
   stream,
   canExecutePlan,
@@ -4329,7 +4884,7 @@ function ErrorRecoveryCard({
   );
 }
 
-function CodeChangeCard({
+function CodeChangeCardImpl({
   change,
   rollbackDisabled,
   onRollbackSnapshot,
@@ -4386,7 +4941,7 @@ function CodeChangeCard({
   );
 }
 
-function CodeChangeSummaryCard({
+function CodeChangeSummaryCardImpl({
   group,
   rollbackDisabled,
   onRollbackSnapshot,
@@ -4475,7 +5030,7 @@ function CodeChangeList({
   );
 }
 
-function McpToolCard({ tool }: { tool: TimelineMcpTool }) {
+function McpToolCardImpl({ tool }: { tool: TimelineMcpTool }) {
   const { t } = useTranslation();
   const hasPayload =
     tool.input !== undefined || tool.output !== undefined || Boolean(tool.error);
@@ -4526,7 +5081,7 @@ function McpToolCard({ tool }: { tool: TimelineMcpTool }) {
 const LONG_MARKDOWN_CHARS = 1200;
 const LONG_MARKDOWN_LINES = 18;
 
-function MarkdownText({
+function MarkdownTextImpl({
   text,
   stream = false
 }: {
@@ -4538,25 +5093,41 @@ function MarkdownText({
   const isLong = isLongMarkdown(normalizedText);
   const [expanded, setExpanded] = useState(!isLong);
   const [visibleLength, setVisibleLength] = useState(stream ? 0 : text.length);
+  const visibleLengthRef = useRef(visibleLength);
+  const previousTextRef = useRef(stream ? "" : text);
 
   useEffect(() => {
     setExpanded(!isLongMarkdown(normalizedText));
     if (!stream) {
+      visibleLengthRef.current = text.length;
+      previousTextRef.current = text;
       setVisibleLength(text.length);
       return undefined;
     }
 
-    setVisibleLength(0);
-    const characters = Array.from(text);
-    const step = Math.max(4, Math.ceil(characters.length / 140));
+    const total = Array.from(text).length;
+    // When a streamed token simply extends the text we were already revealing,
+    // keep the progress made so far — only rewind to 0 if the message was
+    // replaced or shortened. This stops the reply from flashing back to empty
+    // and re-typing on every token.
+    const isAppend = text.startsWith(previousTextRef.current);
+    previousTextRef.current = text;
+    let revealed = isAppend ? Math.min(visibleLengthRef.current, total) : 0;
+    visibleLengthRef.current = revealed;
+    setVisibleLength(revealed);
+
+    if (revealed >= total) {
+      return undefined;
+    }
+
+    const step = Math.max(4, Math.ceil(total / 140));
     const timer = window.setInterval(() => {
-      setVisibleLength((current) => {
-        const next = Math.min(characters.length, current + step);
-        if (next >= characters.length) {
-          window.clearInterval(timer);
-        }
-        return next;
-      });
+      revealed = Math.min(total, revealed + step);
+      visibleLengthRef.current = revealed;
+      setVisibleLength(revealed);
+      if (revealed >= total) {
+        window.clearInterval(timer);
+      }
     }, 18);
 
     return () => window.clearInterval(timer);
@@ -6213,6 +6784,14 @@ function valueAsString(value: unknown) {
   return typeof value === "string" ? value : "";
 }
 
+function parseReasoningEffort(value: string): ReasoningEffortSetting {
+  return isReasoningEffort(value) ? value : "";
+}
+
+function isReasoningEffort(value: string): value is ReasoningEffort {
+  return ["none", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value);
+}
+
 function formatJson(value: unknown) {
   if (typeof value === "string") {
     return value;
@@ -6437,17 +7016,28 @@ function contextUsageFromEvents(eventsResponse: SessionEventsResponse): ContextU
   };
 }
 
-function estimateContextUsage({
+type ContextEstimateBase = {
+  baseTokens: number;
+  maxTokens: number;
+  limit: number | null;
+  providerId: string;
+  modelId: string;
+  recentEventCount: number;
+  totalEventCount: number;
+};
+
+// Heavy part of the context estimate: serialize + tokenize up to
+// CONTEXT_ESTIMATE_EVENT_LIMIT recent events. Split out so it only recomputes when
+// the events/config/provider change — not on every composer keystroke.
+function estimateContextBase({
   eventsResponse,
   configContent,
-  selectedProviderId,
-  draftPrompt
+  selectedProviderId
 }: {
   eventsResponse: SessionEventsResponse;
   configContent: string;
   selectedProviderId: string;
-  draftPrompt: string;
-}): ContextUsage {
+}): ContextEstimateBase {
   const limit = contextLimitFromConfig(configContent, selectedProviderId);
   const maxTokens = limit ?? 128_000;
   const estimatedEvents = eventsResponse.events.slice(-CONTEXT_ESTIMATE_EVENT_LIMIT);
@@ -6461,21 +7051,40 @@ function estimateContextUsage({
     )
     .join("\n");
   const summaryText = eventsResponse.summaries[0]?.text ?? "";
-  const promptShape = [
+  const baseShape = [
     "System prompt: local coding agent JSON tool protocol.",
-    `Current user prompt:\n${draftPrompt}`,
     `Compressed context:\n${summaryText}`,
     `Recent event timeline:\n${recentEventText}`
   ].join("\n\n");
-  const usedTokens = estimateTokens(promptShape);
-  const percent = Math.ceil((usedTokens / maxTokens) * 100);
-  const limitIsDefault = !limit;
+  const provider = splitProviderRecordId(selectedProviderId);
+  return {
+    baseTokens: estimateTokens(baseShape),
+    maxTokens,
+    limit,
+    providerId: provider.providerId,
+    modelId: provider.modelId,
+    recentEventCount: estimatedEvents.length,
+    totalEventCount: eventsResponse.events.length
+  };
+}
+
+// Cheap part: only the draft prompt varies, so typing re-runs just this. Token
+// counts are additive per character, so adding the prompt tokens to the cached base
+// is equivalent to tokenizing the whole shape.
+function estimateContextUsage(
+  base: ContextEstimateBase,
+  draftPrompt: string
+): ContextUsage {
+  const usedTokens =
+    base.baseTokens + estimateTokens(`Current user prompt:\n${draftPrompt}`);
+  const percent = Math.ceil((usedTokens / base.maxTokens) * 100);
+  const limitIsDefault = !base.limit;
 
   return {
     percent,
     barPercent: Math.min(100, Math.max(0, percent)),
     usedTokens,
-    maxTokens,
+    maxTokens: base.maxTokens,
     source: "estimate",
     severity: contextUsageSeverity(percent),
     tokens: {
@@ -6488,13 +7097,13 @@ function estimateContextUsage({
       },
       total: usedTokens
     },
-    providerId: splitProviderRecordId(selectedProviderId).providerId,
-    model: splitProviderRecordId(selectedProviderId).modelId,
+    providerId: base.providerId,
+    model: base.modelId,
     limitIsDefault,
     notes: [
       appT("contextNotes.estimateSource", {
-        recent: estimatedEvents.length,
-        total: eventsResponse.events.length
+        recent: base.recentEventCount,
+        total: base.totalEventCount
       }),
       limitIsDefault ? appT("contextNotes.defaultLimit") : "",
       appT("contextNotes.estimateHint")
@@ -6561,6 +7170,8 @@ function formatInteger(value: number) {
   return new Intl.NumberFormat("zh-CN").format(value);
 }
 
+type ReasoningEffortSetting = ReasoningEffort | "";
+
 type ProviderSettingsFields = {
   providerId: string;
   modelId: string;
@@ -6569,6 +7180,7 @@ type ProviderSettingsFields = {
   apiKey: string;
   supportsResponses: boolean;
   responsesSource: "model" | "provider" | "default";
+  reasoningEffort: ReasoningEffortSetting;
 };
 
 function parseProviderSettings(
@@ -6596,6 +7208,7 @@ function parseProviderSettings(
         : (modelKeys[0] ?? "");
     const options = asRecord(provider.options);
     const model = asRecord(models?.[modelId]);
+    const modelOptions = asRecord(model.options);
     const modelProvider = asRecord(model.provider);
     const providerRequest = asRecord(provider.request);
     const modelRequest = asRecord(model.request);
@@ -6622,7 +7235,10 @@ function parseProviderSettings(
         valueAsString(options.api_key) ||
         valueAsString(options.key),
       supportsResponses,
-      responsesSource
+      responsesSource,
+      reasoningEffort: parseReasoningEffort(
+        valueAsString(modelOptions.reasoningEffort)
+      )
     };
   } catch {
     return {
@@ -6632,7 +7248,8 @@ function parseProviderSettings(
       baseUrl: "",
       apiKey: "",
       supportsResponses: false,
-      responsesSource: "default"
+      responsesSource: "default",
+      reasoningEffort: ""
     };
   }
 }
@@ -6662,6 +7279,18 @@ function buildProviderConfigContent(
   options.apiKey = fields.apiKey.trim();
   model.name = model.name || modelId;
   config.model = `${providerId}/${modelId}`;
+
+  const modelOptions = fields.reasoningEffort
+    ? ensureRecord(model, "options")
+    : asRecord(model.options);
+  if (fields.reasoningEffort) {
+    modelOptions.reasoningEffort = fields.reasoningEffort;
+  } else if ("reasoningEffort" in modelOptions) {
+    delete modelOptions.reasoningEffort;
+  }
+  if (Object.keys(modelOptions).length === 0 && "options" in model) {
+    delete model.options;
+  }
 
   const modelRequest = fields.supportsResponses
     ? ensureRecord(model, "request")
@@ -6841,11 +7470,15 @@ function SetupDialog({
   const [textError, setTextError] = useState("");
 
   useEffect(() => {
+    let disposed = false;
     findOpencodeConfig(projectRoot)
       .then((content) => {
-        if (content) setOpencodeContent(content);
+        if (!disposed && content) setOpencodeContent(content);
       })
       .catch(() => {});
+    return () => {
+      disposed = true;
+    };
   }, [projectRoot]);
 
   function applyPreset(preset: SetupPreset) {

@@ -26,14 +26,14 @@ pub fn register(job_id: &str) {
     let tasks = RUNNING_TASKS.get_or_init(|| Mutex::new(HashSet::new()));
     tasks
         .lock()
-        .expect("task registry poisoned")
+        .unwrap_or_else(|error| error.into_inner())
         .insert(job_id.to_string());
 }
 
 pub fn cancel(job_id: &str) -> bool {
     RUNNING_TASKS
         .get()
-        .map(|tasks| tasks.lock().expect("task registry poisoned").remove(job_id))
+        .map(|tasks| tasks.lock().unwrap_or_else(|error| error.into_inner()).remove(job_id))
         .unwrap_or(false)
 }
 
@@ -43,7 +43,7 @@ pub fn is_registered(job_id: &str) -> bool {
         .map(|tasks| {
             tasks
                 .lock()
-                .expect("task registry poisoned")
+                .unwrap_or_else(|error| error.into_inner())
                 .contains(job_id)
         })
         .unwrap_or(false)
@@ -51,7 +51,7 @@ pub fn is_registered(job_id: &str) -> bool {
 
 pub fn unregister(job_id: &str) {
     if let Some(tasks) = RUNNING_TASKS.get() {
-        tasks.lock().expect("task registry poisoned").remove(job_id);
+        tasks.lock().unwrap_or_else(|error| error.into_inner()).remove(job_id);
     }
 }
 
@@ -59,7 +59,7 @@ pub fn register_promotable(child_session_id: &str, sender: oneshot::Sender<()>) 
     let waiters = PROMOTE_WAITERS.get_or_init(|| Mutex::new(HashMap::new()));
     waiters
         .lock()
-        .expect("task promote registry poisoned")
+        .unwrap_or_else(|error| error.into_inner())
         .insert(child_session_id.to_string(), sender);
 }
 
@@ -67,7 +67,7 @@ pub fn unregister_promotable(child_session_id: &str) {
     if let Some(waiters) = PROMOTE_WAITERS.get() {
         waiters
             .lock()
-            .expect("task promote registry poisoned")
+            .unwrap_or_else(|error| error.into_inner())
             .remove(child_session_id);
     }
 }
@@ -78,7 +78,7 @@ pub fn promote(child_session_id: &str) -> bool {
         .and_then(|waiters| {
             waiters
                 .lock()
-                .expect("task promote registry poisoned")
+                .unwrap_or_else(|error| error.into_inner())
                 .remove(child_session_id)
         })
         .map(|sender| sender.send(()).is_ok())

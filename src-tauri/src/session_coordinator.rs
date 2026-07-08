@@ -60,7 +60,7 @@ pub fn record_demand(session_id: &str, demand: RunDemand) {
         return;
     };
     let interrupts = INTERRUPT_SEQS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut interrupts = interrupts.lock().expect("session interrupt map poisoned");
+    let mut interrupts = interrupts.lock().unwrap_or_else(|error| error.into_inner());
     let entry = interrupts.entry(session_id.to_string()).or_insert(seq);
     *entry = (*entry).max(seq);
 }
@@ -79,7 +79,7 @@ pub fn stale_wake(session_id: &str, demand: RunDemand) -> bool {
     };
     interrupts
         .lock()
-        .expect("session interrupt map poisoned")
+        .unwrap_or_else(|error| error.into_inner())
         .get(session_id)
         .map(|latest| seq <= *latest)
         .unwrap_or(false)
@@ -91,7 +91,7 @@ pub fn activity_status(session_id: &str) -> RunActivityStatus {
         .and_then(|running| {
             running
                 .lock()
-                .expect("running session set poisoned")
+                .unwrap_or_else(|error| error.into_inner())
                 .contains(session_id)
                 .then_some(())
         })
@@ -104,7 +104,7 @@ pub fn activity_status(session_id: &str) -> RunActivityStatus {
         .and_then(|interrupts| {
             interrupts
                 .lock()
-                .expect("session interrupt map poisoned")
+                .unwrap_or_else(|error| error.into_inner())
                 .get(session_id)
                 .copied()
         })
@@ -117,7 +117,7 @@ pub fn activity_status(session_id: &str) -> RunActivityStatus {
 
 fn session_lock(session_id: &str) -> SessionLock {
     let locks = SESSION_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut locks = locks.lock().expect("session lock map poisoned");
+    let mut locks = locks.lock().unwrap_or_else(|error| error.into_inner());
     locks
         .entry(session_id.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
@@ -128,7 +128,7 @@ fn set_running(session_id: &str, running: bool) {
     let running_sessions = RUNNING_SESSIONS.get_or_init(|| Mutex::new(HashSet::new()));
     let mut running_sessions = running_sessions
         .lock()
-        .expect("running session set poisoned");
+        .unwrap_or_else(|error| error.into_inner());
     if running {
         running_sessions.insert(session_id.to_string());
     } else {
@@ -194,7 +194,7 @@ where
 
 fn reserve_pending_wake(session_id: &str, seq: Option<i64>) -> bool {
     let pending = PENDING_WAKE_SEQS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut pending = pending.lock().expect("pending wake map poisoned");
+    let mut pending = pending.lock().unwrap_or_else(|error| error.into_inner());
     match pending.get_mut(session_id) {
         Some(existing) => {
             *existing = max_optional_seq(*existing, seq);
@@ -213,7 +213,7 @@ fn take_pending_wake_seq(session_id: &str) -> Option<i64> {
         .and_then(|pending| {
             pending
                 .lock()
-                .expect("pending wake map poisoned")
+                .unwrap_or_else(|error| error.into_inner())
                 .remove(session_id)
         })
         .flatten()

@@ -290,9 +290,23 @@ export function FloatBall() {
     };
     syncStatus();
     window.addEventListener("storage", onStorage);
-    const timer = window.setInterval(syncStatus, 1000);
+    // Only poll while the float window is actually visible — the storage listener
+    // still catches updates from other windows, so there is no need to burn a
+    // wakeup every second while hidden. Resync immediately when we become visible.
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") {
+        syncStatus();
+      }
+    }, 1000);
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") {
+        syncStatus();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
       window.removeEventListener("storage", onStorage);
+      document.removeEventListener("visibilitychange", onVisibility);
       window.clearInterval(timer);
     };
   }, []);

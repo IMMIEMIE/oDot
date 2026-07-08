@@ -77,8 +77,12 @@ export function mergeSessionEvents(
   }
   return {
     events: Array.from(byId.values()).sort((a, b) => a.seq - b.seq),
-    snapshots: incoming.snapshots.length ? incoming.snapshots : current.snapshots,
-    summaries: incoming.summaries.length ? incoming.summaries : current.summaries,
+    snapshots: mergeListById(current.snapshots, incoming.snapshots).sort((a, b) =>
+      b.createdAt.localeCompare(a.createdAt)
+    ),
+    summaries: mergeListById(current.summaries, incoming.summaries).sort((a, b) =>
+      b.createdAt.localeCompare(a.createdAt)
+    ),
     inputs: incoming.inputs ?? current.inputs,
     runs: incoming.runs ?? current.runs,
     checkpoints: incoming.checkpoints ?? current.checkpoints,
@@ -92,12 +96,41 @@ function mergeEventRecord(
   current: SessionEventsResponse,
   incoming: EventRecord
 ): SessionEventsResponse {
-  const byId = new Map(current.events.map((event) => [event.id, event]));
+  const events = current.events;
+  // Streaming deltas update the same (most-recent) event id many times per second,
+  // so search from the end and update in place — avoiding rebuilding a Map and
+  // re-sorting the whole array on every token.
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (events[index].id === incoming.id) {
+      const nextEvents = events.slice();
+      nextEvents[index] = incoming;
+      return { ...current, events: nextEvents };
+    }
+  }
+  // New event: append directly when it belongs at (or after) the tail, which is the
+  // common append case. Only fall back to a full sorted rebuild for the rare
+  // out-of-order insert.
+  const lastSeq = events.length ? events[events.length - 1].seq : Number.NEGATIVE_INFINITY;
+  if (incoming.seq >= lastSeq) {
+    return { ...current, events: [...events, incoming] };
+  }
+  const byId = new Map(events.map((event) => [event.id, event]));
   byId.set(incoming.id, incoming);
   return {
     ...current,
     events: Array.from(byId.values()).sort((a, b) => a.seq - b.seq)
   };
+}
+
+function mergeListById<T extends { id: string }>(current: T[], incoming: T[]): T[] {
+  if (!incoming.length) {
+    return current;
+  }
+  const byId = new Map(current.map((item) => [item.id, item]));
+  for (const item of incoming) {
+    byId.set(item.id, item);
+  }
+  return Array.from(byId.values());
 }
 
 function mergeRealtimeEvent(

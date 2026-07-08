@@ -11,9 +11,16 @@ use crate::{
 };
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{fs, path::PathBuf};
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
+
+/// The schema bootstrap (CREATE TABLE / migrations) only needs to run once per
+/// process against the single on-disk database file — the created tables persist
+/// in the file. Every command still opens its own connection, but after the first
+/// bootstrap we skip the redundant schema batch + `PRAGMA table_info` probes.
+static SCHEMA_READY: AtomicBool = AtomicBool::new(false);
 
 pub fn open_db(app: &AppHandle) -> Result<Connection, String> {
     let db_path = db_path(app)?;
@@ -22,8 +29,22 @@ pub fn open_db(app: &AppHandle) -> Result<Connection, String> {
     }
 
     let conn = Connection::open(db_path).map_err(|error| error.to_string())?;
-    init_db(&conn)?;
+    // Connection-scoped pragmas must be applied to every connection (they are not
+    // persisted like journal_mode is).
+    configure_connection(&conn)?;
+    if !SCHEMA_READY.load(Ordering::Acquire) {
+        init_db(&conn)?;
+        SCHEMA_READY.store(true, Ordering::Release);
+    }
     Ok(conn)
+}
+
+/// Per-connection pragmas: `busy_timeout` lets a second writer wait instead of
+/// immediately failing with `SQLITE_BUSY` under WAL, and `foreign_keys` is not
+/// persisted so it must be re-enabled on each connection.
+fn configure_connection(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;")
+        .map_err(|error| error.to_string())
 }
 
 fn db_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -38,6 +59,7 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         r#"
         PRAGMA journal_mode = WAL;
+        PRAGMA busy_timeout = 5000;
         PRAGMA foreign_keys = ON;
 
         CREATE TABLE IF NOT EXISTS provider (

@@ -5,8 +5,7 @@ use crate::{
         ShellPolicy, TodoRecord, ToolCallRequest,
     },
     util::{
-        ignored_directories, is_likely_text_file, normalize_project_path, plan_file_path,
-        MAX_FILE_SIZE_BYTES,
+        ignored_directories, normalize_project_path, plan_file_path, MAX_FILE_SIZE_BYTES,
     },
 };
 use encoding_rs::GBK;
@@ -804,20 +803,23 @@ fn search_project(root: &str, query: &str) -> Result<Vec<Value>, String> {
                 continue;
             }
 
-            if !metadata.is_file()
-                || metadata.len() > MAX_FILE_SIZE_BYTES
-                || !is_likely_text_file(&path)?
-            {
+            if !metadata.is_file() || metadata.len() > MAX_FILE_SIZE_BYTES {
                 continue;
             }
 
-            let content = decode_text_file(&path)?;
+            // Read the file once and reuse the bytes for both the binary sniff and
+            // the text decode, instead of opening it twice.
+            let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+            if bytes.iter().take(512).any(|byte| *byte == 0) {
+                continue;
+            }
+            let content = decode_bytes(&bytes);
             let relative = path
                 .strip_prefix(&root)
                 .map_err(|error| error.to_string())?
                 .to_string_lossy()
                 .replace('\\', "/");
-            if relative.contains(query) {
+            if relative.contains(query) && matches.len() < 100 {
                 matches.push(json!({
                     "path": relative,
                     "lineNumber": 0,
@@ -1111,11 +1113,6 @@ fn terminate_pid_tree(pid: u32) {
 
 fn decode_process_output(bytes: &[u8]) -> String {
     decode_bytes(bytes)
-}
-
-fn decode_text_file(path: &std::path::Path) -> Result<String, String> {
-    let bytes = fs::read(path).map_err(|error| error.to_string())?;
-    Ok(decode_bytes(&bytes))
 }
 
 fn decode_bytes(bytes: &[u8]) -> String {

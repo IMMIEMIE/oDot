@@ -102,7 +102,10 @@ impl StdioMcpClient {
         command.envs(&server.env);
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
+        // Discard stderr rather than piping it: nothing reads this pipe, so a
+        // chatty server that fills the OS pipe buffer would block on write and
+        // deadlock the JSON-RPC request until it times out.
+        command.stderr(Stdio::null());
         let mut child = command
             .spawn()
             .map_err(|error| format!("无法启动 MCP server '{}': {error}", server.id))?;

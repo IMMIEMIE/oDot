@@ -1,0 +1,19 @@
+# Normalize line endings: store text files with LF in the repo and let Git handle
+# the working-tree conversion. Stops the constant "LF will be replaced by CRLF"
+# churn on Windows checkouts.
+* text=auto eol=lf
+
+# Explicitly treat common binary assets as binary (never touch their bytes).
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.zip binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+
+# Windows batch files must keep CRLF to run correctly.
+*.bat text eol=crlf
