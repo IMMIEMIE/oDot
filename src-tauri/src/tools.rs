@@ -5,7 +5,8 @@ use crate::{
         ShellPolicy, TodoRecord, ToolCallRequest,
     },
     util::{
-        ignored_directories, normalize_project_path, plan_file_path, MAX_FILE_SIZE_BYTES,
+        hide_console, ignored_directories, normalize_project_path, plan_file_path,
+        MAX_FILE_SIZE_BYTES,
     },
 };
 use encoding_rs::GBK;
@@ -995,6 +996,7 @@ fn shell_command(root: &PathBuf, command: &str) -> Command {
                 &command,
             ])
             .current_dir(root);
+        hide_console(&mut process);
         process
     } else {
         let mut process = Command::new("sh");
@@ -1017,11 +1019,13 @@ where
 fn terminate_process_tree(child: &mut Child) {
     let pid = child.id().to_string();
     if cfg!(target_os = "windows") {
-        let _ = Command::new("taskkill")
+        let mut command = Command::new("taskkill");
+        command
             .args(["/PID", &pid, "/T", "/F"])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+            .stderr(Stdio::null());
+        hide_console(&mut command);
+        let _ = command.status();
     }
     let _ = child.kill();
 }
@@ -1077,8 +1081,10 @@ pub fn read_job_logs(conn: &Connection, job_id: &str) -> Result<Value, String> {
 
 fn pid_is_running(pid: u32) -> bool {
     if cfg!(target_os = "windows") {
-        Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}")])
+        let mut command = Command::new("tasklist");
+        command.args(["/FI", &format!("PID eq {pid}")]);
+        hide_console(&mut command);
+        command
             .output()
             .map(|output| {
                 String::from_utf8_lossy(&output.stdout)
@@ -1097,11 +1103,13 @@ fn pid_is_running(pid: u32) -> bool {
 
 fn terminate_pid_tree(pid: u32) {
     if cfg!(target_os = "windows") {
-        let _ = Command::new("taskkill")
+        let mut command = Command::new("taskkill");
+        command
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+            .stderr(Stdio::null());
+        hide_console(&mut command);
+        let _ = command.status();
     } else {
         let _ = Command::new("kill")
             .args(["-TERM", &pid.to_string()])

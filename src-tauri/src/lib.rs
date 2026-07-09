@@ -745,11 +745,39 @@ fn set_bridge_port(app: AppHandle, port: u16) -> Result<external_bridge::BridgeS
     external_bridge::save_port(&app, port)
 }
 
+#[tauri::command]
+fn report_workspace_resolution(
+    action: String,
+    workspace_root: String,
+    active_session_id: Option<String>,
+    busy_reason: Option<String>,
+) -> Result<external_bridge::WorkspaceResolutionState, String> {
+    external_bridge::update_resolution(action, workspace_root, active_session_id, busy_reason)
+}
+
+#[tauri::command]
+fn quit_app(app: AppHandle) -> Result<(), String> {
+    external_bridge::mark_manual_shutdown()?;
+    app.exit(0);
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        let _ = app.emit("odot:bridge-wake", json!({ "source": "deep-link" }));
+    }));
+    builder
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            #[cfg(any(target_os = "linux", all(debug_assertions, target_os = "windows")))]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                app.deep_link().register_all()?;
+            }
             event_bus::init();
             external_bridge::start(app.handle().clone());
             let app_handle = app.handle().clone();
@@ -829,7 +857,9 @@ pub fn run() {
             reveal_project_path,
             list_project_files,
             get_bridge_status,
-            set_bridge_port
+            set_bridge_port,
+            report_workspace_resolution,
+            quit_app
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

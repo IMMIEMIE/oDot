@@ -7,7 +7,7 @@ import {
   PhysicalPosition
 } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { AlertTriangle, Check, FolderOpen, KeyRound, Maximize2, Send, ShieldCheck, X } from "lucide-react";
+import { AlertTriangle, Check, FolderOpen, KeyRound, Maximize2, Plus, Send, ShieldCheck, X } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type {
@@ -35,9 +35,9 @@ import {
 import {
   clearExternalProjectSessions,
   EXTERNAL_PROJECT_SESSIONS_STORAGE_KEY,
-  readExternalProjectSessions,
-  saveExternalProjectSessions
+  readExternalProjectSessions
 } from "./externalProjectSessions";
+import { saveAppearanceMode } from "./appearanceMode";
 import {
   appendPromptReferenceSections,
   externalPromptReferenceKind,
@@ -85,7 +85,7 @@ import {
 type ThemeMode = "system" | "light" | "dark";
 type ResolvedTheme = "light" | "dark";
 type FloatExpansionMode = "prompt" | "approval";
-type FloatWindowLayoutKind = "ball" | "prompt" | "approval" | "reply";
+type FloatWindowLayoutKind = "ball" | "prompt" | "approval" | "reply" | "sessions";
 type FloatWindowAnchor = { x: number; y: number };
 type FloatWindowMetrics = {
   width: number;
@@ -110,6 +110,10 @@ const FLOAT_APPROVAL_HEIGHT = 166;
 const FLOAT_REPLY_WIDTH = 332;
 const FLOAT_REPLY_HEIGHT = 136;
 const FLOAT_REPLY_ANCHOR_OFFSET = 36;
+const FLOAT_SESSIONS_WIDTH = 332;
+const FLOAT_SESSIONS_HEADER_HEIGHT = 34;
+const FLOAT_SESSIONS_OPTION_HEIGHT = 46;
+const FLOAT_SESSIONS_MAX_HEIGHT = 320;
 
 export function FloatBall() {
   const { t } = useTranslation();
@@ -500,6 +504,7 @@ export function FloatBall() {
     setExpandedMode(null);
     setPanelError("");
     try {
+      saveAppearanceMode("window");
       await mainWin.show();
       await mainWin.setFocus();
       await floatWin.hide();
@@ -925,9 +930,16 @@ export function FloatBall() {
   const isPromptCapsuleOpen = expandedMode === "prompt" && canOpenPrompt;
   const isApprovalCapsuleOpen =
     expandedMode === "approval" && isApprovalPending && Boolean(agentStatus.pendingApproval);
+  const externalProjectSessionCount = externalProjectSessions?.sessions.length ?? 0;
+  const externalProjectWorkspaceRoot = externalProjectSessions?.workspaceRoot?.trim() ?? "";
+  const showSessionsCapsule =
+    !isPromptCapsuleOpen &&
+    !isApprovalCapsuleOpen &&
+    Boolean(externalProjectSessionCount || externalProjectWorkspaceRoot);
   const showReplyCapsule =
     !isPromptCapsuleOpen &&
     !isApprovalCapsuleOpen &&
+    !showSessionsCapsule &&
     (hasCompletedReply || (isAgentActive && displayAgentMessage.length > 0)) &&
     liveMessage.length > 0;
   const shouldRenderMarkdown =
@@ -1027,46 +1039,8 @@ export function FloatBall() {
     };
   }, []);
 
-  useEffect(() => {
-    let disposed = false;
-    let unlisten: (() => void) | undefined;
-    void listen<ExternalProjectSessionsPayload>(
-      "odot:external-project-sessions",
-      async ({ payload }) => {
-        if (disposed) {
-          return;
-        }
-        const isVisible = await getCurrentWindow().isVisible().catch(() => true);
-        if (disposed || !isVisible) {
-          return;
-        }
-        setExternalProjectSessions(
-          payload.sessions.length || payload.workspaceRoot ? payload : null
-        );
-        saveExternalProjectSessions(payload, "float");
-        externalProjectSessionsUpdatedAtRef.current =
-          readExternalProjectSessions()?.updatedAt ?? Date.now();
-        if (payload.sessions.length && canOpenPrompt && !isSubmittingPrompt) {
-          setExpandedMode("prompt");
-          setPanelError("");
-        }
-      }
-    ).then((dispose) => {
-      if (disposed) {
-        dispose();
-      } else {
-        unlisten = dispose;
-      }
-    }).catch(() => undefined);
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, [canOpenPrompt, isSubmittingPrompt]);
-
   const promptInputChromeHeight =
     FLOAT_PROMPT_CHROME_HEIGHT +
-    (externalProjectSessions?.sessions.length || externalProjectSessions?.workspaceRoot ? 82 : 0) +
     (attachments.length ? 32 : 0) +
     (panelError ? 20 : 0);
   const promptWindowHeight = promptInputChromeHeight + promptInputHeight;
@@ -1075,16 +1049,27 @@ export function FloatBall() {
     resizePromptInput();
   }, [externalPromptReferences.length, isPromptCapsuleOpen, promptText]);
 
+  const sessionsCapsuleOptionCount =
+    externalProjectSessionCount + (externalProjectWorkspaceRoot ? 1 : 0);
+  const sessionsCapsuleHeight = Math.min(
+    FLOAT_SESSIONS_HEADER_HEIGHT +
+      12 +
+      sessionsCapsuleOptionCount * FLOAT_SESSIONS_OPTION_HEIGHT,
+    FLOAT_SESSIONS_MAX_HEIGHT
+  );
   const floatLayoutKind: FloatWindowLayoutKind = isPromptCapsuleOpen
     ? "prompt"
     : isApprovalCapsuleOpen
       ? "approval"
-      : showReplyCapsule
-        ? "reply"
-        : "ball";
+      : showSessionsCapsule
+        ? "sessions"
+        : showReplyCapsule
+          ? "reply"
+          : "ball";
   const floatWindowMetrics = floatWindowLayoutMetrics(
     floatLayoutKind,
-    promptWindowHeight
+    promptWindowHeight,
+    sessionsCapsuleHeight
   );
   const containerClassName = [
     "floatBallContainer",
@@ -1108,6 +1093,7 @@ export function FloatBall() {
     floatLayoutKind !== "ball" ? "floatCapsule--expanded" : "",
     isPromptCapsuleOpen ? "floatCapsule--prompt" : "",
     isApprovalCapsuleOpen ? "floatCapsule--approval" : "",
+    showSessionsCapsule ? "floatCapsule--sessions" : "",
     showReplyCapsule ? "floatCapsule--reply" : "",
   ].filter(Boolean).join(" ");
   const approvalTitle = agentStatus.pendingApproval?.command.trim();
@@ -1219,6 +1205,70 @@ export function FloatBall() {
         </div>
       )}
 
+      {showSessionsCapsule && (
+        <div className="floatCapsulePanel floatSessionsCapsule" aria-live="polite">
+          <div className="floatSessionsHeader">
+            <span>
+              <FolderOpen size={12} />
+              {t("externalProjectSessions.title")}
+            </span>
+            <button
+              type="button"
+              className="floatPanelIconButton"
+              aria-label={t("externalProjectSessions.dismiss")}
+              onClick={(event) => {
+                event.stopPropagation();
+                setExternalProjectSessions(null);
+                clearExternalProjectSessions("float");
+                externalProjectSessionsUpdatedAtRef.current =
+                  readExternalProjectSessions()?.updatedAt ?? Date.now();
+              }}
+            >
+              <X size={12} />
+            </button>
+          </div>
+          {(externalProjectSessions?.action === "deferredBusy" ||
+            externalProjectSessions?.action === "error") && (
+            <div className="floatSessionsWarning">
+              {externalProjectSessions.busyReason ??
+                t("externalProjectSessions.busyReason")}
+            </div>
+          )}
+          <div className="floatSessionsList">
+            {externalProjectSessions?.sessions.map((session) => (
+              <button
+                type="button"
+                key={session.id}
+                className="floatSessionsOption"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  selectExternalProjectSession(session.id);
+                }}
+              >
+                <span>{session.title}</span>
+                <small>{appT(`mode.${session.mode}`)} / {session.status}</small>
+              </button>
+            ))}
+            {externalProjectWorkspaceRoot ? (
+              <button
+                type="button"
+                className="floatSessionsOption floatSessionsOption--create"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  requestExternalProjectSessionCreate(externalProjectWorkspaceRoot);
+                }}
+              >
+                <span>
+                  <Plus size={12} />
+                  {t("externalProjectSessions.create")}
+                </span>
+                <small>{externalProjectWorkspaceRoot}</small>
+              </button>
+            ) : null}
+          </div>
+        </div>
+      )}
+
       {isPromptCapsuleOpen && (
         <form
           className="floatCapsulePanel floatPromptCapsule"
@@ -1231,55 +1281,6 @@ export function FloatBall() {
             void sendPrompt();
           }}
         >
-          {(externalProjectSessions?.sessions.length || externalProjectSessions?.workspaceRoot) ? (
-            <div className="floatExternalProjectSessionPicker">
-              <div className="floatExternalProjectSessionHeader">
-                <span>
-                  <FolderOpen size={12} />
-                  {t("externalProjectSessions.title")}
-                </span>
-                <button
-                  type="button"
-                  aria-label={t("externalProjectSessions.dismiss")}
-                  onClick={() => {
-                    setExternalProjectSessions(null);
-                    clearExternalProjectSessions("float");
-                    externalProjectSessionsUpdatedAtRef.current =
-                      readExternalProjectSessions()?.updatedAt ?? Date.now();
-                  }}
-                >
-                  <X size={11} />
-                </button>
-              </div>
-              <div className="floatExternalProjectSessionList">
-                {externalProjectSessions.sessions.map((session) => (
-                  <button
-                    type="button"
-                    key={session.id}
-                    className="floatExternalProjectSessionOption"
-                    onClick={() => selectExternalProjectSession(session.id)}
-                  >
-                    <span>{session.title}</span>
-                    <small>{appT(`mode.${session.mode}`)} / {session.status}</small>
-                  </button>
-                ))}
-                {externalProjectSessions.workspaceRoot?.trim() ? (
-                  <button
-                    type="button"
-                    className="floatExternalProjectSessionOption floatExternalProjectSessionOption--create"
-                    onClick={() =>
-                      requestExternalProjectSessionCreate(
-                        externalProjectSessions.workspaceRoot ?? ""
-                      )
-                    }
-                  >
-                    <span>{t("externalProjectSessions.create")}</span>
-                    <small>{externalProjectSessions.workspaceRoot}</small>
-                  </button>
-                ) : null}
-              </div>
-            </div>
-          ) : null}
           <div
             ref={promptInputRef}
             className={`floatPromptInput promptRichInput ${
@@ -1429,8 +1430,17 @@ export function FloatBall() {
 
 function floatWindowLayoutMetrics(
   kind: FloatWindowLayoutKind,
-  promptHeight: number
+  promptHeight: number,
+  sessionsHeight = 0
 ): FloatWindowMetrics {
+  if (kind === "sessions") {
+    return {
+      width: FLOAT_SESSIONS_WIDTH,
+      height: sessionsHeight,
+      anchorX: FLOAT_SESSIONS_WIDTH / 2,
+      anchorY: sessionsHeight / 2
+    };
+  }
   if (kind === "prompt") {
     return {
       width: FLOAT_PROMPT_WIDTH,

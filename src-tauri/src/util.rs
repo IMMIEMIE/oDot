@@ -10,6 +10,20 @@ pub const MAX_FILES: usize = 1_000;
 pub const MAX_FILE_SIZE_BYTES: u64 = 300_000;
 const DIFF_CONTEXT_LINES: usize = 3;
 
+/// Suppress the transient console window Windows spawns for each child process.
+/// Piped stdout/stderr are still captured; only the flashing `cmd`/console
+/// window is gone. No-op on other platforms.
+pub fn hide_console(command: &mut std::process::Command) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = command;
+}
+
 pub fn now_string() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

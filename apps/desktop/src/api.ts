@@ -143,9 +143,23 @@ export type SessionRecord = {
   updatedAt: string;
 };
 
+export type WorkspaceResolutionAction =
+  | "ignored"
+  | "selected"
+  | "created"
+  | "choose"
+  | "deferredBusy"
+  | "needsSetup"
+  | "error";
+
 export type ExternalProjectSessionsPayload = {
-  workspaceRoot?: string | null;
+  protocolVersion: number;
+  requestId: string;
+  action: WorkspaceResolutionAction;
+  workspaceRoot: string;
   source?: string | null;
+  busyReason?: string | null;
+  activeSessionId?: string | null;
   sessions: SessionRecord[];
 };
 
@@ -266,11 +280,13 @@ export type ProjectFile = {
 
 export type BridgeStatus = {
   enabled: boolean;
+  protocolVersion: number;
   host: string;
   port: number;
   configuredPort: number;
   portSource: string;
   settingsPath?: string | null;
+  discoveryPath?: string | null;
   error?: string | null;
   restartRequired: boolean;
 };
@@ -677,6 +693,26 @@ export async function getBridgeStatus(): Promise<BridgeStatus> {
 export async function setBridgePort(port: number): Promise<BridgeStatus> {
   assertTauri();
   return invoke<BridgeStatus>("set_bridge_port", { port });
+}
+
+export async function reportWorkspaceResolution(input: {
+  action: WorkspaceResolutionAction;
+  workspaceRoot: string;
+  activeSessionId?: string | null;
+  busyReason?: string | null;
+}): Promise<ExternalProjectSessionsPayload> {
+  assertTauri();
+  return invoke<ExternalProjectSessionsPayload>("report_workspace_resolution", {
+    action: input.action,
+    workspaceRoot: input.workspaceRoot,
+    activeSessionId: input.activeSessionId ?? null,
+    busyReason: input.busyReason ?? null
+  });
+}
+
+export async function quitApp(): Promise<void> {
+  assertTauri();
+  return invoke<void>("quit_app");
 }
 
 export async function pickProjectDirectory(): Promise<string | null> {

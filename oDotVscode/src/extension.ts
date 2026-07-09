@@ -1,6 +1,16 @@
 import * as http from "node:http";
+import { spawn } from "node:child_process";
+import { promises as fs } from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
+import {
+  canRestartAfterManualShutdown,
+  normalizeWorkspaceRoot,
+  shouldPublishWorkspace,
+  shouldWakeODot
+} from "./workspaceSync";
 
 type ExternalPromptReferenceItem = {
   itemType?: string | null;
@@ -18,33 +28,141 @@ type ExternalPromptReferencePayload = {
   items: ExternalPromptReferenceItem[];
 };
 
-type BridgeConfig = {
+type BridgeDiscovery = {
+  protocolVersion: number;
   host: string;
   port: number;
+  token: string;
+  executablePath?: string | null;
+  pid: number;
+  startedAt: number;
+};
+
+type BridgeConfig = BridgeDiscovery & {
   timeoutMs: number;
 };
 
-const sourceName = "vscode";
-let publishWorkspaceTimer: NodeJS.Timeout | undefined;
-let lastPublishedWorkspaceRoot = "";
+type WorkspaceReason = "activation" | "editor-change" | "folder-change" | "focus";
 
-export function activate(context: vscode.ExtensionContext) {
+const sourceName = "vscode";
+const PROTOCOL_VERSION = 2;
+const BRIDGE_HEARTBEAT_INTERVAL_MS = 4000;
+const BRIDGE_WAKE_RETRY_MS = 15000;
+let publishWorkspaceTimer: NodeJS.Timeout | undefined;
+let bridgeHeartbeatTimer: NodeJS.Timeout | undefined;
+let lastPublishedWorkspaceRoot = "";
+let bridgeReachable = false;
+let clientId = "";
+let sequence = 0;
+let windowFocused = true;
+let lastWakeAttempt = 0;
+let protocolWarningShown = false;
+let fallbackWakeAttempted = false;
+
+export async function activate(context: vscode.ExtensionContext) {
+  const persistentClientId =
+    context.workspaceState.get<string>("odot.bridge.clientId") ?? randomUUID();
+  await context.workspaceState.update("odot.bridge.clientId", persistentClientId);
+  clientId = `${persistentClientId}:${randomUUID()}`;
+  windowFocused = vscode.window.state.focused;
   context.subscriptions.push(
     vscode.commands.registerCommand("odot.sendReferenceToPrompt", sendReferenceToPrompt),
     vscode.commands.registerCommand("odot.sendResourceToPrompt", sendResourceToPrompt),
     vscode.commands.registerCommand("odot.checkBridge", checkBridge),
     vscode.window.onDidChangeActiveTextEditor(() => {
-      schedulePublishWorkspaceSessions();
+      schedulePublishWorkspaceSessions("editor-change");
     }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
-      schedulePublishWorkspaceSessions(true);
+      schedulePublishWorkspaceSessions("folder-change", true);
+    }),
+    vscode.window.onDidChangeWindowState((state) => {
+      windowFocused = state.focused;
+      void sendHeartbeat();
+      if (state.focused) {
+        schedulePublishWorkspaceSessions("focus", true);
+      }
     })
   );
-  schedulePublishWorkspaceSessions(true);
+  startBridgeHeartbeat(context);
+  schedulePublishWorkspaceSessions("activation", true);
 }
 
 export function deactivate() {
-  // Nothing to dispose.
+  if (publishWorkspaceTimer) {
+    clearTimeout(publishWorkspaceTimer);
+    publishWorkspaceTimer = undefined;
+  }
+  if (bridgeHeartbeatTimer) {
+    clearInterval(bridgeHeartbeatTimer);
+    bridgeHeartbeatTimer = undefined;
+  }
+}
+
+// Poll the oDot bridge so the extension notices when oDot (re)starts. On every
+// unreachable -> reachable transition we force a fresh workspace publish, which
+// makes oDot re-run its session-matching logic and keeps the IDE and the app
+// pinned to the same project directory (requirement: sync on each oDot startup).
+function startBridgeHeartbeat(context: vscode.ExtensionContext) {
+  const tick = () => {
+    void pollBridgeReachability();
+  };
+  bridgeHeartbeatTimer = setInterval(tick, BRIDGE_HEARTBEAT_INTERVAL_MS);
+  context.subscriptions.push({
+    dispose: () => {
+      if (bridgeHeartbeatTimer) {
+        clearInterval(bridgeHeartbeatTimer);
+        bridgeHeartbeatTimer = undefined;
+      }
+    }
+  });
+  tick();
+}
+
+async function pollBridgeReachability() {
+  const requestSequence = nextSequence();
+  try {
+    const config = await bridgeConfig();
+    const response = await requestJson(config, "POST", "/v2/client/heartbeat", {
+      protocolVersion: PROTOCOL_VERSION,
+      clientId,
+      sequence: requestSequence,
+      focused: windowFocused,
+      workspaceRoot: currentWorkspaceFolder()?.uri.fsPath ?? null,
+      sentAt: Date.now()
+    });
+    ensureProtocolResponse(response);
+    const reachable = response.statusCode >= 200 && response.statusCode < 300;
+    if (reachable && !bridgeReachable) {
+      bridgeReachable = true;
+      await publishWorkspaceSessions("activation", true);
+    } else if (!reachable) {
+      bridgeReachable = false;
+    }
+  } catch (error) {
+    bridgeReachable = false;
+    if (shouldWakeODot(error)) {
+      await wakeODot("heartbeat");
+    }
+  }
+}
+
+async function sendHeartbeat() {
+  const requestSequence = nextSequence();
+  try {
+    const config = await bridgeConfig();
+    const response = await requestJson(config, "POST", "/v2/client/heartbeat", {
+      protocolVersion: PROTOCOL_VERSION,
+      clientId,
+      sequence: requestSequence,
+      focused: windowFocused,
+      workspaceRoot: currentWorkspaceFolder()?.uri.fsPath ?? null,
+      sentAt: Date.now()
+    });
+    ensureProtocolResponse(response);
+    bridgeReachable = response.statusCode >= 200 && response.statusCode < 300;
+  } catch {
+    bridgeReachable = false;
+  }
 }
 
 async function sendReferenceToPrompt(resource?: vscode.Uri, selectedResources?: vscode.Uri[]) {
@@ -93,8 +211,9 @@ async function sendResourceToPrompt(resource?: vscode.Uri, selectedResources?: v
 
 async function checkBridge() {
   await runCommand(async () => {
-    const config = bridgeConfig();
-    const response = await requestJson(config, "GET", "/health");
+    const config = await bridgeConfig();
+    const response = await requestJson(config, "GET", "/v2/status");
+    ensureProtocolResponse(response);
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw new Error(`Bridge responded with HTTP ${response.statusCode}: ${response.body}`);
     }
@@ -102,34 +221,55 @@ async function checkBridge() {
   });
 }
 
-function schedulePublishWorkspaceSessions(force = false) {
+function schedulePublishWorkspaceSessions(reason: WorkspaceReason, force = false) {
   if (publishWorkspaceTimer) {
     clearTimeout(publishWorkspaceTimer);
   }
   publishWorkspaceTimer = setTimeout(() => {
     publishWorkspaceTimer = undefined;
-    void publishWorkspaceSessions(force);
+    void publishWorkspaceSessions(reason, force);
   }, 120);
 }
 
-async function publishWorkspaceSessions(force = false) {
+async function publishWorkspaceSessions(reason: WorkspaceReason, force = false) {
   const folder = currentWorkspaceFolder();
   if (!folder) {
     return;
   }
   const workspaceRoot = normalizeWorkspaceRoot(folder.uri.fsPath);
-  if (!force && workspaceRoot === lastPublishedWorkspaceRoot) {
+  if (
+    !shouldPublishWorkspace({
+      focused: windowFocused,
+      force,
+      workspaceRoot: folder.uri.fsPath,
+      lastPublishedWorkspaceRoot
+    })
+  ) {
     return;
   }
-  const config = bridgeConfig();
+  const requestSequence = nextSequence();
   try {
-    await requestJson(config, "POST", "/v1/project-sessions", {
+    const config = await bridgeConfig();
+    const response = await requestJson(config, "POST", "/v2/workspace/activate", {
+      protocolVersion: PROTOCOL_VERSION,
+      clientId,
+      sequence: requestSequence,
+      focused: windowFocused,
       workspaceRoot: folder.uri.fsPath,
-      source: sourceName
+      reason,
+      sentAt: Date.now()
     });
+    ensureProtocolResponse(response);
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw new Error(`Bridge responded with HTTP ${response.statusCode}: ${response.body}`);
+    }
     lastPublishedWorkspaceRoot = workspaceRoot;
-  } catch {
-    // oDot may not be running yet; keep activation quiet.
+    bridgeReachable = true;
+  } catch (error) {
+    bridgeReachable = false;
+    if (shouldWakeODot(error)) {
+      await wakeODot(reason);
+    }
   }
 }
 
@@ -142,10 +282,6 @@ function currentWorkspaceFolder() {
     }
   }
   return vscode.workspace.workspaceFolders?.[0] ?? null;
-}
-
-function normalizeWorkspaceRoot(value: string) {
-  return value.trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
 }
 
 async function runCommand(command: () => Promise<void>) {
@@ -285,8 +421,9 @@ async function sendItems(items: ExternalPromptReferenceItem[], mode: string) {
     throw new Error("The selected reference is empty or too large to send.");
   }
 
-  const config = bridgeConfig();
-  const response = await requestJson(config, "POST", "/v1/prompt-references", payload);
+  const config = await bridgeConfig();
+  const response = await requestJson(config, "POST", "/v2/prompt-references", payload);
+  ensureProtocolResponse(response);
   if (response.statusCode < 200 || response.statusCode >= 300) {
     throw new Error(`Bridge responded with HTTP ${response.statusCode}: ${response.body}`);
   }
@@ -352,12 +489,28 @@ function languageForUri(uri: vscode.Uri) {
   return aliases[ext] ?? ext;
 }
 
-function bridgeConfig(): BridgeConfig {
-  const config = vscode.workspace.getConfiguration("odot.bridge");
+async function bridgeConfig(): Promise<BridgeConfig> {
+  const discoveryPath = path.join(os.homedir(), ".odot", "bridge.json");
+  const raw = await fs.readFile(discoveryPath, "utf8");
+  const discovery = JSON.parse(raw) as Partial<BridgeDiscovery>;
+  if (
+    discovery.protocolVersion !== PROTOCOL_VERSION ||
+    discovery.host !== "127.0.0.1" ||
+    !Number.isInteger(discovery.port) ||
+    !discovery.token
+  ) {
+    throw new Error(`Invalid or incompatible oDot bridge discovery file: ${discoveryPath}`);
+  }
   return {
-    host: config.get("host", "127.0.0.1"),
-    port: config.get("port", 39871),
-    timeoutMs: config.get("timeoutMs", 5000)
+    protocolVersion: discovery.protocolVersion,
+    host: discovery.host,
+    port: discovery.port!,
+    token: discovery.token,
+    executablePath:
+      typeof discovery.executablePath === "string" ? discovery.executablePath : null,
+    pid: discovery.pid ?? 0,
+    startedAt: discovery.startedAt ?? 0,
+    timeoutMs: vscode.workspace.getConfiguration("odot.bridge").get("timeoutMs", 5000)
   };
 }
 
@@ -378,6 +531,7 @@ function requestJson(
         timeout: config.timeoutMs,
         headers: {
           Accept: "application/json",
+          Authorization: `Bearer ${config.token}`,
           ...(json
             ? {
                 "Content-Type": "application/json; charset=utf-8",
@@ -407,6 +561,67 @@ function requestJson(
     }
     request.end();
   });
+}
+
+function nextSequence() {
+  sequence += 1;
+  return sequence;
+}
+
+function ensureProtocolResponse(response: { statusCode: number; body: string }) {
+  if (response.statusCode !== 409 && response.statusCode !== 426) {
+    return;
+  }
+  if (!protocolWarningShown) {
+    protocolWarningShown = true;
+    vscode.window.showErrorMessage(
+      "oDot Bridge protocol mismatch. Update both oDot and the oDot VS Code extension."
+    );
+  }
+  throw new Error("oDot Bridge protocol mismatch.");
+}
+
+async function wakeODot(reason: WorkspaceReason | "heartbeat" | "explicit") {
+  const now = Date.now();
+  if (now - lastWakeAttempt < BRIDGE_WAKE_RETRY_MS) {
+    return;
+  }
+  lastWakeAttempt = now;
+  const shutdownMarker = path.join(os.homedir(), ".odot", "manual-shutdown.json");
+  const manuallyStopped = await fs.access(shutdownMarker).then(
+    () => true,
+    () => false
+  );
+  if (manuallyStopped && !canRestartAfterManualShutdown(reason)) {
+    return;
+  }
+  if (manuallyStopped) {
+    await fs.unlink(shutdownMarker).catch(() => undefined);
+  }
+  try {
+    const discovery = JSON.parse(
+      await fs.readFile(path.join(os.homedir(), ".odot", "bridge.json"), "utf8")
+    ) as Partial<BridgeDiscovery>;
+    if (typeof discovery.executablePath === "string" && discovery.executablePath) {
+      const child = spawn(discovery.executablePath, [], {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true
+      });
+      child.unref();
+      return;
+    }
+  } catch {
+    // The first launch may not have a discovery file yet; use the URI once.
+  }
+  if (fallbackWakeAttempted) {
+    return;
+  }
+  fallbackWakeAttempted = true;
+  await vscode.env.openExternal(vscode.Uri.parse("odot://bridge/wake")).then(
+    () => undefined,
+    () => undefined
+  );
 }
 
 function byteLength(value: string) {

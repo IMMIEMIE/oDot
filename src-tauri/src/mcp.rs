@@ -12,6 +12,19 @@ use tokio::{
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// Stop Windows from flashing a console window for each MCP server we launch
+/// (`npx`/`node`/`cmd` are console programs). stdin/stdout stay piped for the
+/// JSON-RPC transport; only the visible window is suppressed. No-op elsewhere.
+fn hide_console(command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = command;
+}
+
 pub async fn list_server_tools(
     project_root: &str,
     server: &McpServerConfig,
@@ -106,6 +119,7 @@ impl StdioMcpClient {
         // chatty server that fills the OS pipe buffer would block on write and
         // deadlock the JSON-RPC request until it times out.
         command.stderr(Stdio::null());
+        hide_console(&mut command);
         let mut child = command
             .spawn()
             .map_err(|error| format!("无法启动 MCP server '{}': {error}", server.id))?;

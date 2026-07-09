@@ -83,8 +83,10 @@ import {
   pickProjectDirectory,
   pickSkillFile,
   promoteTask,
+  quitApp,
   revealProjectPath,
   rejectToolCall,
+  reportWorkspaceResolution,
   replyPermission,
   recoverBackgroundTask,
   recoverSessionFromCheckpoint,
@@ -143,6 +145,10 @@ import {
   readExternalProjectSessions,
   saveExternalProjectSessions
 } from "./externalProjectSessions";
+import {
+  readAppearanceMode,
+  saveAppearanceMode
+} from "./appearanceMode";
 import {
   extractPromptEditorText,
   insertTextAtSelection,
@@ -306,7 +312,8 @@ export function App() {
   const rollbackInFlightRef = useRef(false);
   const promptDraftHydratedRef = useRef(false);
   const promptDraftUpdatedAtRef = useRef(readPromptDraft()?.updatedAt ?? 0);
-  const autoCreatingExternalProjectRootRef = useRef<string | null>(null);
+  const pendingExternalProjectRootRef = useRef<string | null>(null);
+  const appearanceRestoredRef = useRef(false);
   const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
   const [isShellModeMenuOpen, setIsShellModeMenuOpen] = useState(false);
   const [composerReasoningEfforts, setComposerReasoningEfforts] = useState<ReasoningEffort[]>([]);
@@ -373,6 +380,14 @@ export function App() {
         clearTimeout(composerReasoningSaveTimer.current);
       }
     };
+  }, []);
+
+  useEffect(() => {
+    if (appearanceRestoredRef.current) {
+      return;
+    }
+    appearanceRestoredRef.current = true;
+    void presentPreferredWindow();
   }, []);
 
   useEffect(() => {
@@ -558,7 +573,7 @@ export function App() {
   function handleWindowClose(event: ReactMouseEvent<HTMLButtonElement>) {
     event.preventDefault();
     event.stopPropagation();
-    void getCurrentWindow().close();
+    void quitApp().catch(reportError);
   }
 
   const availableSessions = useMemo(
@@ -791,6 +806,7 @@ export function App() {
   );
   const isAgentWorking = isSubmitting || isContinuing || selectedSessionIsWorking;
   const isPromptLocked = isAgentWorking || isStopping || pendingToolEvents.length > 0;
+  const workspaceSwitchBlocked = isPromptLocked || visiblePermissions.length > 0;
   const floatAgentStatus = useMemo(
     () =>
       deriveFloatAgentStatus({
@@ -956,19 +972,94 @@ export function App() {
     let unlisten: (() => void) | undefined;
     void listen<ExternalProjectSessionsPayload>(
       "odot:external-project-sessions",
-      ({ payload }) => {
+      async ({ payload }) => {
         if (disposed) {
           return;
         }
-        setExternalProjectSessions(
-          payload.sessions.length || payload.workspaceRoot ? payload : null
-        );
+        const workspaceRoot = payload.workspaceRoot.trim();
+        if (!workspaceRoot) {
+          return;
+        }
+        if (
+          selectedSessionId &&
+          normalizeProjectRootKey(projectRoot) === normalizeProjectRootKey(workspaceRoot)
+        ) {
+          dismissExternalProjectSessions();
+          return;
+        }
+        await presentPreferredWindow();
+        if (workspaceSwitchBlocked && selectedSessionId) {
+          const deferred = {
+            ...payload,
+            action: "deferredBusy" as const,
+            busyReason: t("externalProjectSessions.busyReason"),
+            activeSessionId: selectedSessionId
+          };
+          setExternalProjectSessions(deferred);
+          saveExternalProjectSessions(deferred, "main");
+          externalProjectSessionsUpdatedAtRef.current =
+            readExternalProjectSessions()?.updatedAt ?? Date.now();
+          void reportWorkspaceResolution({
+            action: "deferredBusy",
+            workspaceRoot,
+            activeSessionId: selectedSessionId,
+            busyReason: deferred.busyReason
+          });
+          return;
+        }
+        if (payload.sessions.length === 1) {
+          dismissExternalProjectSessions();
+          await selectSession(payload.sessions[0]).catch(reportError);
+          void reportWorkspaceResolution({
+            action: "selected",
+            workspaceRoot,
+            activeSessionId: payload.sessions[0].id
+          });
+          return;
+        }
+        if (payload.sessions.length === 0) {
+          pendingExternalProjectRootRef.current = workspaceRoot;
+          let config: ProviderConfigFileResponse;
+          try {
+            config = await loadProviderConfig(
+              workspaceRoot,
+              selectedConfigPathForProject(workspaceRoot)
+            );
+          } catch {
+            await showExternalProjectSetup(payload, workspaceRoot);
+            return;
+          }
+          if (!preferredConfigProviderId(config)) {
+            await showExternalProjectSetup(payload, workspaceRoot);
+            return;
+          }
+          try {
+            await createExternalProjectSession(workspaceRoot);
+            pendingExternalProjectRootRef.current = null;
+          } catch (error) {
+            pendingExternalProjectRootRef.current = null;
+            reportError(error);
+            const failedResolution = {
+              ...payload,
+              action: "error" as const,
+              busyReason: errorMessage(error)
+            };
+            setExternalProjectSessions(failedResolution);
+            saveExternalProjectSessions(failedResolution, "main");
+            externalProjectSessionsUpdatedAtRef.current =
+              readExternalProjectSessions()?.updatedAt ?? Date.now();
+            void reportWorkspaceResolution({
+              action: "error",
+              workspaceRoot,
+              busyReason: failedResolution.busyReason
+            });
+          }
+          return;
+        }
+        setExternalProjectSessions(payload);
         saveExternalProjectSessions(payload, "main");
         externalProjectSessionsUpdatedAtRef.current =
           readExternalProjectSessions()?.updatedAt ?? Date.now();
-        if (!payload.sessions.length && payload.workspaceRoot?.trim()) {
-          void autoCreateExternalProjectSession(payload.workspaceRoot);
-        }
       }
     ).then((dispose) => {
       if (disposed) {
@@ -981,7 +1072,34 @@ export function App() {
       disposed = true;
       unlisten?.();
     };
-  }, [mode, shellMode]);
+  }, [
+    mode,
+    projectRoot,
+    selectedSessionId,
+    shellMode,
+    t,
+    workspaceSwitchBlocked
+  ]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen("odot:bridge-wake", () => {
+      if (!disposed) {
+        void presentPreferredWindow();
+      }
+    }).then((dispose) => {
+      if (disposed) {
+        dispose();
+      } else {
+        unlisten = dispose;
+      }
+    }).catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -994,6 +1112,11 @@ export function App() {
       const session = nextSessions.find((item) => item.id === payload.sessionId);
       if (session) {
         await selectSession(session).catch(reportError);
+        void reportWorkspaceResolution({
+          action: "selected",
+          workspaceRoot: session.projectRoot,
+          activeSessionId: session.id
+        });
       }
     }).then((dispose) => {
       if (disposed) {
@@ -1289,7 +1412,6 @@ export function App() {
       if (preferredProviderId) {
         setSelectedProviderId(preferredProviderId);
       }
-      setNeedsSetup(false);
       setSetupError("");
       const [nextSessions, policy] = await Promise.all([
         listSessions(),
@@ -1301,6 +1423,12 @@ export function App() {
       setEventsResponse(EMPTY_EVENTS);
       setStreamingEventId(null);
       setNotice({ tone: "success", text: t("notice.configCreated") });
+      const pendingRoot = pendingExternalProjectRootRef.current;
+      if (pendingRoot) {
+        await createExternalProjectSession(pendingRoot);
+        pendingExternalProjectRootRef.current = null;
+      }
+      setNeedsSetup(false);
     } catch (error) {
       setSetupError(errorMessage(error));
     } finally {
@@ -1352,6 +1480,11 @@ export function App() {
       return;
     }
     await selectSession(session);
+    void reportWorkspaceResolution({
+      action: "selected",
+      workspaceRoot: session.projectRoot,
+      activeSessionId: session.id
+    });
     setExternalProjectSessions(null);
     clearExternalProjectSessions("main");
     externalProjectSessionsUpdatedAtRef.current =
@@ -1364,28 +1497,39 @@ export function App() {
     if (!root) {
       return;
     }
-    await createSessionForProjectRoot(root);
+    const session = await createSessionForProjectRoot(root);
+    void reportWorkspaceResolution({
+      action: "created",
+      workspaceRoot: root,
+      activeSessionId: session.id
+    });
     setExternalProjectSessions(null);
     clearExternalProjectSessions("main");
     externalProjectSessionsUpdatedAtRef.current =
       readExternalProjectSessions()?.updatedAt ?? Date.now();
+    return session;
   }
 
-  async function autoCreateExternalProjectSession(workspaceRoot: string) {
-    const key = normalizeProjectRootKey(workspaceRoot);
-    if (!key || autoCreatingExternalProjectRootRef.current === key) {
-      return;
-    }
-    autoCreatingExternalProjectRootRef.current = key;
-    try {
-      await createExternalProjectSession(workspaceRoot);
-    } catch (error) {
-      reportError(error);
-    } finally {
-      if (autoCreatingExternalProjectRootRef.current === key) {
-        autoCreatingExternalProjectRootRef.current = null;
-      }
-    }
+  async function showExternalProjectSetup(
+    payload: ExternalProjectSessionsPayload,
+    workspaceRoot: string
+  ) {
+    pendingExternalProjectRootRef.current = workspaceRoot;
+    const needsSetupResolution = {
+      ...payload,
+      action: "needsSetup" as const
+    };
+    setProjectRoot(workspaceRoot);
+    setExternalProjectSessions(needsSetupResolution);
+    saveExternalProjectSessions(needsSetupResolution, "main");
+    externalProjectSessionsUpdatedAtRef.current =
+      readExternalProjectSessions()?.updatedAt ?? Date.now();
+    setNeedsSetup(true);
+    void reportWorkspaceResolution({
+      action: "needsSetup",
+      workspaceRoot
+    });
+    await presentPreferredWindow(true);
   }
 
   async function refreshSessions() {
@@ -1749,71 +1893,100 @@ export function App() {
     setLoadedSkills((current) => current.filter((skill) => skill.path !== path));
   }
 
+  function dismissExternalProjectSessions() {
+    setExternalProjectSessions(null);
+    clearExternalProjectSessions("main");
+    externalProjectSessionsUpdatedAtRef.current =
+      readExternalProjectSessions()?.updatedAt ?? Date.now();
+  }
+
   function renderExternalProjectSessionPicker() {
     const workspaceRoot = externalProjectSessions?.workspaceRoot?.trim() ?? "";
     const sessions = externalProjectSessions?.sessions ?? [];
+    if (externalProjectSessions?.action === "needsSetup") {
+      return null;
+    }
     if (!workspaceRoot && !sessions.length) {
       return null;
     }
     return (
-      <div className="externalProjectSessionPicker">
-        <div className="externalProjectSessionHeader">
-          <span>
-            <FolderOpen size={13} />
-            {t("externalProjectSessions.title")}
-          </span>
-          <button
-            type="button"
-            className="externalProjectSessionDismiss"
-            aria-label={t("externalProjectSessions.dismiss")}
-            onClick={() => {
-              setExternalProjectSessions(null);
-              clearExternalProjectSessions("main");
-              externalProjectSessionsUpdatedAtRef.current =
-                readExternalProjectSessions()?.updatedAt ?? Date.now();
-            }}
-          >
-            <X size={12} />
-          </button>
-        </div>
-        <div className="externalProjectSessionList">
-          {sessions.map((session) => {
-            const isCurrent = session.id === selectedSessionId;
-            return (
-              <button
-                type="button"
-                key={session.id}
-                className={`externalProjectSessionOption ${isCurrent ? "active" : ""}`}
-                onClick={() => void selectExternalProjectSession(session.id)}
-              >
-                <span className="externalProjectSessionTitle">{session.title}</span>
-                <span className="externalProjectSessionMeta">
-                  {modeLabel(session.mode)} / {t(`shellMode.${session.shellMode}`)} / {session.status}
-                </span>
-                <small>{formatSessionUpdatedAt(session.updatedAt)}</small>
-              </button>
-            );
-          })}
-          {workspaceRoot && (
+      <div
+        className="modalBackdrop"
+        role="presentation"
+        onClick={dismissExternalProjectSessions}
+      >
+        <section
+          className="settingsModal externalProjectSessionModal"
+          role="dialog"
+          aria-modal="true"
+          aria-label={t("externalProjectSessions.title")}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <header className="modalHeader">
+            <div>
+              <strong>
+                <FolderOpen size={15} />
+                {t("externalProjectSessions.title")}
+              </strong>
+              {workspaceRoot && (
+                <small className="externalProjectSessionRoot">{workspaceRoot}</small>
+              )}
+            </div>
             <button
               type="button"
-              className="externalProjectSessionOption externalProjectSessionOption--create"
-              disabled={isCreatingSession}
-              onClick={() => void createExternalProjectSession(workspaceRoot)}
+              className="iconButton ghost"
+              aria-label={t("externalProjectSessions.dismiss")}
+              onClick={dismissExternalProjectSessions}
             >
-              <span className="externalProjectSessionTitle">
-                <Plus size={13} />
-                {t("externalProjectSessions.create")}
-              </span>
-              <span className="externalProjectSessionMeta">{workspaceRoot}</span>
-              <small>
-                {sessions.length
-                  ? t("externalProjectSessions.createInstead")
-                  : t("externalProjectSessions.autoCreating")}
-              </small>
+              <X size={16} />
             </button>
+          </header>
+          {(externalProjectSessions?.action === "deferredBusy" ||
+            externalProjectSessions?.action === "error") && (
+            <div className="externalProjectSessionWarning">
+              {externalProjectSessions.busyReason ??
+                t("externalProjectSessions.busyReason")}
+            </div>
           )}
-        </div>
+          <div className="externalProjectSessionList">
+            {sessions.map((session) => {
+              const isCurrent = session.id === selectedSessionId;
+              return (
+                <button
+                  type="button"
+                  key={session.id}
+                  className={`externalProjectSessionOption ${isCurrent ? "active" : ""}`}
+                  onClick={() => void selectExternalProjectSession(session.id)}
+                >
+                  <span className="externalProjectSessionTitle">{session.title}</span>
+                  <span className="externalProjectSessionMeta">
+                    {modeLabel(session.mode)} / {t(`shellMode.${session.shellMode}`)} / {session.status}
+                  </span>
+                  <small>{formatSessionUpdatedAt(session.updatedAt)}</small>
+                </button>
+              );
+            })}
+            {workspaceRoot && (
+              <button
+                type="button"
+                className="externalProjectSessionOption externalProjectSessionOption--create"
+                disabled={isCreatingSession}
+                onClick={() => void createExternalProjectSession(workspaceRoot)}
+              >
+                <span className="externalProjectSessionTitle">
+                  <Plus size={14} />
+                  {t("externalProjectSessions.create")}
+                </span>
+                <span className="externalProjectSessionMeta">{workspaceRoot}</span>
+                <small>
+                  {sessions.length
+                    ? t("externalProjectSessions.createInstead")
+                    : t("externalProjectSessions.autoCreating")}
+                </small>
+              </button>
+            )}
+          </div>
+        </section>
       </div>
     );
   }
@@ -2509,6 +2682,7 @@ export function App() {
     );
     promptReferencesDraftUpdatedAtRef.current = readPromptReferences()?.updatedAt ?? Date.now();
     try {
+      saveAppearanceMode("float");
       await floatWin.show();
       await floatWin.setFocus();
       await mainWin.hide();
@@ -2517,6 +2691,21 @@ export function App() {
       await mainWin.setFocus().catch(() => undefined);
       reportError(error);
     }
+  }
+
+  async function presentPreferredWindow(forceMain = false) {
+    const mainWin = getCurrentWindow();
+    const floatWin = await WebviewWindow.getByLabel("float");
+    const appearance = forceMain ? "window" : readAppearanceMode();
+    if (appearance === "float" && floatWin) {
+      await floatWin.show();
+      await floatWin.setFocus();
+      await mainWin.hide();
+      return;
+    }
+    await mainWin.show();
+    await mainWin.setFocus();
+    await floatWin?.hide().catch(() => undefined);
   }
 
   async function handleDeleteSession(sessionId: string) {
@@ -2728,6 +2917,7 @@ export function App() {
       }}
     >
       <div className="windowDragStrip" data-tauri-drag-region aria-hidden="true" />
+      {renderExternalProjectSessionPicker()}
       <aside className="leftPane">
         <header className="brandRow" onClick={() => void switchToFloatWindow()}>
           <span className="brandIcon">
@@ -2849,7 +3039,6 @@ export function App() {
                 accept={attachmentAccept}
                 onChange={(event) => void handleAttachmentInputChange(event)}
               />
-              {renderExternalProjectSessionPicker()}
               <div className="promptInputRow">
                 {loadedSkills.length > 0 && (
                   <div className="promptSkillTags">

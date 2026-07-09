@@ -3231,6 +3231,96 @@ pre {
   width: min(560px, calc(100vw - 44px));
 }
 
+.externalProjectSessionModal {
+  width: min(480px, calc(100vw - 44px));
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.externalProjectSessionModal .modalHeader strong {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.externalProjectSessionRoot {
+  display: block;
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.externalProjectSessionList {
+  min-height: 0;
+  max-height: min(60vh, 420px);
+  overflow-y: auto;
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+}
+
+.externalProjectSessionWarning {
+  margin: 12px 14px 0;
+  padding: 9px 11px;
+  border: 1px solid color-mix(in srgb, #d79a34 50%, var(--border));
+  border-radius: 8px;
+  background: color-mix(in srgb, #d79a34 10%, var(--surface));
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.externalProjectSessionOption {
+  display: grid;
+  gap: 3px;
+  padding: 10px 12px;
+  text-align: left;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-elevated);
+  cursor: pointer;
+  transition: border-color 0.14s ease, background 0.14s ease;
+}
+
+.externalProjectSessionOption:hover {
+  border-color: var(--accent);
+  background: var(--surface);
+}
+
+.externalProjectSessionOption:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.externalProjectSessionOption.active {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.externalProjectSessionTitle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.externalProjectSessionMeta {
+  font-size: 11px;
+  color: var(--text-muted);
+  word-break: break-all;
+}
+
+.externalProjectSessionOption small {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.externalProjectSessionOption--create {
+  border-style: dashed;
+}
+
 .sessionsModalBody {
   min-height: 0;
   overflow: hidden;
@@ -4137,6 +4227,105 @@ body.float-window-body {
 
 .floatCapsule--reply.floatCapsule--expanded {
   box-shadow: none;
+}
+
+.floatCapsule--sessions {
+  align-items: stretch;
+  justify-content: stretch;
+  transform-origin: center;
+}
+
+.floatCapsule--sessions.floatCapsule--expanded {
+  border-radius: 16px;
+}
+
+.floatSessionsCapsule {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 2px 4px 4px;
+  overflow: hidden;
+}
+
+.floatSessionsHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 22px;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.floatSessionsHeader > span:first-child {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.floatSessionsList {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-right: 2px;
+}
+
+.floatSessionsWarning {
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: color-mix(in srgb, #d79a34 12%, transparent);
+  color: var(--ink);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.floatSessionsOption {
+  display: grid;
+  gap: 2px;
+  padding: 6px 9px;
+  text-align: left;
+  border: 1px solid var(--float-glass-border);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--surface) 82%, transparent);
+  color: var(--ink);
+  cursor: pointer;
+  transition: border-color 0.14s ease, background 0.14s ease;
+}
+
+.floatSessionsOption:hover {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--surface) 94%, transparent);
+}
+
+.floatSessionsOption > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.floatSessionsOption > small {
+  font-size: 10px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.floatSessionsOption--create {
+  border-style: dashed;
 }
 
 .floatCapsulePanel {

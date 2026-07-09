@@ -113,7 +113,8 @@
     "createInstead": "Create another session for this directory",
     "autoCreating": "No matched session; creating one now",
     "selected": "Switched to the VS Code project session",
-    "notFound": "This VS Code project session no longer exists"
+    "notFound": "This VS Code project session no longer exists",
+    "busyReason": "The current session is running or awaiting approval. It will continue; choose or create a session to confirm the switch."
   },
   "prompt": {
     "agentWorking": "Agent is working. Send again after it finishes.",

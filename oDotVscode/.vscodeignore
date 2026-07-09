@@ -2,6 +2,7 @@
 .gitignore
 src/**
 node_modules/**
+dist/**/*.test.*
 *.vsix
 tsconfig.json
 package-lock.json

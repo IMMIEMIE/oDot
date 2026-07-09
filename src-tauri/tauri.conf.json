@@ -40,6 +40,15 @@
       "csp": null
     }
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": [
+          "odot"
+        ]
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",

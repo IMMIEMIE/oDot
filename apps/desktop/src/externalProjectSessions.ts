@@ -21,8 +21,13 @@ export function readExternalProjectSessions(): ExternalProjectSessionsDraftRecor
     }
     return {
       payload: {
-        workspaceRoot: value.payload.workspaceRoot ?? null,
+        protocolVersion: value.payload.protocolVersion ?? 2,
+        requestId: value.payload.requestId ?? `legacy-${value.updatedAt ?? 0}`,
+        action: value.payload.action ?? "choose",
+        workspaceRoot: value.payload.workspaceRoot ?? "",
         source: value.payload.source ?? null,
+        busyReason: value.payload.busyReason ?? null,
+        activeSessionId: value.payload.activeSessionId ?? null,
         sessions: value.payload.sessions
       },
       source: value.source === "float" ? "float" : "main",
@@ -51,7 +56,16 @@ export function clearExternalProjectSessions(source: PromptDraftSource) {
   localStorage.setItem(
     EXTERNAL_PROJECT_SESSIONS_STORAGE_KEY,
     JSON.stringify({
-      payload: { workspaceRoot: null, source: null, sessions: [] },
+      payload: {
+        protocolVersion: 2,
+        requestId: `clear-${Date.now()}`,
+        action: "ignored",
+        workspaceRoot: "",
+        source: null,
+        busyReason: null,
+        activeSessionId: null,
+        sessions: []
+      },
       source,
       updatedAt: Date.now()
     } satisfies ExternalProjectSessionsDraftRecord)

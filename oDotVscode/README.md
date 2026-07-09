@@ -6,19 +6,18 @@ The extension sends reference metadata only: absolute path, optional relative pa
 
 ## Usage
 
-- Keep oDot running with the Bridge enabled.
+- Start VS Code normally. The extension launches oDot through `odot://bridge/wake` when needed.
 - In VS Code, select code and press `Ctrl+L` (`Cmd+L` on macOS).
 - In the Explorer, right-click a file or folder and choose `oDot: Send File/Folder to Prompt`.
 - Run `oDot: Check Bridge` from the Command Palette if sending fails.
 
 ## Configuration
 
-- `odot.bridge.port`: oDot Bridge port. Default: `39871`.
-- `odot.bridge.host`: oDot Bridge host. Default: `127.0.0.1`.
+- `odot.bridge.timeoutMs`: timeout for authenticated local Bridge requests.
 - `odot.reference.maxPayloadBytes`: approximate maximum JSON payload size sent to oDot.
 - `odot.shortcut.sendReferenceToPrompt`: shortcut for `oDot: Send Selection/File to Prompt`.
   - Default: `primary+l` (`Ctrl+L` on Windows/Linux, `Cmd+L` on macOS).
   - Built-in choices are limited to combinations of up to three keys.
   - Set it to `disabled` if you want to bind the command yourself in VS Code Keyboard Shortcuts.
 
-The port should match oDot's Bridge setting or the `ODOT_BRIDGE_PORT` environment variable used by oDot.
+The extension discovers the loopback port and per-launch authentication token from `~/.odot/bridge.json`; no host or port configuration is required.
