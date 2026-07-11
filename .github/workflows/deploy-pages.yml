@@ -3,7 +3,7 @@ name: Deploy oDot website to GitHub Pages
 on:
   push:
     branches:
-      - agent/github-pages-site
+      - master
     paths:
       - "website/**"
       - ".github/workflows/deploy-pages.yml"
