@@ -15,3 +15,6 @@ Thumbs.db
 src-tauri/nsis-3.11.zip
 *.bat
 .odot/skills/caveman/SKILL.md
+
+# standalone website (separate nested git repo)
+/website-standalone/
