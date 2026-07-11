@@ -1,0 +1,53 @@
+<idea-plugin>
+    <id>dev.odot.jetbrains</id>
+    <name>oDot Bridge</name>
+    <vendor>oDot</vendor>
+    <description><![CDATA[
+        Bridges JetBrains IDEs to the oDot desktop app.
+        <ul>
+            <li>Live window monitoring &mdash; this IDE window appears in oDot's IDE panel and can be switched to.</li>
+            <li>Send the current selection, file, or folder into the oDot prompt.</li>
+        </ul>
+        Requires the oDot desktop app to be running (it publishes the local bridge at ~/.odot/bridge.json).
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <applicationService serviceImplementation="dev.odot.bridge.BridgeSettings"/>
+        <projectService serviceImplementation="dev.odot.bridge.BridgeSyncService"/>
+        <postStartupActivity implementation="dev.odot.bridge.BridgeStartupActivity"/>
+        <applicationConfigurable parentId="tools"
+                                 id="dev.odot.bridge.settings"
+                                 displayName="oDot Bridge"
+                                 instance="dev.odot.bridge.BridgeConfigurable"/>
+        <notificationGroup id="oDot Bridge" displayType="BALLOON"/>
+    </extensions>
+
+    <applicationListeners>
+        <listener class="dev.odot.bridge.AppFocusListener"
+                  topic="com.intellij.openapi.application.ApplicationActivationListener"/>
+    </applicationListeners>
+
+    <actions>
+        <action id="dev.odot.SendReferenceToPrompt"
+                class="dev.odot.bridge.SendReferenceToPromptAction"
+                text="oDot: Send Selection/File to Prompt"
+                description="Send the current selection or file to the oDot prompt.">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+        <action id="dev.odot.SendResourceToPrompt"
+                class="dev.odot.bridge.SendResourceToPromptAction"
+                text="oDot: Send File/Folder to Prompt"
+                description="Send the selected files or folders to the oDot prompt.">
+            <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
+        </action>
+        <action id="dev.odot.CheckBridge"
+                class="dev.odot.bridge.CheckBridgeAction"
+                text="oDot: Check Bridge"
+                description="Check whether the oDot bridge is reachable.">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>

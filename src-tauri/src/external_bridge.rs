@@ -6,7 +6,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::{
@@ -20,7 +20,14 @@ const DEFAULT_BRIDGE_PORT: u16 = 39871;
 const MAX_REQUEST_BYTES: usize = 1_250_000;
 const BRIDGE_EVENT: &str = "odot:external-prompt-references";
 const WORKSPACE_EVENT: &str = "odot:external-project-sessions";
+const CLIENTS_EVENT: &str = "odot:bridge-clients";
 const ENV_PORT: &str = "ODOT_BRIDGE_PORT";
+// A client with no heartbeat within OFFLINE_MS is shown as offline; past
+// REMOVE_MS it is pruned from the roster entirely. The reaper sweeps on this
+// cadence so offline state stays fresh even when heartbeats stop arriving.
+const CLIENT_OFFLINE_MS: u64 = 10_000;
+const CLIENT_REMOVE_MS: u64 = 60_000;
+const REAPER_INTERVAL_MS: u64 = 3_000;
 
 static BRIDGE_STATUS: OnceLock<Arc<Mutex<BridgeStatus>>> = OnceLock::new();
 static BRIDGE_RUNTIME: OnceLock<Arc<Mutex<BridgeRuntime>>> = OnceLock::new();
@@ -67,6 +74,8 @@ pub struct WorkspaceClientRequest {
     pub focused: bool,
     #[serde(default)]
     pub workspace_root: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
     #[serde(default)]
@@ -127,6 +136,20 @@ struct ClientState {
     sequence: u64,
     focused: bool,
     workspace_root: Option<String>,
+    source: Option<String>,
+    last_seen: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientSnapshot {
+    pub client_id: String,
+    pub workspace_root: Option<String>,
+    pub workspace_name: Option<String>,
+    pub source: Option<String>,
+    pub focused: bool,
+    pub last_seen: u64,
+    pub online: bool,
 }
 
 #[derive(Debug)]
@@ -169,6 +192,8 @@ pub fn start(app: AppHandle) {
         error: None,
         restart_required: false,
     });
+
+    spawn_reaper(app.clone());
 
     tauri::async_runtime::spawn(async move {
         match TcpListener::bind(("127.0.0.1", config.port)).await {
@@ -346,7 +371,8 @@ fn route_request(app: AppHandle, request: HttpRequest) -> String {
     }
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/v2/status") => route_status(),
-        ("POST", "/v2/client/heartbeat") => route_heartbeat(request),
+        ("POST", "/v2/client/heartbeat") => route_heartbeat(app, request),
+        ("POST", "/v2/client/disconnect") => route_disconnect(app, request),
         ("POST", "/v2/workspace/activate") => route_workspace_activate(app, request),
         ("POST", "/v2/prompt-references") => route_prompt_references(app, request),
         _ => json_response(404, json!({ "ok": false, "error": "Not found." })),
@@ -370,11 +396,12 @@ fn route_status() -> String {
     )
 }
 
-fn route_heartbeat(request: HttpRequest) -> String {
+fn route_heartbeat(app: AppHandle, request: HttpRequest) -> String {
     let payload = match parse_client_request(&request) {
         Ok(payload) => payload,
         Err(response) => return response,
     };
+    let now = now_ms();
     let mut runtime = match runtime_cell().lock() {
         Ok(runtime) => runtime,
         Err(_) => {
@@ -389,26 +416,65 @@ fn route_heartbeat(request: HttpRequest) -> String {
             .clients
             .entry(payload.client_id.clone())
             .or_default();
-        if payload.sequence <= client.sequence {
-            false
-        } else {
+        // Liveness + latest workspace/focus reflect every heartbeat, regardless of
+        // sequence: the sequence gate only decides owner election, not presence.
+        client.last_seen = now;
+        client.focused = payload.focused;
+        client.workspace_root = payload.workspace_root.clone();
+        if payload.source.is_some() {
+            client.source = payload.source.clone();
+        }
+        if payload.sequence > client.sequence {
             client.sequence = payload.sequence;
-            client.focused = payload.focused;
-            client.workspace_root = payload.workspace_root.clone();
             true
+        } else {
+            false
         }
     };
     if accepted && payload.focused {
-        runtime.owner_client_id = Some(payload.client_id);
+        runtime.owner_client_id = Some(payload.client_id.clone());
     }
+    let roster = snapshot_from(&runtime, now);
+    let owner = runtime.owner_client_id.clone();
+    let current = runtime.current.clone();
+    drop(runtime);
+    let _ = app.emit(CLIENTS_EVENT, roster);
     json_response(
         200,
         json!({
             "ok": true,
             "protocolVersion": PROTOCOL_VERSION,
-            "owner": runtime.owner_client_id,
-            "current": runtime.current
+            "owner": owner,
+            "current": current
         }),
+    )
+}
+
+fn route_disconnect(app: AppHandle, request: HttpRequest) -> String {
+    let payload = match parse_client_request(&request) {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
+    let roster = {
+        let mut runtime = match runtime_cell().lock() {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                return json_response(
+                    500,
+                    json!({ "ok": false, "error": "Bridge state is unavailable." }),
+                )
+            }
+        };
+        runtime.clients.remove(&payload.client_id);
+        if runtime.owner_client_id.as_deref() == Some(payload.client_id.as_str()) {
+            runtime.owner_client_id = None;
+        }
+        snapshot_from(&runtime, now_ms())
+    };
+    let _ = app.emit(CLIENTS_EVENT, roster);
+    json_response(
+        200,
+        json!({ "ok": true, "protocolVersion": PROTOCOL_VERSION }),
     )
 }
 
@@ -470,6 +536,10 @@ fn route_workspace_activate(app: AppHandle, request: HttpRequest) -> String {
         client.sequence = payload.sequence;
         client.focused = payload.focused;
         client.workspace_root = Some(canonical_root.clone());
+        if payload.source.is_some() {
+            client.source = payload.source.clone();
+        }
+        client.last_seen = now_ms();
         if runtime
             .current
             .as_ref()
@@ -510,6 +580,9 @@ fn route_workspace_activate(app: AppHandle, request: HttpRequest) -> String {
     };
     if let Ok(mut runtime) = runtime_cell().lock() {
         runtime.current = Some(state.clone());
+        let roster = snapshot_from(&runtime, now_ms());
+        drop(runtime);
+        let _ = app.emit(CLIENTS_EVENT, roster);
     }
     if let Err(error) = app.emit(WORKSPACE_EVENT, state.clone()) {
         return json_response(500, json!({ "ok": false, "error": error.to_string() }));
@@ -928,6 +1001,96 @@ fn runtime_cell() -> &'static Arc<Mutex<BridgeRuntime>> {
     BRIDGE_RUNTIME.get_or_init(|| Arc::new(Mutex::new(BridgeRuntime::default())))
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn workspace_name(root: &str) -> Option<String> {
+    let name = root
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn snapshot_from(runtime: &BridgeRuntime, now: u64) -> Vec<ClientSnapshot> {
+    let mut list: Vec<ClientSnapshot> = runtime
+        .clients
+        .iter()
+        .map(|(client_id, state)| {
+            let workspace_root = state.workspace_root.clone();
+            ClientSnapshot {
+                client_id: client_id.clone(),
+                workspace_name: workspace_root.as_deref().and_then(workspace_name),
+                workspace_root,
+                source: state.source.clone(),
+                focused: state.focused,
+                last_seen: state.last_seen,
+                online: now.saturating_sub(state.last_seen) <= CLIENT_OFFLINE_MS,
+            }
+        })
+        .collect();
+    list.sort_by(|left, right| {
+        right
+            .focused
+            .cmp(&left.focused)
+            .then_with(|| left.workspace_name.cmp(&right.workspace_name))
+            .then_with(|| left.client_id.cmp(&right.client_id))
+    });
+    list
+}
+
+/// Current connected-client roster for initial frontend load / poll fallback.
+pub fn clients() -> Vec<ClientSnapshot> {
+    let now = now_ms();
+    runtime_cell()
+        .lock()
+        .map(|runtime| snapshot_from(&runtime, now))
+        .unwrap_or_default()
+}
+
+/// Sweep stale clients: prune entries past REMOVE_MS and re-emit the roster so the
+/// frontend's online/offline flags stay current even when heartbeats stop arriving.
+fn spawn_reaper(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(REAPER_INTERVAL_MS));
+        loop {
+            ticker.tick().await;
+            let now = now_ms();
+            let roster = {
+                let mut runtime = match runtime_cell().lock() {
+                    Ok(runtime) => runtime,
+                    Err(_) => continue,
+                };
+                let before = runtime.clients.len();
+                runtime
+                    .clients
+                    .retain(|_, state| now.saturating_sub(state.last_seen) <= CLIENT_REMOVE_MS);
+                if runtime.clients.len() != before {
+                    if let Some(owner) = runtime.owner_client_id.clone() {
+                        if !runtime.clients.contains_key(&owner) {
+                            runtime.owner_client_id = None;
+                        }
+                    }
+                }
+                snapshot_from(&runtime, now)
+            };
+            if !roster.is_empty() {
+                let _ = app.emit(CLIENTS_EVENT, roster);
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -995,6 +1158,47 @@ mod tests {
         assert!(!activation_is_allowed(true, false, 1, 1));
         assert!(activation_is_allowed(true, false, 2, 1));
         assert!(activation_is_allowed(false, true, 2, 1));
+    }
+
+    #[test]
+    fn derives_workspace_name_from_root() {
+        assert_eq!(workspace_name(r"C:\Work\Demo").as_deref(), Some("Demo"));
+        assert_eq!(workspace_name("/home/me/proj/").as_deref(), Some("proj"));
+        assert_eq!(workspace_name("").as_deref(), None);
+    }
+
+    #[test]
+    fn snapshot_marks_clients_online_within_window() {
+        let now = 1_000_000;
+        let mut runtime = BridgeRuntime::default();
+        runtime.clients.insert(
+            "fresh".to_string(),
+            ClientState {
+                sequence: 1,
+                focused: true,
+                workspace_root: Some(r"C:\Work\Fresh".to_string()),
+                source: Some("vscode".to_string()),
+                last_seen: now - 2_000,
+            },
+        );
+        runtime.clients.insert(
+            "stale".to_string(),
+            ClientState {
+                sequence: 1,
+                focused: false,
+                workspace_root: Some(r"C:\Work\Stale".to_string()),
+                source: None,
+                last_seen: now - (CLIENT_OFFLINE_MS + 5_000),
+            },
+        );
+        let roster = snapshot_from(&runtime, now);
+        // Focused client sorts first.
+        assert_eq!(roster[0].client_id, "fresh");
+        assert!(roster[0].online);
+        assert_eq!(roster[0].workspace_name.as_deref(), Some("Fresh"));
+        assert_eq!(roster[0].source.as_deref(), Some("vscode"));
+        let stale = roster.iter().find(|c| c.client_id == "stale").unwrap();
+        assert!(!stale.online);
     }
 
     #[test]

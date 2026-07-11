@@ -25,7 +25,6 @@ import {
   RefreshCw,
   RotateCcw,
   Save,
-  Search,
   Settings,
   Terminal,
   Trash2,
@@ -68,8 +67,8 @@ import {
   deleteQueuedInput,
   deleteSession,
   deleteSkill,
-  fetchProjectFiles,
   findOpencodeConfig,
+  getBridgeClients,
   getModelReasoningEfforts,
   getSessionEvents,
   importSkill,
@@ -109,7 +108,7 @@ import {
   type McpToolDefinition,
   type PermissionRequestRecord,
   type PermissionReply,
-  type ProjectFile,
+  type BridgeClient,
   type ProjectCapabilities,
   type ProviderConfigFileResponse,
   type ProviderRecord,
@@ -207,14 +206,6 @@ type PromptAttachmentSummary = Omit<PromptAttachment, "id" | "content">;
 const PROJECT_ROOT_STORAGE_KEY = "odot.projectRoot";
 const LAST_SESSION_STORAGE_KEY = "odot.lastSessionId";
 
-type TreeNode = {
-  type: "dir" | "file";
-  name: string;
-  path: string;
-  file?: ProjectFile;
-  children: TreeNode[];
-};
-
 // Returns a callback with a stable identity that always invokes the latest version
 // of `callback`. Lets us pass handlers into memoized children without recreating
 // them every render (which would defeat `memo`) and without the stale-closure risk
@@ -250,10 +241,7 @@ export function App() {
   const [projectRoot, setProjectRoot] = useState(
     () => localStorage.getItem(PROJECT_ROOT_STORAGE_KEY) ?? ""
   );
-  const [files, setFiles] = useState<ProjectFile[]>([]);
-  const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
-  const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set());
-  const [fileFilter, setFileFilter] = useState("");
+  const [bridgeClients, setBridgeClients] = useState<BridgeClient[]>([]);
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState("");
   const [mode, setMode] = useState<AgentMode>("agent");
@@ -278,7 +266,6 @@ export function App() {
   });
   const [, setIsBooting] = useState(true);
   const [isSavingConfig, setIsSavingConfig] = useState(false);
-  const [isLoadingFiles, setIsLoadingFiles] = useState(false);
   const [isCreatingSession, setIsCreatingSession] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isContinuing, setIsContinuing] = useState(false);
@@ -531,8 +518,8 @@ export function App() {
   );
   const canUploadAttachments = allowedAttachmentKinds.length > 0;
   const promptInlineReferences = useMemo(
-    () => buildPromptInlineReferences(selectedPaths, promptAttachments, externalPromptReferences),
-    [externalPromptReferences, promptAttachments, selectedPaths]
+    () => buildPromptInlineReferences(promptAttachments, externalPromptReferences),
+    [externalPromptReferences, promptAttachments]
   );
   const skillOptions = useMemo(() => {
     const query = skillMenu.query.trim().toLowerCase();
@@ -669,16 +656,6 @@ export function App() {
       disposed = true;
     };
   }, [configPath, projectRoot]);
-
-  const filteredFiles = useMemo(() => {
-    const query = fileFilter.trim().toLowerCase();
-    if (!query) {
-      return files;
-    }
-    return files.filter((file) => file.path.toLowerCase().includes(query));
-  }, [fileFilter, files]);
-
-  const fileTree = useMemo(() => buildFileTree(filteredFiles), [filteredFiles]);
 
   const pendingToolEvents = useMemo(() => {
     const resolved = new Set(
@@ -854,11 +831,11 @@ export function App() {
 
   useEffect(() => {
     savePromptReferences(
-      mergePromptReferencesForStorage(externalPromptReferences, selectedPaths, projectRoot),
+      mergePromptReferencesForStorage(externalPromptReferences),
       "main"
     );
     promptReferencesDraftUpdatedAtRef.current = readPromptReferences()?.updatedAt ?? Date.now();
-  }, [externalPromptReferences, projectRoot, selectedPaths]);
+  }, [externalPromptReferences]);
 
   useEffect(() => {
     const applyExternalReferences = () => {
@@ -1080,6 +1057,35 @@ export function App() {
     t,
     workspaceSwitchBlocked
   ]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void getBridgeClients()
+      .then((clients) => {
+        if (!disposed) {
+          setBridgeClients(clients);
+        }
+      })
+      .catch(() => undefined);
+    void listen<BridgeClient[]>("odot:bridge-clients", ({ payload }) => {
+      if (!disposed) {
+        setBridgeClients(payload);
+      }
+    })
+      .then((dispose) => {
+        if (disposed) {
+          dispose();
+        } else {
+          unlisten = dispose;
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -1464,7 +1470,6 @@ export function App() {
     );
     await Promise.all([
       loadEvents(session.id),
-      loadFiles(session.projectRoot),
       refreshProjectCapabilities(session.projectRoot, config.path)
     ]);
     if (!sessionProviderExists) {
@@ -1577,44 +1582,52 @@ export function App() {
     }, 100);
   }
 
-  async function loadFiles(root = projectRoot) {
-    if (!root.trim()) {
-      setFiles([]);
+  // Switch oDot's active project to a connected IDE window's workspace: reuse the
+  // most recent existing session for that root, else create one (mirrors the
+  // VSCode-driven external-project resolution, but triggered by a panel click).
+  async function switchToWorkspace(workspaceRoot: string) {
+    const root = workspaceRoot.trim();
+    if (!root) {
       return;
     }
-    setIsLoadingFiles(true);
-    try {
-      const nextFiles = await fetchProjectFiles(root);
-      setFiles(nextFiles);
-      setSelectedPaths(new Set());
-      setExpandedDirs(new Set(initialExpandedDirs(nextFiles)));
-      setNotice({
-        tone: "success",
-        text: t("notice.filesIndexed", { count: nextFiles.length })
-      });
-    } catch (error) {
-      setFiles([]);
-      reportError(error);
-    } finally {
-      setIsLoadingFiles(false);
+    if (
+      selectedSessionId &&
+      normalizeProjectRootKey(projectRoot) === normalizeProjectRootKey(root)
+    ) {
+      return;
     }
-  }
-
-  async function chooseProjectDirectory() {
+    if (workspaceSwitchBlocked && selectedSessionId) {
+      setNotice({ tone: "error", text: t("externalProjectSessions.busyReason") });
+      return;
+    }
     try {
-      const selected = await pickProjectDirectory();
-      if (!selected) {
+      const allSessions = sessions.length ? sessions : await refreshSessions();
+      const matching = allSessions
+        .filter(
+          (session) =>
+            normalizeProjectRootKey(session.projectRoot) === normalizeProjectRootKey(root)
+        )
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+      if (matching.length > 0) {
+        await selectSession(matching[0]);
+        void reportWorkspaceResolution({
+          action: "selected",
+          workspaceRoot: root,
+          activeSessionId: matching[0].id
+        });
         return;
       }
-      setProjectRoot(selected);
-      setSelectedSessionId("");
-      setEventsResponse(EMPTY_EVENTS);
-      const config = await loadProviderConfig(selected, selectedConfigPathForProject(selected));
-      setConfigPath(config.path);
-      setConfigContent(config.content);
-      setProviders(config.providers);
-      setSelectedProviderId(preferredConfigProviderId(config));
-      await loadFiles(selected);
+      const config = await loadProviderConfig(
+        root,
+        selectedConfigPathForProject(root)
+      ).catch(() => null);
+      if (!config || !preferredConfigProviderId(config)) {
+        setProjectRoot(root);
+        setNeedsSetup(true);
+        void reportWorkspaceResolution({ action: "needsSetup", workspaceRoot: root });
+        return;
+      }
+      await createExternalProjectSession(root);
     } catch (error) {
       reportError(error);
     }
@@ -1686,7 +1699,6 @@ export function App() {
       setConfigContent(config.content);
       setProviders(config.providers);
       setSelectedProviderId(providerId);
-      await loadFiles(targetRoot);
       const session = await createSession({
         projectRoot: targetRoot,
         mode,
@@ -1828,8 +1840,6 @@ export function App() {
       removePromptAttachment(reference.sourceId);
     } else if (reference.source === "externalReference") {
       removeExternalPromptReference(reference.sourceId);
-    } else {
-      toggleFile(reference.sourceId);
     }
   }
 
@@ -1847,8 +1857,6 @@ export function App() {
         removePromptAttachment(reference.sourceId);
       } else if (reference.source === "externalReference") {
         removeExternalPromptReference(reference.sourceId);
-      } else {
-        toggleFile(reference.sourceId);
       }
     }
   }
@@ -1996,7 +2004,6 @@ export function App() {
       (!prompt.trim() &&
         !promptAttachments.length &&
         !externalPromptReferences.length &&
-        !selectedPaths.size &&
         !loadedSkills.length) ||
       isPromptLocked
     ) {
@@ -2010,7 +2017,6 @@ export function App() {
     try {
       const session = await ensureSession();
       const previousMaxSeq = eventsResponse.events.at(-1)?.seq ?? 0;
-      const selectedFileText = Array.from(selectedPaths).sort().join("\n");
       const externalReferenceText = formatExternalPromptReferences(externalPromptReferences);
       const editorPrompt = extractPromptEditorText(promptInputRef.current, {
         includeReferences: true
@@ -2018,10 +2024,7 @@ export function App() {
       const promptText = editorPrompt || prompt.trim();
       const finalPrompt = appendPromptReferenceSections(
         promptText || t("prompt.continueFromAttachment"),
-        [
-          selectedFileText ? `${t("prompt.selectedFiles")}\n${selectedFileText}` : "",
-          externalReferenceText
-        ]
+        [externalReferenceText]
       );
       const response = await promptSession({
         sessionId: session.id,
@@ -2048,11 +2051,7 @@ export function App() {
       promptDraftUpdatedAtRef.current = readPromptDraft()?.updatedAt ?? Date.now();
       setPromptAttachments([]);
       setExternalPromptReferences([]);
-      setPromptEditorText(
-        promptInputRef.current,
-        "",
-        buildPromptInlineReferences(selectedPaths, [], [])
-      );
+      setPromptEditorText(promptInputRef.current, "", buildPromptInlineReferences([], []));
       setLoadedSkills([]);
       setSkillMenu((current) => ({ ...current, open: false }));
       setNotice({
@@ -2374,7 +2373,6 @@ export function App() {
       if (selectedSessionId) {
         scheduleRealtimeTailRefresh(selectedSessionId);
       }
-      await loadFiles(projectRoot);
       setNotice({ tone: "success", text: successText });
     } catch (error) {
       reportError(error);
@@ -2677,7 +2675,7 @@ export function App() {
     );
     promptDraftUpdatedAtRef.current = readPromptDraft()?.updatedAt ?? Date.now();
     savePromptReferences(
-      mergePromptReferencesForStorage(externalPromptReferences, selectedPaths, projectRoot),
+      mergePromptReferencesForStorage(externalPromptReferences),
       "main"
     );
     promptReferencesDraftUpdatedAtRef.current = readPromptReferences()?.updatedAt ?? Date.now();
@@ -2776,26 +2774,6 @@ export function App() {
     const fullError = errorMessage(error);
     setLastError(fullError);
     setNotice({ tone: "error", text: errorSummary(fullError) });
-  }
-
-  function toggleFile(path: string) {
-    const next = new Set(selectedPaths);
-    if (next.has(path)) {
-      next.delete(path);
-    } else {
-      next.add(path);
-    }
-    setSelectedPaths(next);
-  }
-
-  function toggleDirectory(path: string) {
-    const next = new Set(expandedDirs);
-    if (next.has(path)) {
-      next.delete(path);
-    } else {
-      next.add(path);
-    }
-    setExpandedDirs(next);
   }
 
   function startLeftResize(event: PointerEvent<HTMLDivElement>) {
@@ -2916,7 +2894,55 @@ export function App() {
         gridTemplateColumns: `${leftWidth}px 6px minmax(0, 1fr) ${isRightPaneCollapsed ? 0 : 344}px`
       }}
     >
-      <div className="windowDragStrip" data-tauri-drag-region aria-hidden="true" />
+      <header className="windowChrome">
+        <div
+          className="windowChromeDrag"
+          data-tauri-drag-region
+          aria-hidden="true"
+        />
+        <div
+          className="windowControls"
+          role="group"
+          aria-label="Window actions"
+        >
+          <button
+            className="windowControlButton"
+            type="button"
+            aria-label={isRightPaneCollapsed ? t("nav.expandRightPane") : t("nav.collapseRightPane")}
+            title={isRightPaneCollapsed ? t("nav.expandRightPane") : t("nav.collapseRightPane")}
+            onClick={() => setIsRightPaneCollapsed((current) => !current)}
+          >
+            {isRightPaneCollapsed ? <ChevronLeft size={16} /> : <ChevronRight size={16} />}
+          </button>
+          <button
+            type="button"
+            className="windowControlButton"
+            aria-label="Minimize window"
+            title="Minimize"
+            onClick={handleWindowMinimize}
+          >
+            <Minus size={13} />
+          </button>
+          <button
+            type="button"
+            className="windowControlButton"
+            aria-label="Maximize window"
+            title="Maximize"
+            onClick={handleWindowToggleMaximize}
+          >
+            <Maximize2 size={13} />
+          </button>
+          <button
+            type="button"
+            className="windowControlButton danger"
+            aria-label="Close window"
+            title="Close"
+            onClick={handleWindowClose}
+          >
+            <X size={13} />
+          </button>
+        </div>
+      </header>
       {renderExternalProjectSessionPicker()}
       <aside className="leftPane">
         <header className="brandRow" onClick={() => void switchToFloatWindow()}>
@@ -2954,47 +2980,13 @@ export function App() {
         </section>
 
         <section className="leftSection projectSection">
-          <SectionTitle icon={<FolderOpen size={16} />} title={t("nav.projectFiles")} />
-          <div className="pathRow">
-            <input
-              value={projectRoot}
-              onChange={(event) => setProjectRoot(event.target.value)}
-              placeholder={t("nav.projectRoot")}
-            />
-            <button className="iconButton" onClick={chooseProjectDirectory}>
-              <FolderOpen size={17} />
-            </button>
-            <button
-              className="iconButton ghost"
-              disabled={!projectRoot.trim() || isLoadingFiles}
-              onClick={() => void loadFiles()}
-            >
-              {isLoadingFiles ? <Loader2 className="spin" size={17} /> : <RefreshCw size={17} />}
-            </button>
-          </div>
-          <div className="searchBox">
-            <Search size={15} />
-            <input
-              value={fileFilter}
-              onChange={(event) => setFileFilter(event.target.value)}
-              placeholder={t("nav.filterFiles")}
-            />
-          </div>
-          <div className="fileTree" aria-label={t("nav.fileTree")}>
-            {fileTree.map((node) => (
-              <FileTreeNode
-                key={node.path}
-                node={node}
-                depth={0}
-                expandedDirs={expandedDirs}
-                forceExpanded={Boolean(fileFilter.trim())}
-                selectedPaths={selectedPaths}
-                onToggleDirectory={toggleDirectory}
-                onToggleFile={toggleFile}
-              />
-            ))}
-            {!files.length && <EmptyLine text={t("empty.noIndexedFiles")} />}
-          </div>
+          <SectionTitle icon={<Network size={16} />} title={t("nav.connectedIdes")} />
+          <IdeMonitorPanel
+            clients={bridgeClients}
+            activeRoot={projectRoot}
+            onSelect={(root) => void switchToWorkspace(root)}
+            t={t}
+          />
         </section>
 
       </aside>
@@ -3357,7 +3349,6 @@ export function App() {
                         ? false
                         : (!prompt.trim() &&
                             !promptAttachments.length &&
-                            !selectedPaths.size &&
                             !externalPromptReferences.length &&
                             !loadedSkills.length) ||
                           isPromptLocked ||
@@ -3377,51 +3368,6 @@ export function App() {
           </div>
         </section>
       </main>
-
-      <div className="windowActionBar">
-        <div
-          className="windowControls"
-          role="group"
-          aria-label="Window actions"
-        >
-          <button
-            className="windowControlButton"
-            type="button"
-            aria-label={isRightPaneCollapsed ? t("nav.expandRightPane") : t("nav.collapseRightPane")}
-            title={isRightPaneCollapsed ? t("nav.expandRightPane") : t("nav.collapseRightPane")}
-            onClick={() => setIsRightPaneCollapsed((current) => !current)}
-          >
-            {isRightPaneCollapsed ? <ChevronLeft size={16} /> : <ChevronRight size={16} />}
-          </button>
-          <button
-            type="button"
-            className="windowControlButton"
-            aria-label="Minimize window"
-            title="Minimize"
-            onClick={handleWindowMinimize}
-          >
-            <Minus size={13} />
-          </button>
-          <button
-            type="button"
-            className="windowControlButton"
-            aria-label="Maximize window"
-            title="Maximize"
-            onClick={handleWindowToggleMaximize}
-          >
-            <Maximize2 size={13} />
-          </button>
-          <button
-            type="button"
-            className="windowControlButton danger"
-            aria-label="Close window"
-            title="Close"
-            onClick={handleWindowClose}
-          >
-            <X size={13} />
-          </button>
-        </div>
-      </div>
 
       <aside className={`rightPane ${isRightPaneCollapsed ? "collapsed" : ""}`}>
 
@@ -3443,8 +3389,7 @@ export function App() {
               <ContextUsageMeter usage={contextUsage} />
               <strong>{selectedSession?.title ?? t("empty.noActiveSession")}</strong>
               <small>
-                {selectedProvider ? selectedModelLabel : t("session.noServiceSelected")} /{" "}
-                {t("session.selectedFiles", { count: selectedPaths.size })}
+                {selectedProvider ? selectedModelLabel : t("session.noServiceSelected")}
               </small>
               {selectedChildSessions.length > 0 && (
                 <small className="subagentStatus">
@@ -4957,64 +4902,98 @@ function reasoningEffortLabel(
   return labels[effort];
 }
 
-function FileTreeNode({
-  node,
-  depth,
-  expandedDirs,
-  forceExpanded,
-  selectedPaths,
-  onToggleDirectory,
-  onToggleFile
+function ideIdentity(
+  source: string | null | undefined,
+  t: (key: string, vars?: Record<string, string | number>) => string
+): { name: string; icon: JSX.Element } {
+  const normalized = (source ?? "").trim().toLowerCase();
+  if (normalized === "vscode") {
+    return {
+      name: "VS Code",
+      icon: (
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <path d="M23.15 2.587 18.21.21a1.494 1.494 0 0 0-1.705.29l-9.46 8.63-4.12-3.128a.999.999 0 0 0-1.276.057L.327 7.261A1 1 0 0 0 .326 8.74L3.899 12 .326 15.26a1 1 0 0 0 .001 1.479L1.65 17.94a.999.999 0 0 0 1.276.057l4.12-3.128 9.46 8.63a1.492 1.492 0 0 0 1.704.29l4.942-2.377A1.5 1.5 0 0 0 24 20.06V3.939a1.5 1.5 0 0 0-.85-1.352zm-5.146 14.861L10.826 12l7.178-5.448v10.896z" />
+        </svg>
+      )
+    };
+  }
+  if (normalized === "jetbrains") {
+    return {
+      name: "JetBrains",
+      icon: (
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <path
+            fillRule="evenodd"
+            d="M2 2h20v20H2V2zm2.5 15.5h7.5v1.9H4.5v-1.9zm.4-11h3.4v1.4h-1v4.3h1v1.4H4.9v-1.4h1V7.9h-1V6.5zm5 0h2.9c.8 0 1.4.2 1.8.6.3.3.5.7.5 1.2 0 .8-.4 1.3-1 1.6.8.3 1.2.8 1.2 1.7 0 1.2-1 1.9-2.5 1.9h-2.9V6.5zm2.7 2.7c.5 0 .8-.2.8-.6s-.3-.6-.8-.6h-1.1v1.2h1.1zm.2 2.8c.5 0 .8-.2.8-.7 0-.4-.3-.7-.9-.7h-1.2V12h1.3z"
+          />
+        </svg>
+      )
+    };
+  }
+  return {
+    name: source?.trim() || t("ide.unknownIde"),
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <path d="m9 8-4 4 4 4" />
+        <path d="m15 8 4 4-4 4" />
+      </svg>
+    )
+  };
+}
+
+function IdeMonitorPanel({
+  clients,
+  activeRoot,
+  onSelect,
+  t
 }: {
-  node: TreeNode;
-  depth: number;
-  expandedDirs: Set<string>;
-  forceExpanded: boolean;
-  selectedPaths: Set<string>;
-  onToggleDirectory: (path: string) => void;
-  onToggleFile: (path: string) => void;
+  clients: BridgeClient[];
+  activeRoot: string;
+  onSelect: (root: string) => void;
+  t: (key: string, vars?: Record<string, string | number>) => string;
 }) {
-  if (node.type === "dir") {
-    const expanded = forceExpanded || expandedDirs.has(node.path);
+  if (!clients.length) {
     return (
-      <div className="treeGroup">
-        <button
-          className="treeRow dir"
-          style={{ paddingLeft: 8 + depth * 14 }}
-          onClick={() => onToggleDirectory(node.path)}
-        >
-          {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
-          <FolderOpen size={15} />
-          <span>{node.name}</span>
-        </button>
-        {expanded &&
-          node.children.map((child) => (
-            <FileTreeNode
-              key={child.path}
-              node={child}
-              depth={depth + 1}
-              expandedDirs={expandedDirs}
-              forceExpanded={forceExpanded}
-              selectedPaths={selectedPaths}
-              onToggleDirectory={onToggleDirectory}
-              onToggleFile={onToggleFile}
-            />
-          ))}
+      <div className="ideMonitor" aria-label={t("ide.panelLabel")}>
+        <EmptyLine text={t("ide.noWindows")} />
       </div>
     );
   }
-
+  const activeKey = normalizeProjectRootKey(activeRoot);
   return (
-    <button
-      className={`treeRow file ${selectedPaths.has(node.path) ? "active" : ""}`}
-      style={{ paddingLeft: 8 + depth * 14 }}
-      onClick={() => onToggleFile(node.path)}
-    >
-      <span className="treeSpacer" />
-      <FileCode2 size={15} />
-      <span>{node.name}</span>
-      <small>{node.file ? formatBytes(node.file.size) : ""}</small>
-    </button>
+    <div className="ideMonitor" aria-label={t("ide.panelLabel")}>
+      {clients.map((client) => {
+        const root = (client.workspaceRoot ?? "").trim();
+        const active = Boolean(root) && normalizeProjectRootKey(root) === activeKey;
+        const className = `ideRow${active ? " active" : ""}${client.online ? "" : " offline"}`;
+        const ide = ideIdentity(client.source, t);
+        return (
+          <button
+            key={client.clientId}
+            className={className}
+            onClick={() => root && onSelect(root)}
+            disabled={!root}
+            title={root ? `${ide.name} · ${root}` : ide.name}
+          >
+            <span className={`ideStatusDot${client.online ? " online" : ""}`} aria-hidden="true" />
+            <span className="ideRowIcon" title={ide.name}>
+              {ide.icon}
+            </span>
+            <span className="ideRowBody">
+              <strong>{client.workspaceName || t("ide.unknownWorkspace")}</strong>
+              <small>
+                {ide.name}
+                {root ? ` · ${root}` : ` · ${t("ide.noFolder")}`}
+              </small>
+            </span>
+            {client.online && client.focused && (
+              <span className="ideBadge focused">{t("ide.focused")}</span>
+            )}
+            {!client.online && <span className="ideBadge offline">{t("ide.offline")}</span>}
+          </button>
+        );
+      })}
+    </div>
   );
 }
 
@@ -7127,61 +7106,6 @@ function EmptyLine({ text }: { text: string }) {
   return <div className="emptyLine">{text}</div>;
 }
 
-function buildFileTree(files: ProjectFile[]): TreeNode[] {
-  const root: TreeNode = {
-    type: "dir",
-    name: "",
-    path: "",
-    children: []
-  };
-
-  for (const file of files) {
-    const parts = file.path.split("/").filter(Boolean);
-    let current = root;
-    for (let index = 0; index < parts.length; index += 1) {
-      const part = parts[index];
-      const path = parts.slice(0, index + 1).join("/");
-      const isFile = index === parts.length - 1;
-      let child = current.children.find((item) => item.name === part);
-      if (!child) {
-        child = {
-          type: isFile ? "file" : "dir",
-          name: part,
-          path,
-          file: isFile ? file : undefined,
-          children: []
-        };
-        current.children.push(child);
-      }
-      current = child;
-    }
-  }
-
-  sortTree(root);
-  return root.children;
-}
-
-function sortTree(node: TreeNode) {
-  node.children.sort((a, b) => {
-    if (a.type !== b.type) {
-      return a.type === "dir" ? -1 : 1;
-    }
-    return a.name.localeCompare(b.name);
-  });
-  node.children.forEach(sortTree);
-}
-
-function initialExpandedDirs(files: ProjectFile[]) {
-  const result = new Set<string>();
-  for (const file of files.slice(0, 80)) {
-    const parts = file.path.split("/").filter(Boolean);
-    for (let index = 1; index < parts.length; index += 1) {
-      result.add(parts.slice(0, index).join("/"));
-    }
-  }
-  return result;
-}
-
 function eventLabel(event: EventRecord) {
   const key = `event.${event.type}`;
   const base = appT(key);
@@ -7483,7 +7407,18 @@ function formatSessionUpdatedAt(value: string) {
 }
 
 function normalizeProjectRootKey(value: string) {
-  return value.trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  // Windows fs::canonicalize (used when a session is persisted) returns a
+  // verbatim path prefixed with \\?\ (or \\?\UNC\ for shares), while the bridge
+  // reports the raw IDE path. Strip that prefix so a card's workspaceRoot and a
+  // stored session's projectRoot key to the same value — otherwise every card
+  // click fails to match its session and spawns a duplicate empty one.
+  return value
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\/\/\?\/unc\//i, "//")
+    .replace(/^\/\/\?\//, "")
+    .replace(/\/+$/, "")
+    .toLowerCase();
 }
 
 function toolLabel(value: string) {
@@ -8419,20 +8354,9 @@ function attachmentAcceptValue(kinds: PromptAttachmentKind[]) {
 }
 
 function buildPromptInlineReferences(
-  selectedPaths: Set<string>,
   attachments: PromptAttachment[],
   externalReferences: ExternalPromptReference[]
 ): PromptInlineReference[] {
-  const selectedReferences = Array.from(selectedPaths)
-    .sort()
-    .map((path): PromptInlineReference => ({
-      id: `path:${path}`,
-      source: "selectedPath",
-      sourceId: path,
-      label: basename(path),
-      detail: path,
-      kind: "file"
-    }));
   const attachmentReferences = attachments.map((attachment): PromptInlineReference => {
     const parsed = parseAttachmentReferenceLabel(attachment.name);
     return {
@@ -8452,7 +8376,7 @@ function buildPromptInlineReferences(
     detail: externalPromptReferenceLineLabel(reference, "display"),
     kind: externalPromptReferenceKind(reference)
   }));
-  return [...selectedReferences, ...attachmentReferences, ...externalPromptReferences];
+  return [...attachmentReferences, ...externalPromptReferences];
 }
 
 function parseAttachmentReferenceLabel(name: string) {

@@ -48,10 +48,20 @@
     "manualLong": "手动命令",
     "autoLong": "自动命令"
   },
+  "ide": {
+    "panelLabel": "已连接的 IDE 窗口",
+    "noWindows": "暂无已连接的 IDE 窗口",
+    "unknownWorkspace": "未命名工作区",
+    "unknownIde": "未知 IDE",
+    "noFolder": "未打开文件夹",
+    "focused": "聚焦中",
+    "offline": "离线"
+  },
   "nav": {
     "manageSessions": "管理会话",
     "openSettings": "打开 AI 服务设置",
     "aiService": "AI 服务",
+    "connectedIdes": "已连接的 IDE",
     "projectFiles": "项目文件",
     "projectRoot": "项目目录",
     "filterFiles": "筛选文件",

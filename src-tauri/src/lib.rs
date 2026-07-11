@@ -741,6 +741,11 @@ fn get_bridge_status() -> external_bridge::BridgeStatus {
 }
 
 #[tauri::command]
+fn get_bridge_clients() -> Vec<external_bridge::ClientSnapshot> {
+    external_bridge::clients()
+}
+
+#[tauri::command]
 fn set_bridge_port(app: AppHandle, port: u16) -> Result<external_bridge::BridgeStatus, String> {
     external_bridge::save_port(&app, port)
 }
@@ -857,6 +862,7 @@ pub fn run() {
             reveal_project_path,
             list_project_files,
             get_bridge_status,
+            get_bridge_clients,
             set_bridge_port,
             report_workspace_resolution,
             quit_app

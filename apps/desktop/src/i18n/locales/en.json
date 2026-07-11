@@ -49,10 +49,20 @@
     "manualLong": "Manual shell",
     "autoLong": "Auto shell"
   },
+  "ide": {
+    "panelLabel": "Connected IDE windows",
+    "noWindows": "No IDE windows connected",
+    "unknownWorkspace": "Untitled workspace",
+    "unknownIde": "Unknown IDE",
+    "noFolder": "No folder open",
+    "focused": "Focused",
+    "offline": "Offline"
+  },
   "nav": {
     "manageSessions": "Manage sessions",
     "openSettings": "Open AI settings",
     "aiService": "AI service",
+    "connectedIdes": "Connected IDEs",
     "projectFiles": "Project files",
     "projectRoot": "Project directory",
     "filterFiles": "Filter files",

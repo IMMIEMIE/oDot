@@ -63,7 +63,9 @@ export async function activate(context: vscode.ExtensionContext) {
   const persistentClientId =
     context.workspaceState.get<string>("odot.bridge.clientId") ?? randomUUID();
   await context.workspaceState.update("odot.bridge.clientId", persistentClientId);
-  clientId = `${persistentClientId}:${randomUUID()}`;
+  // Stable for this window's lifetime so oDot's monitor keeps one roster row per
+  // window across extension restarts, rather than accumulating stale duplicates.
+  clientId = persistentClientId;
   windowFocused = vscode.window.state.focused;
   context.subscriptions.push(
     vscode.commands.registerCommand("odot.sendReferenceToPrompt", sendReferenceToPrompt),
@@ -87,7 +89,7 @@ export async function activate(context: vscode.ExtensionContext) {
   schedulePublishWorkspaceSessions("activation", true);
 }
 
-export function deactivate() {
+export async function deactivate() {
   if (publishWorkspaceTimer) {
     clearTimeout(publishWorkspaceTimer);
     publishWorkspaceTimer = undefined;
@@ -95,6 +97,25 @@ export function deactivate() {
   if (bridgeHeartbeatTimer) {
     clearInterval(bridgeHeartbeatTimer);
     bridgeHeartbeatTimer = undefined;
+  }
+  // Best-effort: tell oDot this window is gone so its monitor drops the row
+  // immediately instead of waiting for the heartbeat-timeout reaper.
+  if (!clientId) {
+    return;
+  }
+  try {
+    const config = await bridgeConfig();
+    await requestJson(config, "POST", "/v2/client/disconnect", {
+      protocolVersion: PROTOCOL_VERSION,
+      clientId,
+      sequence: nextSequence(),
+      focused: false,
+      workspaceRoot: currentWorkspaceFolder()?.uri.fsPath ?? null,
+      source: sourceName,
+      sentAt: Date.now()
+    });
+  } catch {
+    // The bridge may already be gone; the reaper handles cleanup regardless.
   }
 }
 
@@ -128,6 +149,7 @@ async function pollBridgeReachability() {
       sequence: requestSequence,
       focused: windowFocused,
       workspaceRoot: currentWorkspaceFolder()?.uri.fsPath ?? null,
+      source: sourceName,
       sentAt: Date.now()
     });
     ensureProtocolResponse(response);
@@ -156,6 +178,7 @@ async function sendHeartbeat() {
       sequence: requestSequence,
       focused: windowFocused,
       workspaceRoot: currentWorkspaceFolder()?.uri.fsPath ?? null,
+      source: sourceName,
       sentAt: Date.now()
     });
     ensureProtocolResponse(response);
@@ -256,6 +279,7 @@ async function publishWorkspaceSessions(reason: WorkspaceReason, force = false) 
       sequence: requestSequence,
       focused: windowFocused,
       workspaceRoot: folder.uri.fsPath,
+      source: sourceName,
       reason,
       sentAt: Date.now()
     });

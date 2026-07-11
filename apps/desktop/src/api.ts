@@ -291,6 +291,16 @@ export type BridgeStatus = {
   restartRequired: boolean;
 };
 
+export type BridgeClient = {
+  clientId: string;
+  workspaceRoot?: string | null;
+  workspaceName?: string | null;
+  source?: string | null;
+  focused: boolean;
+  lastSeen: number;
+  online: boolean;
+};
+
 export type ExternalPromptReferenceItem = {
   itemType?: string | null;
   path?: string | null;
@@ -688,6 +698,11 @@ export async function fetchProjectFiles(root: string): Promise<ProjectFile[]> {
 export async function getBridgeStatus(): Promise<BridgeStatus> {
   assertTauri();
   return invoke<BridgeStatus>("get_bridge_status");
+}
+
+export async function getBridgeClients(): Promise<BridgeClient[]> {
+  assertTauri();
+  return invoke<BridgeClient[]>("get_bridge_clients");
 }
 
 export async function setBridgePort(port: number): Promise<BridgeStatus> {

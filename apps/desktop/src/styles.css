@@ -173,6 +173,7 @@ button:focus-visible {
   position: relative;
   height: 100vh;
   display: grid;
+  grid-template-rows: 36px minmax(0, 1fr);
   color: var(--ink);
   background:
     linear-gradient(90deg, rgba(255, 255, 255, 0.42), transparent 18%),
@@ -181,42 +182,40 @@ button:focus-visible {
   animation: appShellIn 0.28s ease-out both;
 }
 
-.windowDragStrip {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 170px;
-  height: 12px;
-  z-index: 80;
-}
-
-.windowActionBar {
-  position: fixed;
-  top: 8px;
-  right: 8px;
+.windowChrome {
+  grid-column: 1 / -1;
+  grid-row: 1;
   z-index: 90;
   display: flex;
+  min-width: 0;
+  height: 36px;
   align-items: center;
+  justify-content: flex-end;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface-elevated) 94%, var(--bg));
+  box-shadow: var(--inset-line);
   user-select: none;
 }
 
+.windowChromeDrag {
+  align-self: stretch;
+  flex: 1 1 auto;
+  min-width: 24px;
+}
+
 .windowControls {
+  align-self: stretch;
   display: flex;
   align-items: center;
-  gap: 2px;
-  padding: 3px;
-  border: 1px solid color-mix(in srgb, var(--border) 84%, transparent);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--surface-elevated) 88%, transparent);
-  box-shadow: 0 10px 26px rgba(20, 35, 31, 0.14);
-  backdrop-filter: blur(16px);
+  border-left: 1px solid var(--border);
 }
 
 .windowControlButton {
-  width: 28px;
-  height: 28px;
+  width: 40px;
+  height: 35px;
   border: 0;
-  border-radius: 5px;
+  border-left: 1px solid color-mix(in srgb, var(--border) 68%, transparent);
+  border-radius: 0;
   background: transparent;
   color: var(--muted);
   display: inline-flex;
@@ -235,7 +234,8 @@ button:focus-visible {
 }
 
 .windowControlButton:active {
-  transform: translateY(1px);
+  transform: none;
+  background: var(--surface-strong);
 }
 
 .windowControlButton.danger:hover {
@@ -245,7 +245,8 @@ button:focus-visible {
 
 .leftPane,
 .rightPane {
-  height: 100vh;
+  grid-row: 2;
+  height: 100%;
   background: var(--surface-elevated);
   border-right: 1px solid var(--border);
   display: flex;
@@ -267,7 +268,8 @@ button:focus-visible {
 }
 
 .resizeHandle {
-  height: 100vh;
+  grid-row: 2;
+  height: 100%;
   background:
     linear-gradient(180deg, transparent, var(--border), transparent),
     var(--surface-soft);
@@ -663,6 +665,134 @@ button:focus-visible {
   height: 16px;
 }
 
+.ideMonitor {
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  padding: 6px 5px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: linear-gradient(180deg, var(--surface), var(--surface-soft));
+  box-shadow: inset 0 1px 8px rgba(20, 35, 31, 0.035);
+}
+
+.ideRow {
+  width: 100%;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-soft);
+  display: grid;
+  grid-template-columns: 10px 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 9px;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background-color 0.14s ease,
+    color 0.14s ease,
+    transform 0.14s ease;
+}
+
+.ideRow:hover:not(:disabled) {
+  background: var(--surface-soft);
+  transform: translateX(1px);
+}
+
+.ideRow:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.ideRow.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.ideRow.offline {
+  opacity: 0.55;
+}
+
+.ideRowIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  color: var(--text-soft);
+  flex: none;
+}
+
+.ideRowIcon svg {
+  width: 15px;
+  height: 15px;
+}
+
+.ideRow.active .ideRowIcon {
+  color: var(--accent);
+}
+
+.ideRowBody {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.ideRowBody strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.ideRowBody small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.ideStatusDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  box-shadow: 0 0 0 2px var(--surface);
+}
+
+.ideStatusDot.online {
+  background: #34c759;
+  box-shadow: 0 0 0 2px var(--surface), 0 0 6px rgba(52, 199, 89, 0.5);
+}
+
+.ideBadge {
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.ideBadge.focused {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.ideBadge.offline {
+  color: var(--muted);
+  background: var(--surface-soft);
+}
+
 .listRow.active,
 .fileRow.active {
   border-color: var(--accent-border);
@@ -835,7 +965,8 @@ button:focus-visible {
 
 .mainPane {
   min-width: 0;
-  height: 100vh;
+  grid-row: 2;
+  height: 100%;
   display: grid;
   grid-template-rows: minmax(0, 1fr);
   background:
