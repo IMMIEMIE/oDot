@@ -243,6 +243,15 @@ button:focus-visible {
   color: #fff;
 }
 
+.windowControlButton.floatEntry {
+  color: var(--accent);
+}
+
+.windowControlButton.floatEntry:hover {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
 .leftPane,
 .rightPane {
   grid-row: 2;
@@ -427,6 +436,12 @@ button:focus-visible {
   min-height: 180px;
   flex: 1;
   grid-template-rows: auto auto auto minmax(0, 1fr);
+}
+
+.projectTreeSection {
+  min-height: 180px;
+  flex: 1;
+  grid-template-rows: auto minmax(0, 1fr);
 }
 
 .providerConfigSection {
@@ -791,6 +806,129 @@ button:focus-visible {
 .ideBadge.offline {
   color: var(--muted);
   background: var(--surface-soft);
+}
+
+.projectTree {
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  padding: 6px 5px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: linear-gradient(180deg, var(--surface), var(--surface-soft));
+  box-shadow: inset 0 1px 8px rgba(20, 35, 31, 0.035);
+}
+
+.projectGroup {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.projectRow {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) 24px;
+  align-items: center;
+  gap: 2px;
+  border-radius: 7px;
+}
+
+.projectToggle {
+  width: 18px;
+  height: 26px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  transition: background-color 0.14s ease, color 0.14s ease;
+}
+
+.projectToggle:hover {
+  color: var(--ink);
+  background: var(--surface-soft);
+}
+
+.projectHeaderButton {
+  min-width: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-soft);
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px;
+  text-align: left;
+  transition: background-color 0.14s ease, color 0.14s ease, transform 0.14s ease;
+}
+
+.projectHeaderButton:hover:not(:disabled) {
+  background: var(--surface-soft);
+  transform: translateX(1px);
+}
+
+.projectHeaderButton:disabled {
+  cursor: default;
+}
+
+.projectHeaderButton.offline {
+  opacity: 0.6;
+}
+
+.projectHeaderIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  color: var(--text-soft);
+  flex: none;
+}
+
+.projectHeaderIcon svg {
+  width: 15px;
+  height: 15px;
+}
+
+.projectHeaderBody {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.projectHeaderBody strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 680;
+}
+
+.projectHeaderBody small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.projectSessions {
+  display: grid;
+  gap: 6px;
+  padding: 2px 0 4px 14px;
+}
+
+.projectSessions .listRow {
+  min-height: 34px;
 }
 
 .listRow.active,
@@ -3348,7 +3486,7 @@ pre {
 
 .settingsModal {
   width: min(760px, calc(100vw - 44px));
-  max-height: calc(100vh - 44px);
+  max-height: calc((100vh - 44px) * 0.75);
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
   overflow: hidden;

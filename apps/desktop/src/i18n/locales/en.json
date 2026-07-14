@@ -90,7 +90,13 @@
     "uploadedAttachments": "Uploaded attachments",
     "removeAttachment": "Remove attachment {{name}}",
     "renameSession": "Rename session {{title}}",
-    "deleteSession": "Delete session {{title}}"
+    "deleteSession": "Delete session {{title}}",
+    "projects": "Projects",
+    "newProject": "New project",
+    "newSessionInProject": "New session in this project",
+    "switchToFloat": "Enter floating ball mode",
+    "expandProject": "Expand project",
+    "collapseProject": "Collapse project"
   },
   "empty": {
     "noIndexedFiles": "No indexed files yet",
@@ -102,13 +108,16 @@
     "noTodos": "No task progress yet",
     "startPrompt": "Enter a prompt to start",
     "noToolCalls": "No tool call records",
-    "noModelConfigured": "No model configured"
+    "noModelConfigured": "No model configured",
+    "noProjects": "No projects yet — create one above",
+    "noSessionsInProject": "No sessions in this project"
   },
   "session": {
     "manage": "Session manager",
     "availableCount": "{{count}} available sessions",
     "closeManager": "Close session manager",
     "new": "New session",
+    "count": "{{count}} sessions",
     "noModelSelected": "No model selected",
     "noServiceSelected": "No service selected",
     "selectedFiles": "{{count}} files selected",
