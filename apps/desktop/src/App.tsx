@@ -11,12 +11,14 @@ import {
   Database,
   FileCode2,
   FileText,
+  Folder,
   FolderOpen,
   History,
   KeyRound,
   Loader2,
   Maximize2,
   MessageSquare,
+  Minimize2,
   Minus,
   Network,
   Pencil,
@@ -204,6 +206,7 @@ type ResolvedTheme = "light" | "dark";
 type PromptAttachmentSummary = Omit<PromptAttachment, "id" | "content">;
 
 const PROJECT_ROOT_STORAGE_KEY = "odot.projectRoot";
+const COLLAPSED_PROJECTS_STORAGE_KEY = "odot.collapsedProjects";
 const LAST_SESSION_STORAGE_KEY = "odot.lastSessionId";
 
 // Returns a callback with a stable identity that always invokes the latest version
@@ -275,7 +278,9 @@ export function App() {
   const [needsSetup, setNeedsSetup] = useState(false);
   const [setupError, setSetupError] = useState("");
   const [isSetupSaving, setIsSetupSaving] = useState(false);
-  const [isSessionsOpen, setIsSessionsOpen] = useState(false);
+  const [collapsedProjectKeys, setCollapsedProjectKeys] = useState<Set<string>>(
+    () => new Set(readCollapsedProjects())
+  );
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
   const [editingSessionTitle, setEditingSessionTitle] = useState("");
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
@@ -337,6 +342,7 @@ export function App() {
     return Number.isFinite(stored) && stored >= 300 ? stored : 420;
   });
   const [isRightPaneCollapsed, setIsRightPaneCollapsed] = useState(true);
+  const [isMaximized, setIsMaximized] = useState(false);
   const [isPlanDockDismissed, setIsPlanDockDismissed] = useState(false);
 
   // Stable-identity handlers for the memoized timeline (see `useStableCallback`).
@@ -380,6 +386,28 @@ export function App() {
   useEffect(() => {
     localStorage.setItem("odot.leftWidth", String(leftWidth));
   }, [leftWidth]);
+
+  useEffect(() => {
+    localStorage.setItem(
+      COLLAPSED_PROJECTS_STORAGE_KEY,
+      JSON.stringify(Array.from(collapsedProjectKeys))
+    );
+  }, [collapsedProjectKeys]);
+
+  useEffect(() => {
+    const win = getCurrentWindow();
+    let unlisten: (() => void) | undefined;
+    const syncMaximized = () =>
+      void win.isMaximized().then(setIsMaximized).catch(() => undefined);
+    syncMaximized();
+    win
+      .onResized(syncMaximized)
+      .then((dispose) => {
+        unlisten = dispose;
+      })
+      .catch(() => undefined);
+    return () => unlisten?.();
+  }, []);
 
   useEffect(() => {
     localStorage.setItem("odot.themeMode", themeMode);
@@ -573,6 +601,10 @@ export function App() {
   const orderedSessions = useMemo(
     () => orderSessionsByParent(availableSessions),
     [availableSessions]
+  );
+  const projectGroups = useMemo(
+    () => groupSessionsByProject(orderedSessions, bridgeClients),
+    [orderedSessions, bridgeClients]
   );
   const selectedChildSessions = useMemo(
     () =>
@@ -2799,91 +2831,166 @@ export function App() {
     window.addEventListener("pointerup", onUp);
   }
 
-  function renderSessionManager() {
+  function toggleProjectCollapsed(key: string) {
+    setCollapsedProjectKeys((current) => {
+      const next = new Set(current);
+      if (next.has(key)) {
+        next.delete(key);
+      } else {
+        next.add(key);
+      }
+      return next;
+    });
+  }
+
+  function renderSessionRow(session: SessionRecord) {
     return (
-      <>
+      <div
+        key={session.id}
+        className={`listRow ${
+          session.id === selectedSessionId ? "active" : ""
+        } ${session.parentSessionId ? "childSession" : ""}`}
+      >
+        {session.parentSessionId ? <OdodBotIcon size={15} /> : <Clock3 size={15} />}
+        {editingSessionId === session.id ? (
+          <input
+            className="sessionTitleInput"
+            value={editingSessionTitle}
+            autoFocus
+            onChange={(event) => setEditingSessionTitle(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                void saveSessionTitle(session.id);
+              }
+              if (event.key === "Escape") {
+                cancelEditingSession();
+              }
+            }}
+            onBlur={() => void saveSessionTitle(session.id)}
+          />
+        ) : (
+          <button
+            type="button"
+            className="sessionSelectButton"
+            disabled={isAgentWorking}
+            onClick={() => void selectSession(session).catch(reportError)}
+            onDoubleClick={() => startEditingSession(session)}
+          >
+            <strong>{session.title}</strong>
+            <small>
+              {session.parentSessionId ? t("common.subAgent") : modeLabel(session.mode)} /{" "}
+              {shellModeLabel(session.shellMode)}
+            </small>
+          </button>
+        )}
         <button
-          className="commandButton"
-          disabled={isCreatingSession || isAgentWorking || !selectedProviderId}
-          onClick={() =>
-            void createCurrentSessionInDirectory()
-              .then((session) => {
-                if (session) {
-                  setIsSessionsOpen(false);
-                }
-              })
-              .catch(() => undefined)
-          }
+          type="button"
+          className="rowIconAction"
+          aria-label={t("nav.renameSession", { title: session.title })}
+          disabled={editingSessionId === session.id || isMutating || isAgentWorking}
+          onClick={() => startEditingSession(session)}
         >
-          {isCreatingSession ? <Loader2 className="spin" size={16} /> : <Play size={16} />}
-          {t("session.new")}
+          <Pencil size={14} />
         </button>
-        <div className="stackList sessionManagerList">
-          {orderedSessions.map((session) => (
-            <div
-              key={session.id}
-              className={`listRow ${
-                session.id === selectedSessionId ? "active" : ""
-              } ${session.parentSessionId ? "childSession" : ""}`}
+        <button
+          type="button"
+          className="rowIconAction danger"
+          aria-label={t("nav.deleteSession", { title: session.title })}
+          disabled={isMutating || isAgentWorking}
+          onClick={() => void handleDeleteSession(session.id)}
+        >
+          <Trash2 size={14} />
+        </button>
+      </div>
+    );
+  }
+
+  function renderProjectTree() {
+    return (
+      <section className="leftSection projectTreeSection">
+        <div className="sectionTitleRow">
+          <SectionTitle icon={<FolderOpen size={16} />} title={t("nav.projects")} />
+          <div className="sectionActions">
+            <button
+              className="iconButton ghost"
+              aria-label={t("nav.newProject")}
+              title={t("nav.newProject")}
+              disabled={isCreatingSession || isAgentWorking || !selectedProviderId}
+              onClick={() => void createCurrentSessionInDirectory().catch(() => undefined)}
             >
-              {session.parentSessionId ? <OdodBotIcon size={15} /> : <Clock3 size={15} />}
-              {editingSessionId === session.id ? (
-                <input
-                  className="sessionTitleInput"
-                  value={editingSessionTitle}
-                  autoFocus
-                  onChange={(event) => setEditingSessionTitle(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      event.preventDefault();
-                      void saveSessionTitle(session.id);
-                    }
-                    if (event.key === "Escape") {
-                      cancelEditingSession();
-                    }
-                  }}
-                  onBlur={() => void saveSessionTitle(session.id)}
-                />
-              ) : (
-                <button
-                  type="button"
-                  className="sessionSelectButton"
-                  disabled={isAgentWorking}
-                  onClick={() =>
-                    void selectSession(session).then(() => setIsSessionsOpen(false))
-                  }
-                  onDoubleClick={() => startEditingSession(session)}
-                >
-                  <strong>{session.title}</strong>
-                  <small>
-                    {session.parentSessionId ? t("common.subAgent") : modeLabel(session.mode)} /{" "}
-                    {shellModeLabel(session.shellMode)}
-                  </small>
-                </button>
-              )}
-              <button
-                type="button"
-                className="rowIconAction"
-                aria-label={t("nav.renameSession", { title: session.title })}
-                disabled={editingSessionId === session.id || isMutating || isAgentWorking}
-                onClick={() => startEditingSession(session)}
-              >
-                <Pencil size={14} />
-              </button>
-              <button
-                type="button"
-                className="rowIconAction danger"
-                aria-label={t("nav.deleteSession", { title: session.title })}
-                disabled={isMutating || isAgentWorking}
-                onClick={() => void handleDeleteSession(session.id)}
-              >
-                <Trash2 size={14} />
-              </button>
-            </div>
-          ))}
-          {!availableSessions.length && <EmptyLine text={t("empty.noAvailableSessions")} />}
+              {isCreatingSession ? <Loader2 className="spin" size={16} /> : <Plus size={16} />}
+            </button>
+          </div>
         </div>
-      </>
+        <div className="projectTree" aria-label={t("nav.projects")}>
+          {projectGroups.map((group) => {
+            const collapsed = collapsedProjectKeys.has(group.key);
+            const ide = group.ide;
+            const identity = ide ? ideIdentity(ide.source, t) : null;
+            return (
+              <div className="projectGroup" key={group.key}>
+                <div className="projectRow">
+                  <button
+                    type="button"
+                    className="projectToggle"
+                    aria-label={collapsed ? t("nav.expandProject") : t("nav.collapseProject")}
+                    onClick={() => toggleProjectCollapsed(group.key)}
+                  >
+                    {collapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+                  </button>
+                  <button
+                    type="button"
+                    className={`projectHeaderButton${ide && !ide.online ? " offline" : ""}`}
+                    title={group.root}
+                    disabled={isAgentWorking}
+                    onClick={() => void switchToWorkspace(group.root)}
+                  >
+                    <span className="projectHeaderIcon">
+                      {identity ? identity.icon : <Folder size={15} />}
+                    </span>
+                    <span className="projectHeaderBody">
+                      <strong>{group.displayName}</strong>
+                      <small>
+                        {ide && identity
+                          ? `${identity.name}${ide.online ? "" : ` · ${t("ide.offline")}`}`
+                          : t("session.count", { count: group.sessions.length })}
+                      </small>
+                    </span>
+                    {ide && (
+                      <span
+                        className={`ideStatusDot${ide.online ? " online" : ""}`}
+                        aria-hidden="true"
+                      />
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    className="rowIconAction"
+                    aria-label={t("nav.newSessionInProject")}
+                    title={t("nav.newSessionInProject")}
+                    disabled={isCreatingSession || isAgentWorking || !selectedProviderId}
+                    onClick={() =>
+                      void createSessionForProjectRoot(group.root).catch(() => undefined)
+                    }
+                  >
+                    <Plus size={14} />
+                  </button>
+                </div>
+                {!collapsed && (
+                  <div className="projectSessions">
+                    {group.sessions.map((session) => renderSessionRow(session))}
+                    {!group.sessions.length && (
+                      <EmptyLine text={t("empty.noSessionsInProject")} />
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+          {!projectGroups.length && <EmptyLine text={t("empty.noProjects")} />}
+        </div>
+      </section>
     );
   }
 
@@ -2906,6 +3013,24 @@ export function App() {
           aria-label="Window actions"
         >
           <button
+            className="windowControlButton floatEntry"
+            type="button"
+            aria-label={t("nav.switchToFloat")}
+            title={t("nav.switchToFloat")}
+            onClick={() => void switchToFloatWindow()}
+          >
+            <OdodBotIcon size={16} />
+          </button>
+          <button
+            className="windowControlButton"
+            type="button"
+            aria-label={t("nav.openSettings")}
+            title={t("nav.openSettings")}
+            onClick={() => setIsSettingsOpen(true)}
+          >
+            <Settings size={16} />
+          </button>
+          <button
             className="windowControlButton"
             type="button"
             aria-label={isRightPaneCollapsed ? t("nav.expandRightPane") : t("nav.collapseRightPane")}
@@ -2926,11 +3051,11 @@ export function App() {
           <button
             type="button"
             className="windowControlButton"
-            aria-label="Maximize window"
-            title="Maximize"
+            aria-label={isMaximized ? "Restore window" : "Maximize window"}
+            title={isMaximized ? "Restore" : "Maximize"}
             onClick={handleWindowToggleMaximize}
           >
-            <Maximize2 size={13} />
+            {isMaximized ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
           </button>
           <button
             type="button"
@@ -2945,50 +3070,7 @@ export function App() {
       </header>
       {renderExternalProjectSessionPicker()}
       <aside className="leftPane">
-        <header className="brandRow" onClick={() => void switchToFloatWindow()}>
-          <span className="brandIcon">
-            <OdodBotIcon size={22} />
-          </span>
-          <span>
-            <strong>oDot</strong>
-            <small>{t("brand.tagline")}</small>
-          </span>
-        </header>
-
-        <section className="leftSection providerConfigSection">
-          <div className="sectionTitleRow">
-            <SectionTitle icon={<KeyRound size={16} />} title={t("nav.aiService")} />
-            <div className="sectionActions">
-              <button
-                className="iconButton ghost"
-                aria-label={t("nav.manageSessions")}
-                title={t("nav.manageSessions")}
-                onClick={() => setIsSessionsOpen(true)}
-              >
-                <MessageSquare size={16} />
-              </button>
-              <button
-                className="iconButton ghost"
-                aria-label={t("nav.openSettings")}
-                title={t("nav.openSettings")}
-                onClick={() => setIsSettingsOpen(true)}
-              >
-                <Settings size={16} />
-              </button>
-            </div>
-          </div>
-        </section>
-
-        <section className="leftSection projectSection">
-          <SectionTitle icon={<Network size={16} />} title={t("nav.connectedIdes")} />
-          <IdeMonitorPanel
-            clients={bridgeClients}
-            activeRoot={projectRoot}
-            onSelect={(root) => void switchToWorkspace(root)}
-            t={t}
-          />
-        </section>
-
+        {renderProjectTree()}
       </aside>
 
       <div
@@ -3647,49 +3729,6 @@ export function App() {
           onMcpConfigChanged={syncMcpConfigContent}
         />
       )}
-      {isSessionsOpen && (
-        <SessionsModal
-          sessionCount={availableSessions.length}
-          onClose={() => {
-            cancelEditingSession();
-            setIsSessionsOpen(false);
-          }}
-        >
-          {renderSessionManager()}
-        </SessionsModal>
-      )}
-    </div>
-  );
-}
-
-function SessionsModal({
-  children,
-  sessionCount,
-  onClose
-}: {
-  children: ReactNode;
-  sessionCount: number;
-  onClose: () => void;
-}) {
-  const { t } = useTranslation();
-  return (
-    <div className="modalBackdrop" role="presentation">
-      <section className="settingsModal sessionsModal" role="dialog" aria-modal="true">
-        <header className="modalHeader">
-          <div>
-            <strong>{t("session.manage")}</strong>
-            <small>
-              {sessionCount
-                ? t("session.availableCount", { count: sessionCount })
-                : t("empty.noAvailableSessions")}
-            </small>
-          </div>
-          <button className="iconButton ghost" onClick={onClose} aria-label={t("session.closeManager")}>
-            <X size={16} />
-          </button>
-        </header>
-        <div className="sessionsModalBody">{children}</div>
-      </section>
     </div>
   );
 }
@@ -4939,62 +4978,6 @@ function ideIdentity(
       </svg>
     )
   };
-}
-
-function IdeMonitorPanel({
-  clients,
-  activeRoot,
-  onSelect,
-  t
-}: {
-  clients: BridgeClient[];
-  activeRoot: string;
-  onSelect: (root: string) => void;
-  t: (key: string, vars?: Record<string, string | number>) => string;
-}) {
-  if (!clients.length) {
-    return (
-      <div className="ideMonitor" aria-label={t("ide.panelLabel")}>
-        <EmptyLine text={t("ide.noWindows")} />
-      </div>
-    );
-  }
-  const activeKey = normalizeProjectRootKey(activeRoot);
-  return (
-    <div className="ideMonitor" aria-label={t("ide.panelLabel")}>
-      {clients.map((client) => {
-        const root = (client.workspaceRoot ?? "").trim();
-        const active = Boolean(root) && normalizeProjectRootKey(root) === activeKey;
-        const className = `ideRow${active ? " active" : ""}${client.online ? "" : " offline"}`;
-        const ide = ideIdentity(client.source, t);
-        return (
-          <button
-            key={client.clientId}
-            className={className}
-            onClick={() => root && onSelect(root)}
-            disabled={!root}
-            title={root ? `${ide.name} · ${root}` : ide.name}
-          >
-            <span className={`ideStatusDot${client.online ? " online" : ""}`} aria-hidden="true" />
-            <span className="ideRowIcon" title={ide.name}>
-              {ide.icon}
-            </span>
-            <span className="ideRowBody">
-              <strong>{client.workspaceName || t("ide.unknownWorkspace")}</strong>
-              <small>
-                {ide.name}
-                {root ? ` · ${root}` : ` · ${t("ide.noFolder")}`}
-              </small>
-            </span>
-            {client.online && client.focused && (
-              <span className="ideBadge focused">{t("ide.focused")}</span>
-            )}
-            {!client.online && <span className="ideBadge offline">{t("ide.offline")}</span>}
-          </button>
-        );
-      })}
-    </div>
-  );
 }
 
 type TimelineItemKind =
@@ -8212,6 +8195,110 @@ function providerChoices(
     return fallbackProvider ? [fallbackProvider] : providers.map((item) => item.id.split("/")[0]);
   } catch {
     return providers.map((item) => item.id.split("/")[0]);
+  }
+}
+
+type ProjectGroup = {
+  key: string;
+  root: string;
+  displayName: string;
+  sessions: SessionRecord[];
+  ide: BridgeClient | null;
+};
+
+// Two-level sidebar model: distinct project directories (keyed by normalized
+// root) each own the sessions created under them. Connected IDE windows are
+// folded in as live nodes so a freshly-connected workspace with no session yet
+// still shows (with a "+" to create its first session) — mirrors the old
+// IdeMonitorPanel. Empty projects are never persisted; a project exists only
+// while it has a session or a connected IDE.
+function groupSessionsByProject(
+  sessions: SessionRecord[],
+  clients: BridgeClient[]
+): ProjectGroup[] {
+  const groups = new Map<string, ProjectGroup>();
+  const ensure = (root: string): ProjectGroup => {
+    const key = normalizeProjectRootKey(root);
+    let group = groups.get(key);
+    if (!group) {
+      group = {
+        key,
+        root: root.trim(),
+        displayName: projectDisplayName(root),
+        sessions: [],
+        ide: null
+      };
+      groups.set(key, group);
+    }
+    return group;
+  };
+
+  for (const session of sessions) {
+    if (!session.projectRoot.trim()) {
+      continue;
+    }
+    ensure(session.projectRoot).sessions.push(session);
+  }
+
+  for (const client of clients) {
+    const root = (client.workspaceRoot ?? "").trim();
+    if (!root) {
+      continue;
+    }
+    const group = ensure(root);
+    if (!group.ide || ideClientRank(client) > ideClientRank(group.ide)) {
+      group.ide = client;
+      const name = (client.workspaceName ?? "").trim();
+      if (name) {
+        group.displayName = name;
+      }
+    }
+  }
+
+  // Stable ordering by each project's earliest session so selecting a session
+  // (which changes the active projectRoot) or new activity never reorders the
+  // tree. Projects with no sessions (IDE-only nodes) sink to the bottom.
+  return Array.from(groups.values()).sort(
+    (left, right) => earliestSessionTime(left.sessions) - earliestSessionTime(right.sessions)
+  );
+}
+
+function projectDisplayName(root: string): string {
+  const segments = root.trim().replace(/[/\\]+$/, "").split(/[/\\]+/);
+  const last = segments.at(-1)?.trim();
+  return last || root.trim() || "—";
+}
+
+function ideClientRank(client: BridgeClient): number {
+  if (!client.online) {
+    return 1;
+  }
+  return client.focused ? 3 : 2;
+}
+
+function earliestSessionTime(sessions: SessionRecord[]): number {
+  let earliest = Number.POSITIVE_INFINITY;
+  for (const session of sessions) {
+    const time = Date.parse(session.createdAt);
+    if (Number.isFinite(time) && time < earliest) {
+      earliest = time;
+    }
+  }
+  return earliest;
+}
+
+function readCollapsedProjects(): string[] {
+  try {
+    const raw = localStorage.getItem(COLLAPSED_PROJECTS_STORAGE_KEY);
+    if (!raw) {
+      return [];
+    }
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === "string")
+      : [];
+  } catch {
+    return [];
   }
 }
 

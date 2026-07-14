@@ -87,7 +87,13 @@
     "uploadedAttachments": "已上传附件",
     "removeAttachment": "移除附件 {{name}}",
     "renameSession": "重命名会话 {{title}}",
-    "deleteSession": "删除会话 {{title}}"
+    "deleteSession": "删除会话 {{title}}",
+    "projects": "项目",
+    "newProject": "新建项目",
+    "newSessionInProject": "在此项目新建会话",
+    "switchToFloat": "进入悬浮球模式",
+    "expandProject": "展开项目",
+    "collapseProject": "折叠项目"
   },
   "empty": {
     "noIndexedFiles": "尚未索引文件",
@@ -99,13 +105,16 @@
     "noTodos": "暂无任务进度",
     "startPrompt": "输入提示词开始",
     "noToolCalls": "暂无工具调用记录",
-    "noModelConfigured": "未配置模型"
+    "noModelConfigured": "未配置模型",
+    "noProjects": "暂无项目，点击右上新建",
+    "noSessionsInProject": "此项目暂无会话"
   },
   "session": {
     "manage": "会话管理",
     "availableCount": "{{count}} 个可用会话",
     "closeManager": "关闭会话管理",
     "new": "新建会话",
+    "count": "{{count}} 个会话",
     "noModelSelected": "未选择模型",
     "noServiceSelected": "未选择服务",
     "selectedFiles": "已选 {{count}} 个文件",
