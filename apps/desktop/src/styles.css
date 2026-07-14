@@ -2831,9 +2831,12 @@ pre {
 }
 
 .composerReasoningStatus {
+  display: block;
+  min-height: 14px;
   color: var(--muted);
   font-size: 11px;
   font-weight: 650;
+  line-height: 14px;
 }
 
 .composerRunConfigSelect {
@@ -3671,7 +3674,7 @@ pre {
   font-weight: 700;
 }
 
-.modelReasoningPicker {
+.modelPicker {
   position: relative;
   min-width: 0;
 }
@@ -3712,11 +3715,11 @@ pre {
   left: 0;
   right: 0;
   z-index: 35;
-  min-width: min(520px, calc(100vw - 72px));
+  min-width: min(320px, calc(100vw - 72px));
   display: grid;
-  grid-template-columns: minmax(130px, 0.9fr) minmax(0, 1.15fr);
-  gap: 12px;
-  padding: 12px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+  padding: 8px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--surface-elevated);
@@ -3730,8 +3733,8 @@ pre {
   display: grid;
   align-content: start;
   gap: 4px;
-  padding-right: 10px;
-  border-right: 1px solid var(--border);
+  padding-right: 0;
+  border-right: 0;
 }
 
 .modelPickerList button {
@@ -3756,62 +3759,6 @@ pre {
   border-color: var(--accent-border);
   background: var(--accent-soft);
   color: var(--text);
-}
-
-.reasoningSliderPanel {
-  min-width: 0;
-  display: grid;
-  align-content: start;
-  gap: 10px;
-}
-
-.reasoningSliderHeader {
-  min-width: 0;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 10px;
-}
-
-.reasoningSliderHeader span,
-.reasoningSliderHeader strong {
-  min-width: 0;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.reasoningSliderHeader strong {
-  color: var(--text);
-  font-size: 12px;
-}
-
-.reasoningSliderPanel input[type="range"] {
-  width: 100%;
-  accent-color: var(--accent);
-}
-
-.reasoningTicks {
-  display: grid;
-  gap: 4px;
-  color: var(--muted);
-  font-size: 10px;
-  line-height: 1.25;
-  text-align: center;
-}
-
-.reasoningTicks span {
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-
-.reasoningStatus {
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 600;
 }
 
 .settingsWide {
@@ -4333,9 +4280,9 @@ pre {
   .modelPickerList {
     max-height: 160px;
     padding-right: 0;
-    padding-bottom: 10px;
+    padding-bottom: 0;
     border-right: 0;
-    border-bottom: 1px solid var(--border);
+    border-bottom: 0;
   }
 
   .codeChangeSummaryTop {

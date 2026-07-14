@@ -3318,17 +3318,15 @@ export function App() {
                               </span>
                             ))}
                           </div>
-                          {(isComposerReasoningLoading ||
-                            isComposerReasoningSaving ||
-                            composerReasoningEfforts.length === 0) && (
-                            <small className="composerReasoningStatus">
-                              {isComposerReasoningLoading
-                                ? t("settings.reasoningLoading")
-                                : isComposerReasoningSaving
-                                  ? t("settings.reasoningSaving")
-                                  : t("settings.reasoningUnavailable")}
-                            </small>
-                          )}
+                          <small className="composerReasoningStatus" aria-live="polite">
+                            {isComposerReasoningLoading
+                              ? t("settings.reasoningLoading")
+                              : isComposerReasoningSaving
+                                ? t("settings.reasoningSaving")
+                                : composerReasoningEfforts.length === 0
+                                  ? t("settings.reasoningUnavailable")
+                                  : "\u00a0"}
+                          </small>
                         </div>
                       </div>
                     )}
@@ -3782,10 +3780,7 @@ function SettingsModal({
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffortSetting>(
     initial.reasoningEffort
   );
-  const [reasoningEfforts, setReasoningEfforts] = useState<ReasoningEffort[]>([]);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
-  const [isReasoningLoading, setIsReasoningLoading] = useState(false);
-  const [isReasoningSaving, setIsReasoningSaving] = useState(false);
   const [name, setName] = useState(initial.name);
   const [baseUrl, setBaseUrl] = useState(initial.baseUrl);
   const [apiKey, setApiKey] = useState(initial.apiKey);
@@ -3824,15 +3819,6 @@ function SettingsModal({
   const [skills, setSkills] = useState<SkillRecord[]>(projectCapabilities?.skills ?? []);
   const [skillExpanded, setSkillExpanded] = useState<string | null>(null);
   const [skillContents, setSkillContents] = useState<Record<string, string>>({});
-  const reasoningLoadSeq = useRef(0);
-  const reasoningSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const reasoningSaveInFlight = useRef(false);
-  const pendingReasoningSave = useRef<{
-    content: string;
-    policy: ShellPolicy;
-    configPath: string | null;
-  } | null>(null);
-
   useEffect(() => {
     setMcpServers(projectCapabilities?.mcpServers ?? []);
     setSkills(projectCapabilities?.skills ?? []);
@@ -3842,14 +3828,6 @@ function SettingsModal({
         : null
     );
   }, [projectCapabilities]);
-
-  useEffect(() => {
-    return () => {
-      if (reasoningSaveTimer.current) {
-        clearTimeout(reasoningSaveTimer.current);
-      }
-    };
-  }, []);
 
   const providerOptions = useMemo(
     () => providerChoices(jsonText, providers, providerId),
@@ -3891,116 +3869,6 @@ function SettingsModal({
     };
   }
 
-  async function loadReasoningEfforts(
-    content = jsonText,
-    nextProviderId = providerId,
-    nextModelId = modelId
-  ) {
-    if (!nextProviderId || !nextModelId) {
-      setReasoningEfforts([]);
-      return;
-    }
-    const seq = reasoningLoadSeq.current + 1;
-    reasoningLoadSeq.current = seq;
-    setIsReasoningLoading(true);
-    try {
-      const result = await getModelReasoningEfforts(content, nextProviderId, nextModelId);
-      if (reasoningLoadSeq.current !== seq) {
-        return;
-      }
-      setReasoningEfforts(result.efforts);
-      setReasoningEffort(result.current ?? "");
-    } catch (loadError) {
-      if (reasoningLoadSeq.current === seq) {
-        setReasoningEfforts([]);
-        setError(errorMessage(loadError));
-      }
-    } finally {
-      if (reasoningLoadSeq.current === seq) {
-        setIsReasoningLoading(false);
-      }
-    }
-  }
-
-  function openModelPicker(nextOpen: boolean) {
-    setModelPickerOpen(nextOpen);
-    if (!nextOpen) {
-      return;
-    }
-    setError("");
-    try {
-      const draft = flushCurrentProviderDraft();
-      void loadReasoningEfforts(draft, providerId, modelId);
-    } catch (openError) {
-      setError(errorMessage(openError));
-    }
-  }
-
-  function scheduleReasoningSave(content: string) {
-    pendingReasoningSave.current = {
-      content,
-      policy: currentPolicy(),
-      configPath: selectedConfigPath || null
-    };
-    if (reasoningSaveTimer.current) {
-      clearTimeout(reasoningSaveTimer.current);
-    }
-    reasoningSaveTimer.current = setTimeout(() => {
-      reasoningSaveTimer.current = null;
-      void flushReasoningSave();
-    }, 300);
-  }
-
-  async function flushReasoningSave() {
-    if (reasoningSaveInFlight.current) {
-      return;
-    }
-    const pending = pendingReasoningSave.current;
-    if (!pending) {
-      return;
-    }
-    pendingReasoningSave.current = null;
-    reasoningSaveInFlight.current = true;
-    setIsReasoningSaving(true);
-    try {
-      await onSave(pending.content, pending.policy, pending.configPath, {
-        keepOpen: true,
-        silent: true
-      });
-      setError("");
-    } catch (saveError) {
-      setError(errorMessage(saveError));
-    } finally {
-      reasoningSaveInFlight.current = false;
-      setIsReasoningSaving(false);
-      if (pendingReasoningSave.current) {
-        if (reasoningSaveTimer.current) {
-          clearTimeout(reasoningSaveTimer.current);
-        }
-        reasoningSaveTimer.current = setTimeout(() => {
-          reasoningSaveTimer.current = null;
-          void flushReasoningSave();
-        }, 300);
-      }
-    }
-  }
-
-  function handleReasoningEffortChange(nextEffort: ReasoningEffortSetting) {
-    setError("");
-    setReasoningEffort(nextEffort);
-    reasoningLoadSeq.current += 1;
-    try {
-      const nextContent = buildProviderConfigContent(
-        jsonText,
-        currentFields({ reasoningEffort: nextEffort })
-      );
-      setJsonText(nextContent);
-      scheduleReasoningSave(nextContent);
-    } catch (saveError) {
-      setError(errorMessage(saveError));
-    }
-  }
-
   function syncFromSelection(nextProviderId: string, nextModelId?: string) {
     const nextText = flushCurrentProviderDraft();
     const parsed = parseProviderSettings(
@@ -4015,9 +3883,6 @@ function SettingsModal({
     setSupportsResponses(parsed.supportsResponses);
     setResponsesSource(parsed.responsesSource);
     setReasoningEffort(parsed.reasoningEffort);
-    if (modelPickerOpen) {
-      void loadReasoningEfforts(nextText, parsed.providerId || nextProviderId, parsed.modelId);
-    }
   }
 
   async function handleSave() {
@@ -4413,24 +4278,20 @@ function SettingsModal({
             </label>
             <div className="settingsField">
               <span>{t("settings.model")}</span>
-              <ModelReasoningPicker
+              <ModelPicker
                 isOpen={modelPickerOpen}
                 modelId={modelId}
                 modelOptions={modelOptions}
-                efforts={reasoningEfforts}
-                value={reasoningEffort}
-                isLoading={isReasoningLoading}
-                isSaving={isReasoningSaving}
-                onOpenChange={openModelPicker}
+                onOpenChange={setModelPickerOpen}
                 onSelectModel={(nextModelId) => {
                   setError("");
                   try {
                     syncFromSelection(providerId, nextModelId);
+                    setModelPickerOpen(false);
                   } catch (selectionError) {
                     setError(errorMessage(selectionError));
                   }
                 }}
-                onChangeEffort={handleReasoningEffortChange}
               />
             </div>
             <label>
@@ -4528,13 +4389,6 @@ function SettingsModal({
                 setSupportsResponses(parsed.supportsResponses);
                 setResponsesSource(parsed.responsesSource);
                 setReasoningEffort(parsed.reasoningEffort);
-                if (modelPickerOpen) {
-                  void loadReasoningEfforts(
-                    event.target.value,
-                    parsed.providerId,
-                    parsed.modelId
-                  );
-                }
               }}
               spellCheck={false}
             />
@@ -4804,38 +4658,21 @@ function SettingsModal({
   );
 }
 
-function ModelReasoningPicker({
+function ModelPicker({
   isOpen,
   modelId,
   modelOptions,
-  efforts,
-  value,
-  isLoading,
-  isSaving,
   onOpenChange,
-  onSelectModel,
-  onChangeEffort
+  onSelectModel
 }: {
   isOpen: boolean;
   modelId: string;
   modelOptions: string[];
-  efforts: ReasoningEffort[];
-  value: ReasoningEffortSetting;
-  isLoading: boolean;
-  isSaving: boolean;
   onOpenChange: (open: boolean) => void;
   onSelectModel: (modelId: string) => void;
-  onChangeEffort: (effort: ReasoningEffortSetting) => void;
 }) {
   const { t } = useTranslation();
   const rootRef = useRef<HTMLDivElement | null>(null);
-  const sliderOptions = useMemo<ReasoningEffortSetting[]>(
-    () => ["", ...efforts],
-    [efforts]
-  );
-  const selectedValue: ReasoningEffortSetting =
-    value && sliderOptions.includes(value) ? value : "";
-  const selectedIndex = Math.max(0, sliderOptions.indexOf(selectedValue));
 
   useEffect(() => {
     if (!isOpen) {
@@ -4851,7 +4688,7 @@ function ModelReasoningPicker({
   }, [isOpen, onOpenChange]);
 
   return (
-    <div className="modelReasoningPicker" ref={rootRef}>
+    <div className="modelPicker" ref={rootRef}>
       <button
         className="modelPickerTrigger"
         type="button"
@@ -4876,45 +4713,6 @@ function ModelReasoningPicker({
                 {item}
               </button>
             ))}
-          </div>
-
-          <div className="reasoningSliderPanel">
-            <div className="reasoningSliderHeader">
-              <span>
-                <BrainCircuit size={14} />
-                {t("settings.reasoningEffort")}
-              </span>
-              <strong>{reasoningEffortLabel(selectedValue, t)}</strong>
-            </div>
-            <input
-              type="range"
-              min={0}
-              max={Math.max(0, sliderOptions.length - 1)}
-              step={1}
-              value={selectedIndex}
-              disabled={isLoading || sliderOptions.length <= 1}
-              onChange={(event) => {
-                const nextIndex = Number(event.target.value);
-                onChangeEffort(sliderOptions[nextIndex] ?? "");
-              }}
-            />
-            <div
-              className="reasoningTicks"
-              style={{ gridTemplateColumns: `repeat(${sliderOptions.length}, minmax(0, 1fr))` }}
-            >
-              {sliderOptions.map((item) => (
-                <span key={item || "auto"}>{reasoningEffortLabel(item, t)}</span>
-              ))}
-            </div>
-            {(isLoading || isSaving || efforts.length === 0) && (
-              <small className="reasoningStatus">
-                {isLoading
-                  ? t("settings.reasoningLoading")
-                  : isSaving
-                    ? t("settings.reasoningSaving")
-                    : t("settings.reasoningUnavailable")}
-              </small>
-            )}
           </div>
         </div>
       )}
