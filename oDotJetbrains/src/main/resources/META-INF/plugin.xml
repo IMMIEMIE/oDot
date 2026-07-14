@@ -36,6 +36,8 @@
                 description="Send the current selection or file to the oDot prompt.">
             <add-to-group group-id="EditorPopupMenu" anchor="last"/>
             <add-to-group group-id="ToolsMenu" anchor="last"/>
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl shift L"/>
+            <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta shift L"/>
         </action>
         <action id="dev.odot.SendResourceToPrompt"
                 class="dev.odot.bridge.SendResourceToPromptAction"
@@ -47,6 +49,12 @@
                 class="dev.odot.bridge.CheckBridgeAction"
                 text="oDot: Check Bridge"
                 description="Check whether the oDot bridge is reachable.">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+        <action id="dev.odot.ConfigureShortcut"
+                class="dev.odot.bridge.ConfigureShortcutAction"
+                text="oDot: Configure Send Shortcut"
+                description="Open Settings ▸ Keymap to rebind the oDot send shortcut.">
             <add-to-group group-id="ToolsMenu" anchor="last"/>
         </action>
     </actions>

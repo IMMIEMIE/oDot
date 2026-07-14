@@ -45,8 +45,9 @@ $env:JAVA_HOME="$env:USERPROFILE\.jdks\jdk-17"; .\gradlew.bat buildPlugin
 
 ### 快捷键
 
-为避免与 IDE 默认 `Ctrl/Cmd+L`（Go to Line）冲突，插件**默认不绑定快捷键**。
-如需绑定：`Settings ▸ Keymap`，搜索 “oDot: Send Selection/File to Prompt” 自行指定。
+发送快捷键使用 IDE 原生 Keymap 管理，默认 `Ctrl+Shift+L`（macOS 为 `Cmd+Shift+L`）。
+在 `Settings ▸ Keymap` 搜索 `oDot`（或对着 `oDot: Send Selection/File to Prompt` 右键 → `Add Keyboard Shortcut`）即可改成任意组合。Keymap 原生支持多修饰键与两段式 chord，因此三键及以上组合都能设置，也可移除绑定。
+快捷方式：`Find Action` 或 Tools 菜单里的 `oDot: Configure Send Shortcut` 会直接打开已过滤到 oDot 的 Keymap 页。
 
 ## 结构
 

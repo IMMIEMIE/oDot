@@ -2,7 +2,7 @@
   "name": "odot-vscode",
   "displayName": "oDot VS Code Bridge",
   "description": "Send selected code, files, and folders from VS Code to the oDot prompt.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "odot-local",
   "license": "UNLICENSED",
   "icon": "media/icon.png",
@@ -16,6 +16,7 @@
     "onStartupFinished",
     "onCommand:odot.sendReferenceToPrompt",
     "onCommand:odot.sendResourceToPrompt",
+    "onCommand:odot.configureShortcut",
     "onCommand:odot.checkBridge"
   ],
   "main": "./dist/extension.js",
@@ -38,38 +39,20 @@
         "title": "oDot: Check Bridge",
         "category": "oDot",
         "icon": "$(plug)"
+      },
+      {
+        "command": "odot.configureShortcut",
+        "title": "Configure Send Shortcut",
+        "category": "oDot",
+        "icon": "$(keyboard)"
       }
     ],
     "keybindings": [
       {
         "command": "odot.sendReferenceToPrompt",
-        "key": "ctrl+l",
-        "mac": "cmd+l",
-        "when": "(editorTextFocus || filesExplorerFocus) && config.odot.shortcut.sendReferenceToPrompt == 'primary+l'"
-      },
-      {
-        "command": "odot.sendReferenceToPrompt",
         "key": "ctrl+shift+l",
         "mac": "cmd+shift+l",
-        "when": "(editorTextFocus || filesExplorerFocus) && config.odot.shortcut.sendReferenceToPrompt == 'primary+shift+l'"
-      },
-      {
-        "command": "odot.sendReferenceToPrompt",
-        "key": "ctrl+alt+l",
-        "mac": "cmd+alt+l",
-        "when": "(editorTextFocus || filesExplorerFocus) && config.odot.shortcut.sendReferenceToPrompt == 'primary+alt+l'"
-      },
-      {
-        "command": "odot.sendReferenceToPrompt",
-        "key": "alt+l",
-        "mac": "alt+l",
-        "when": "(editorTextFocus || filesExplorerFocus) && config.odot.shortcut.sendReferenceToPrompt == 'alt+l'"
-      },
-      {
-        "command": "odot.sendReferenceToPrompt",
-        "key": "alt+shift+l",
-        "mac": "alt+shift+l",
-        "when": "(editorTextFocus || filesExplorerFocus) && config.odot.shortcut.sendReferenceToPrompt == 'alt+shift+l'"
+        "when": "editorTextFocus || filesExplorerFocus"
       }
     ],
     "menus": {
@@ -95,6 +78,9 @@
         },
         {
           "command": "odot.checkBridge"
+        },
+        {
+          "command": "odot.configureShortcut"
         }
       ]
     },
@@ -114,27 +100,6 @@
           "minimum": 16384,
           "maximum": 1200000,
           "description": "Approximate maximum JSON payload bytes sent to the oDot Bridge. The payload contains reference metadata only, not file contents."
-        },
-        "odot.shortcut.sendReferenceToPrompt": {
-          "type": "string",
-          "default": "primary+l",
-          "enum": [
-            "primary+l",
-            "primary+shift+l",
-            "primary+alt+l",
-            "alt+l",
-            "alt+shift+l",
-            "disabled"
-          ],
-          "enumDescriptions": [
-            "Windows/Linux: Ctrl+L. macOS: Cmd+L.",
-            "Windows/Linux: Ctrl+Shift+L. macOS: Cmd+Shift+L.",
-            "Windows/Linux: Ctrl+Alt+L. macOS: Cmd+Alt+L.",
-            "Alt+L.",
-            "Alt+Shift+L.",
-            "Disable the oDot default shortcut. You can still bind the command with VS Code Keyboard Shortcuts."
-          ],
-          "markdownDescription": "Keyboard shortcut used by `oDot: Send Selection/File to Prompt`. `primary` means Ctrl on Windows/Linux and Cmd on macOS. Choices are limited to combinations of up to three keys; choose `disabled` to turn off the contributed shortcut and use VS Code Keyboard Shortcuts for a fully custom binding."
         }
       }
     }
