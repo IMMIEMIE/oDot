@@ -7,7 +7,9 @@ import javax.swing.JPanel
 import javax.swing.JSpinner
 import javax.swing.SpinnerNumberModel
 
-/** Settings ▸ Tools ▸ oDot Bridge. Mirrors the VS Code extension's configuration block. */
+/** Settings ▸ Tools ▸ oDot Bridge. Mirrors the VS Code extension's configuration block.
+ *  The send shortcut is NOT configured here — it lives in the native Settings ▸ Keymap
+ *  (search "oDot"), reachable via the "oDot: Configure Send Shortcut" action. */
 class BridgeConfigurable : Configurable {
     private var timeoutSpinner: JSpinner? = null
     private var payloadSpinner: JSpinner? = null
@@ -27,7 +29,8 @@ class BridgeConfigurable : Configurable {
 
     override fun isModified(): Boolean {
         val state = BridgeSettings.getInstance().state
-        return spinnerInt(timeoutSpinner) != state.timeoutMs || spinnerInt(payloadSpinner) != state.maxPayloadBytes
+        return spinnerInt(timeoutSpinner) != state.timeoutMs ||
+            spinnerInt(payloadSpinner) != state.maxPayloadBytes
     }
 
     override fun apply() {

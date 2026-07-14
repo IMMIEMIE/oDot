@@ -70,6 +70,7 @@ export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand("odot.sendReferenceToPrompt", sendReferenceToPrompt),
     vscode.commands.registerCommand("odot.sendResourceToPrompt", sendResourceToPrompt),
+    vscode.commands.registerCommand("odot.configureShortcut", configureShortcut),
     vscode.commands.registerCommand("odot.checkBridge", checkBridge),
     vscode.window.onDidChangeActiveTextEditor(() => {
       schedulePublishWorkspaceSessions("editor-change");
@@ -242,6 +243,16 @@ async function checkBridge() {
     }
     vscode.window.showInformationMessage(`oDot Bridge is reachable on ${config.host}:${config.port}.`);
   });
+}
+
+async function configureShortcut() {
+  // Open the native Keyboard Shortcuts editor filtered to the send command. The user can
+  // bind any combination there (VS Code supports multi-modifier keys and chord sequences),
+  // which is why we no longer ship a fixed enum of preset shortcuts.
+  await vscode.commands.executeCommand(
+    "workbench.action.openGlobalKeybindings",
+    "@command:odot.sendReferenceToPrompt"
+  );
 }
 
 function schedulePublishWorkspaceSessions(reason: WorkspaceReason, force = false) {
