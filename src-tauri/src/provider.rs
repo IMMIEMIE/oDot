@@ -1,11 +1,12 @@
 use crate::{
     llm_runtime::{
-        sanitize_assistant_content, LlmStreamEvent, OpenAiChatStreamParser,
+        sanitize_assistant_content, AnthropicStreamParser, LlmStreamEvent, OpenAiChatStreamParser,
         OpenAiResponsesStreamParser,
     },
     types::{
-        McpToolDefinition, ModelTurn, OpenAiApiMode, ProviderKind, ProviderRequestConfig,
-        ReasoningEffort, ToolCallRequest, ToolMode,
+        anthropic_disallows_disabled_thinking, anthropic_uses_adaptive_effort, McpToolDefinition,
+        ModelTurn, OpenAiApiMode, ProviderKind, ProviderRequestConfig, ReasoningEffort,
+        ToolCallRequest, ToolMode,
     },
 };
 use futures_util::StreamExt;
@@ -84,7 +85,10 @@ pub fn supports_native_tools(provider: &ProviderRequestConfig) -> bool {
     provider.tool_mode == ToolMode::Native
         && matches!(
             provider.kind,
-            ProviderKind::OpenAi | ProviderKind::OpenAiCompatible
+            ProviderKind::OpenAi
+                | ProviderKind::OpenAiCompatible
+                | ProviderKind::Anthropic
+                | ProviderKind::AnthropicCompatible
         )
 }
 
@@ -144,6 +148,7 @@ where
         message: None,
         tool_calls: Vec::new(),
         done: true,
+        native_assistant_content: None,
     };
     let mut stream = response.bytes_stream();
     let mut pending_utf8 = Vec::new();
@@ -698,21 +703,339 @@ async fn complete_anthropic_compatible(
         &provider.config_path,
     )
     .await?;
-    let content = payload
-        .pointer("/content")
-        .and_then(|value| value.as_array())
-        .and_then(|items| {
-            items
-                .iter()
-                .find_map(|item| item.get("text").and_then(|value| value.as_str()))
-        })
-        .map(|content| content.to_string())
-        .ok_or_else(|| "AI 服务返回了空消息。".to_string())?;
+    let turn = parse_anthropic_turn(&payload)?;
+    let content = turn.message.clone().unwrap_or_default();
+    if content.trim().is_empty() && turn.tool_calls.is_empty() {
+        return Err("AI 服务返回了空消息。".to_string());
+    }
 
     Ok(ProviderCompletion {
         raw_response: content,
-        turn: None,
+        turn: supports_native_tools(provider).then_some(turn),
     })
+}
+
+pub async fn stream_anthropic_compatible<F>(
+    provider: &ProviderRequestConfig,
+    messages: &[Value],
+    mcp_tools: &[McpToolDefinition],
+    on_event: F,
+) -> Result<ModelTurn, String>
+where
+    F: FnMut(LlmStreamEvent) -> Result<(), String>,
+{
+    stream_anthropic_compatible_with_client(http_client(), provider, messages, mcp_tools, on_event)
+        .await
+}
+
+async fn stream_anthropic_compatible_with_client<F>(
+    client: &reqwest::Client,
+    provider: &ProviderRequestConfig,
+    messages: &[Value],
+    mcp_tools: &[McpToolDefinition],
+    mut on_event: F,
+) -> Result<ModelTurn, String>
+where
+    F: FnMut(LlmStreamEvent) -> Result<(), String>,
+{
+    if !supports_native_tools(provider) {
+        return Err("当前 provider 未启用 native streaming runtime。".to_string());
+    }
+    let endpoint = to_anthropic_messages_endpoint(
+        provider
+            .base_url
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("https://api.anthropic.com/v1"),
+    );
+    let body = anthropic_stream_request_body(provider, messages, mcp_tools)?;
+
+    let mut request = client.post(&endpoint);
+    for (key, value) in &provider.headers {
+        request = request.header(key, value);
+    }
+    let response = request
+        .header("anthropic-version", "2023-06-01")
+        .header("x-api-key", provider.api_key.trim())
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| format!("AI 服务 streaming 请求失败: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response
+            .text()
+            .await
+            .map_err(|error| format!("无法读取 AI 服务响应: {error}"))?;
+        return Err(provider_error_message(
+            status,
+            &text,
+            &endpoint,
+            "x-api-key: <redacted>",
+            &provider.config_path,
+        ));
+    }
+
+    let mut turn = ModelTurn {
+        summary: None,
+        message: None,
+        tool_calls: Vec::new(),
+        done: true,
+        native_assistant_content: None,
+    };
+    let mut parser = AnthropicStreamParser::new();
+    let mut stream = response.bytes_stream();
+    let mut pending_utf8 = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("读取 AI 服务 streaming 响应失败: {error}"))?;
+        pending_utf8.extend_from_slice(&chunk);
+        loop {
+            match std::str::from_utf8(&pending_utf8) {
+                Ok(text) => {
+                    for event in parser.push_str(text)? {
+                        accumulate_stream_event(&mut turn, &event);
+                        on_event(event)?;
+                    }
+                    pending_utf8.clear();
+                    break;
+                }
+                Err(error) => {
+                    let valid_up_to = error.valid_up_to();
+                    if valid_up_to > 0 {
+                        let text = std::str::from_utf8(&pending_utf8[..valid_up_to])
+                            .map_err(|error| error.to_string())?;
+                        for event in parser.push_str(text)? {
+                            accumulate_stream_event(&mut turn, &event);
+                            on_event(event)?;
+                        }
+                        pending_utf8.drain(..valid_up_to);
+                    }
+                    if error.error_len().is_some() {
+                        return Err(format!("AI 服务 streaming 响应包含无效 UTF-8: {error}"));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    if !pending_utf8.is_empty() {
+        return Err("AI 服务 streaming 响应以不完整 UTF-8 结尾。".to_string());
+    }
+    for event in parser.finish()? {
+        accumulate_stream_event(&mut turn, &event);
+        on_event(event)?;
+    }
+    turn.native_assistant_content = Some(parser.native_content());
+    turn.done = turn.tool_calls.is_empty();
+    Ok(turn)
+}
+
+fn anthropic_stream_request_body(
+    provider: &ProviderRequestConfig,
+    messages: &[Value],
+    mcp_tools: &[McpToolDefinition],
+) -> Result<Map<String, Value>, String> {
+    let (system, anthropic_messages) = anthropic_messages_from_internal(messages)?;
+    let mut body = provider.body.clone();
+    body.insert("model".to_string(), json!(provider.model));
+    body.entry("max_tokens".to_string()).or_insert(json!(4096));
+    body.insert("stream".to_string(), json!(true));
+    if let Some(system) = system {
+        body.insert("system".to_string(), json!(system));
+    }
+    body.insert("messages".to_string(), Value::Array(anthropic_messages));
+    normalize_anthropic_reasoning(&mut body, provider);
+    let tools = anthropic_tool_definitions(mcp_tools);
+    if !tools.is_empty() {
+        body.insert("tools".to_string(), Value::Array(tools));
+    }
+    Ok(body)
+}
+
+fn anthropic_messages_from_internal(
+    messages: &[Value],
+) -> Result<(Option<String>, Vec<Value>), String> {
+    let mut system = None;
+    let mut result = Vec::new();
+
+    for msg in messages {
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or_default();
+        match role {
+            "system" => {
+                if system.is_none() {
+                    system = msg.get("content").and_then(Value::as_str).map(String::from);
+                }
+            }
+            "user" => {
+                let content =
+                    anthropic_user_content(msg.get("content").cloned().unwrap_or(json!("")))?;
+                push_anthropic_message(&mut result, "user", content);
+            }
+            "assistant" => {
+                let mut content_parts = Vec::new();
+                if let Some(text) = msg.get("content").and_then(Value::as_str) {
+                    if !text.trim().is_empty() {
+                        content_parts.push(json!({ "type": "text", "text": text }));
+                    }
+                } else if let Some(parts) = msg.get("content").and_then(Value::as_array) {
+                    content_parts.extend(parts.iter().cloned());
+                }
+                // Convert tool_calls to Anthropic tool_use content blocks
+                if let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) {
+                    for call in tool_calls {
+                        let id = call.get("id").and_then(Value::as_str).unwrap_or("");
+                        let name = call
+                            .pointer("/function/name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let arguments = call
+                            .pointer("/function/arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or("{}");
+                        let input: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
+                        if content_parts.iter().any(|part| {
+                            part.get("type").and_then(Value::as_str) == Some("tool_use")
+                                && part.get("id").and_then(Value::as_str) == Some(id)
+                        }) {
+                            continue;
+                        }
+                        content_parts.push(json!({
+                            "type": "tool_use",
+                            "id": id,
+                            "name": name,
+                            "input": input
+                        }));
+                    }
+                }
+                if !content_parts.is_empty() {
+                    push_anthropic_message(&mut result, "assistant", Value::Array(content_parts));
+                }
+            }
+            "tool" => {
+                let tool_call_id = msg
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
+                if !tool_call_id.is_empty() {
+                    let mut block = json!({
+                        "type": "tool_result",
+                        "tool_use_id": tool_call_id,
+                        "content": content
+                    });
+                    if msg.get("is_error").and_then(Value::as_bool) == Some(true) {
+                        block["is_error"] = json!(true);
+                    }
+                    push_anthropic_message(&mut result, "user", json!([block]));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok((system, result))
+}
+
+fn anthropic_user_content(content: Value) -> Result<Value, String> {
+    let Value::Array(parts) = content else {
+        return Ok(content);
+    };
+    parts
+        .into_iter()
+        .map(|part| {
+            if part.get("type").and_then(Value::as_str) != Some("image_url") {
+                return Ok(part);
+            }
+            let url = part
+                .pointer("/image_url/url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Anthropic 图片缺少 image_url.url。".to_string())?;
+            let (media_type, data) = parse_anthropic_image_data_url(url)?;
+            Ok(json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": data
+                }
+            }))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Value::Array)
+}
+
+fn parse_anthropic_image_data_url(url: &str) -> Result<(&str, &str), String> {
+    let value = url
+        .strip_prefix("data:")
+        .ok_or_else(|| "Anthropic 图片必须使用 base64 data URL。".to_string())?;
+    let (metadata, data) = value
+        .split_once(',')
+        .ok_or_else(|| "Anthropic 图片 data URL 格式无效。".to_string())?;
+    let (media_type, encoding) = metadata
+        .split_once(';')
+        .ok_or_else(|| "Anthropic 图片 data URL 缺少 base64 编码声明。".to_string())?;
+    if encoding != "base64" || data.is_empty() {
+        return Err("Anthropic 图片 data URL 必须包含非空 base64 数据。".to_string());
+    }
+    if !matches!(
+        media_type,
+        "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+    ) {
+        return Err(format!(
+            "Anthropic 不支持图片类型 {media_type}，仅支持 JPEG、PNG、GIF 和 WebP。"
+        ));
+    }
+    if data.len() % 4 != 0
+        || !data
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+    {
+        return Err("Anthropic 图片包含无效 base64 数据。".to_string());
+    }
+    Ok((media_type, data))
+}
+
+fn push_anthropic_message(messages: &mut Vec<Value>, role: &str, content: Value) {
+    if let Some(last) = messages
+        .last_mut()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some(role))
+    {
+        let mut incoming = anthropic_content_parts(content);
+        if let Some(existing) = last.get_mut("content").and_then(Value::as_array_mut) {
+            existing.append(&mut incoming);
+            return;
+        }
+        let existing = last.get("content").cloned().unwrap_or(json!(""));
+        let mut merged = anthropic_content_parts(existing);
+        merged.append(&mut incoming);
+        last["content"] = Value::Array(merged);
+        return;
+    }
+    messages.push(json!({ "role": role, "content": content }));
+}
+
+fn anthropic_content_parts(content: Value) -> Vec<Value> {
+    match content {
+        Value::Array(parts) => parts,
+        Value::String(text) => vec![json!({ "type": "text", "text": text })],
+        other => vec![other],
+    }
+}
+
+fn anthropic_tool_definitions(mcp_tools: &[McpToolDefinition]) -> Vec<Value> {
+    native_tool_definitions_for(mcp_tools)
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            let function = tool.get("function")?;
+            Some(json!({
+                "name": function.get("name")?,
+                "description": function.get("description")?,
+                "input_schema": function.get("parameters")?
+            }))
+        })
+        .collect()
 }
 
 fn anthropic_request_body(
@@ -742,7 +1065,9 @@ fn normalize_anthropic_reasoning(body: &mut Map<String, Value>, provider: &Provi
         return;
     }
     if effort == ReasoningEffort::None {
-        body.insert("thinking".to_string(), json!({ "type": "disabled" }));
+        if !anthropic_disallows_disabled_thinking(&provider.model) {
+            body.insert("thinking".to_string(), json!({ "type": "disabled" }));
+        }
         return;
     }
 
@@ -762,16 +1087,6 @@ fn normalize_anthropic_reasoning(body: &mut Map<String, Value>, provider: &Provi
             "budget_tokens": anthropic_budget_tokens(body, effort)
         }),
     );
-}
-
-fn anthropic_uses_adaptive_effort(model: &str) -> bool {
-    let id = model.to_ascii_lowercase();
-    [
-        "opus-4.7", "opus-4-7", "opus-4.8", "opus-4-8", "sonnet-5", "5-sonnet", "fable-5",
-        "mythos-5",
-    ]
-    .iter()
-    .any(|needle| id.contains(needle))
 }
 
 fn anthropic_budget_tokens(body: &Map<String, Value>, effort: ReasoningEffort) -> u64 {
@@ -803,6 +1118,59 @@ fn anthropic_budget_tokens(body: &Map<String, Value>, effort: ReasoningEffort) -
         limit
     };
     desired.min(cap).max(1)
+}
+
+fn parse_anthropic_turn(payload: &Value) -> Result<ModelTurn, String> {
+    let content = payload
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "AI 服务返回缺少 content 数组。".to_string())?;
+    let mut message = String::new();
+    let mut summary = String::new();
+    let mut tool_calls = Vec::new();
+    for block in content {
+        match block
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
+            "text" => {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    message.push_str(text);
+                }
+            }
+            "thinking" => {
+                if let Some(thinking) = block.get("thinking").and_then(Value::as_str) {
+                    summary.push_str(thinking);
+                }
+            }
+            "tool_use" => {
+                let name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !name.trim().is_empty() {
+                    tool_calls.push(ToolCallRequest {
+                        tool_call_id: block
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string),
+                        name: normalize_tool_name(name),
+                        input: block.get("input").cloned().unwrap_or_else(|| json!({})),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    let done = tool_calls.is_empty();
+    Ok(ModelTurn {
+        summary: (!summary.trim().is_empty()).then_some(summary),
+        message: (!message.trim().is_empty()).then_some(message),
+        tool_calls,
+        done,
+        native_assistant_content: Some(content.clone()),
+    })
 }
 
 fn parse_openai_compatible_turn(payload: &Value) -> Result<Option<ModelTurn>, String> {
@@ -840,6 +1208,7 @@ fn parse_openai_compatible_turn(payload: &Value) -> Result<Option<ModelTurn>, St
         message: content,
         done: tool_calls.is_empty(),
         tool_calls,
+        native_assistant_content: None,
     }))
 }
 
@@ -897,6 +1266,7 @@ fn parse_openai_responses_turn(payload: &Value) -> Result<Option<ModelTurn>, Str
         message: content,
         done: tool_calls.is_empty(),
         tool_calls,
+        native_assistant_content: None,
     }))
 }
 
@@ -1312,14 +1682,6 @@ async fn send_json_request(
         .await
         .map_err(|error| format!("无法读取 AI 服务响应: {error}"))?;
 
-    let payload: Value = serde_json::from_str(&text).map_err(|error| {
-        if status == StatusCode::OK {
-            format!("AI 服务返回了无效 JSON: {error}\n\n原始响应:\n{text}")
-        } else {
-            format!("AI 服务请求失败，HTTP 状态码 {status}:\n{text}")
-        }
-    })?;
-
     if !status.is_success() {
         return Err(provider_error_message(
             status,
@@ -1329,6 +1691,9 @@ async fn send_json_request(
             config_path,
         ));
     }
+
+    let payload: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("AI 服务返回了无效 JSON: {error}\n\n原始响应:\n{text}"))?;
 
     Ok(payload)
 }
@@ -1356,8 +1721,14 @@ fn provider_error_message(
                 text.trim()
             }
         });
+    let error_type = payload
+        .as_ref()
+        .and_then(|payload| payload.pointer("/error/type"))
+        .and_then(Value::as_str)
+        .unwrap_or("provider_error");
     format!(
-        "AI 服务请求失败: {message}\n请求端点: {endpoint}\n鉴权方式: {auth_summary}\n配置文件: {config_path}"
+        "AI 服务请求失败: {error_type}: {message}\nHTTP 状态码: {}\n请求端点: {endpoint}\n鉴权方式: {auth_summary}\n配置文件: {config_path}",
+        status.as_u16()
     )
 }
 
@@ -1401,6 +1772,7 @@ fn to_anthropic_messages_endpoint(base_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_provider(kind: ProviderKind, tool_mode: ToolMode) -> ProviderRequestConfig {
         ProviderRequestConfig {
@@ -1909,5 +2281,199 @@ mod tests {
         assert_eq!(turn.message.as_deref(), Some("完成了。"));
         assert!(turn.tool_calls.is_empty());
         assert!(turn.done);
+    }
+
+    #[test]
+    fn parses_anthropic_text_thinking_and_tool_use() {
+        let payload = json!({
+            "stop_reason": "tool_use",
+            "content": [
+                {"type":"thinking","thinking":"consider","signature":"sig"},
+                {"type":"text","text":"Checking "},
+                {"type":"text","text":"now."},
+                {"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"a.rs"}}
+            ]
+        });
+        let turn = parse_anthropic_turn(&payload).expect("anthropic turn");
+        assert_eq!(turn.summary.as_deref(), Some("consider"));
+        assert_eq!(turn.message.as_deref(), Some("Checking now."));
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "read");
+        assert!(!turn.done);
+        assert_eq!(
+            turn.native_assistant_content,
+            payload["content"].as_array().cloned()
+        );
+    }
+
+    #[test]
+    fn anthropic_messages_preserve_native_thinking_and_group_tool_results() {
+        let messages = vec![
+            json!({"role":"assistant","content":[
+                {"type":"thinking","thinking":"plan","signature":"sig"},
+                {"type":"tool_use","id":"toolu_1","name":"read","input":{"path":"a.rs"}},
+                {"type":"tool_use","id":"toolu_2","name":"search","input":{"query":"x"}}
+            ]}),
+            json!({"role":"tool","tool_call_id":"toolu_1","content":"ok","is_error":false}),
+            json!({"role":"tool","tool_call_id":"toolu_2","content":"failed","is_error":true}),
+        ];
+        let (_, converted) = anthropic_messages_from_internal(&messages).expect("messages");
+        assert_eq!(converted.len(), 2);
+        assert_eq!(converted[0]["content"][0]["signature"], json!("sig"));
+        assert_eq!(converted[1]["role"], json!("user"));
+        assert_eq!(converted[1]["content"].as_array().map(Vec::len), Some(2));
+        assert_eq!(converted[1]["content"][1]["is_error"], json!(true));
+    }
+
+    #[test]
+    fn anthropic_converts_supported_image_data_urls() {
+        for media_type in ["image/jpeg", "image/png", "image/gif", "image/webp"] {
+            let messages = vec![json!({
+                "role":"user",
+                "content":[{"type":"image_url","image_url":{"url":format!("data:{media_type};base64,YWJjZA==")}}]
+            })];
+            let (_, converted) = anthropic_messages_from_internal(&messages).expect("image");
+            assert_eq!(converted[0]["content"][0]["type"], json!("image"));
+            assert_eq!(
+                converted[0]["content"][0]["source"]["media_type"],
+                json!(media_type)
+            );
+            assert_eq!(
+                converted[0]["content"][0]["source"]["data"],
+                json!("YWJjZA==")
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_rejects_invalid_or_unsupported_images() {
+        for url in [
+            "https://example.com/image.png",
+            "data:image/png;base64,",
+            "data:image/png;base64,not-base64",
+            "data:image/bmp;base64,YWJjZA==",
+            "data:image/avif;base64,YWJjZA==",
+        ] {
+            let messages = vec![json!({
+                "role":"user",
+                "content":[{"type":"image_url","image_url":{"url":url}}]
+            })];
+            assert!(
+                anthropic_messages_from_internal(&messages).is_err(),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_tool_definitions_share_the_native_catalog() {
+        let tools = anthropic_tool_definitions(&[]);
+        assert!(tools.iter().any(|tool| tool["name"] == json!("grep")));
+        assert!(tools.iter().all(|tool| tool.get("input_schema").is_some()));
+    }
+
+    #[test]
+    fn provider_error_keeps_status_and_anthropic_type() {
+        let error = provider_error_message(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"type":"invalid_request_error","message":"bad input"}}"#,
+            "https://example.com/v1/messages",
+            "x-api-key: <redacted>",
+            "odot.json",
+        );
+        assert!(error.contains("invalid_request_error"));
+        assert!(error.contains("HTTP 状态码: 400"));
+        assert!(!error.contains("test-key"));
+    }
+
+    #[test]
+    fn anthropic_stream_sends_required_headers_and_body() {
+        tauri::async_runtime::block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener");
+            let address = listener.local_addr().expect("address");
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let expected_len = loop {
+                    let read = socket.read(&mut buffer).await.expect("read request");
+                    assert!(read > 0, "request ended before headers");
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(header_end) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let content_len = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        break header_end + 4 + content_len;
+                    }
+                };
+                while request.len() < expected_len {
+                    let read = socket.read(&mut buffer).await.expect("read body");
+                    assert!(read > 0, "request ended before body");
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let sse = concat!(
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n"
+            );
+                let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                sse.len()
+            );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("response");
+                String::from_utf8(request).expect("utf8 request")
+            });
+
+            let mut provider = test_provider(ProviderKind::Anthropic, ToolMode::Native);
+            provider.base_url = Some(format!("http://{address}/v1"));
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("test client");
+            let turn = stream_anthropic_compatible_with_client(
+                &client,
+                &provider,
+                &[
+                    json!({"role":"system","content":"system"}),
+                    json!({"role":"user","content":"hello"}),
+                ],
+                &[],
+                |_| Ok(()),
+            )
+            .await
+            .expect("stream turn");
+            assert_eq!(turn.message.as_deref(), Some("ok"));
+            assert!(turn.done);
+
+            let request = server.await.expect("server task");
+            let (headers, body) = request.split_once("\r\n\r\n").expect("http request");
+            let lower_headers = headers.to_ascii_lowercase();
+            assert!(headers.starts_with("POST /v1/messages HTTP/1.1"));
+            assert!(lower_headers.contains("anthropic-version: 2023-06-01"));
+            assert!(lower_headers.contains("x-api-key: test-key"));
+            assert!(lower_headers.contains("content-type: application/json"));
+            let body: Value = serde_json::from_str(body).expect("request json");
+            assert_eq!(body["stream"], json!(true));
+            assert_eq!(body["system"], json!("system"));
+            assert_eq!(body["messages"][0]["content"], json!("hello"));
+            assert!(body["tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty()));
+        });
     }
 }

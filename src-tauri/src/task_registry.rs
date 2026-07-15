@@ -33,7 +33,12 @@ pub fn register(job_id: &str) {
 pub fn cancel(job_id: &str) -> bool {
     RUNNING_TASKS
         .get()
-        .map(|tasks| tasks.lock().unwrap_or_else(|error| error.into_inner()).remove(job_id))
+        .map(|tasks| {
+            tasks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(job_id)
+        })
         .unwrap_or(false)
 }
 
@@ -51,7 +56,10 @@ pub fn is_registered(job_id: &str) -> bool {
 
 pub fn unregister(job_id: &str) {
     if let Some(tasks) = RUNNING_TASKS.get() {
-        tasks.lock().unwrap_or_else(|error| error.into_inner()).remove(job_id);
+        tasks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(job_id);
     }
 }
 

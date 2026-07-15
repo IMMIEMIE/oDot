@@ -14,6 +14,35 @@ pub enum ProviderKind {
     AnthropicCompatible,
 }
 
+pub fn anthropic_uses_adaptive_effort(model: &str) -> bool {
+    let id = model.to_ascii_lowercase();
+    [
+        "opus-4.6",
+        "opus-4-6",
+        "opus-4.7",
+        "opus-4-7",
+        "opus-4.8",
+        "opus-4-8",
+        "sonnet-4.6",
+        "sonnet-4-6",
+        "sonnet-5",
+        "5-sonnet",
+        "fable-5",
+        "mythos-preview",
+        "mythos_preview",
+        "mythos-5",
+    ]
+    .iter()
+    .any(|needle| id.contains(needle))
+}
+
+pub fn anthropic_disallows_disabled_thinking(model: &str) -> bool {
+    let id = model.to_ascii_lowercase();
+    ["fable-5", "mythos-5"]
+        .iter()
+        .any(|needle| id.contains(needle))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolMode {
@@ -663,4 +692,10 @@ pub struct ModelTurn {
     pub tool_calls: Vec<ToolCallRequest>,
     #[serde(default)]
     pub done: bool,
+    #[serde(
+        default,
+        rename = "nativeAssistantContent",
+        alias = "native_assistant_content"
+    )]
+    pub native_assistant_content: Option<Vec<Value>>,
 }

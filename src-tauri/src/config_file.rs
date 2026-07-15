@@ -1,9 +1,10 @@
 use crate::{
     storage,
     types::{
-        McpConfigFileResponse, McpServerConfig, ModelReasoningEffortsResponse, OpenAiApiMode,
-        ProviderConfigFileResponse, ProviderInput, ProviderKind, ProviderPricing, ProviderRecord,
-        ProviderRequestConfig, ReasoningEffort, ToolMode,
+        anthropic_uses_adaptive_effort, McpConfigFileResponse, McpServerConfig,
+        ModelReasoningEffortsResponse, OpenAiApiMode, ProviderConfigFileResponse, ProviderInput,
+        ProviderKind, ProviderPricing, ProviderRecord, ProviderRequestConfig, ReasoningEffort,
+        ToolMode,
     },
 };
 use serde::Deserialize;
@@ -1091,8 +1092,10 @@ fn infer_provider_kind(provider_id: &str, npm: &str) -> ProviderKind {
 fn resolve_tool_mode(kind: &ProviderKind, requested: ToolMode) -> ToolMode {
     match requested {
         ToolMode::Auto => match kind {
-            ProviderKind::OpenAi | ProviderKind::OpenAiCompatible => ToolMode::Native,
-            ProviderKind::Anthropic | ProviderKind::AnthropicCompatible => ToolMode::Json,
+            ProviderKind::OpenAi
+            | ProviderKind::OpenAiCompatible
+            | ProviderKind::Anthropic
+            | ProviderKind::AnthropicCompatible => ToolMode::Native,
         },
         other => other,
     }
@@ -1263,7 +1266,7 @@ fn inferred_reasoning_efforts(
     let id = format!("{provider_id} {npm} {api} {model_id} {api_id}").to_ascii_lowercase();
 
     let efforts = if id.contains("anthropic") || id.contains("claude") {
-        if is_anthropic_adaptive_model(&id) {
+        if anthropic_uses_adaptive_effort(&id) {
             vec![
                 ReasoningEffort::Low,
                 ReasoningEffort::Medium,
@@ -1302,15 +1305,6 @@ fn inferred_reasoning_efforts(
     };
 
     ordered_reasoning_efforts(efforts).unwrap_or_default()
-}
-
-fn is_anthropic_adaptive_model(id: &str) -> bool {
-    [
-        "opus-4.7", "opus-4-7", "opus-4.8", "opus-4-8", "sonnet-5", "5-sonnet", "fable-5",
-        "mythos-5",
-    ]
-    .iter()
-    .any(|needle| id.contains(needle))
 }
 
 fn is_openai_reasoning_model(id: &str) -> bool {
@@ -1864,5 +1858,30 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn anthropic_auto_defaults_to_native_but_explicit_modes_win() {
+        for kind in [ProviderKind::Anthropic, ProviderKind::AnthropicCompatible] {
+            assert_eq!(resolve_tool_mode(&kind, ToolMode::Auto), ToolMode::Native);
+            assert_eq!(resolve_tool_mode(&kind, ToolMode::Json), ToolMode::Json);
+            assert_eq!(resolve_tool_mode(&kind, ToolMode::Native), ToolMode::Native);
+        }
+    }
+
+    #[test]
+    fn current_anthropic_models_use_shared_adaptive_capabilities() {
+        for model in [
+            "claude-opus-4.6",
+            "claude-opus-4.8",
+            "claude-sonnet-4.6",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-mythos-preview",
+            "claude-mythos-5",
+        ] {
+            assert!(anthropic_uses_adaptive_effort(model), "{model}");
+        }
+        assert!(!anthropic_uses_adaptive_effort("claude-3-7-sonnet-latest"));
     }
 }

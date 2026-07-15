@@ -48,6 +48,388 @@ struct ToolAccumulator {
     emitted: bool,
 }
 
+/// Anthropic Messages API streaming parser.
+///
+/// Handles SSE events: message_start, content_block_start, content_block_delta,
+/// content_block_stop, message_delta, message_stop, ping, error.
+#[derive(Debug, Default)]
+pub struct AnthropicStreamParser {
+    buffer: String,
+    /// Current content blocks keyed by index.
+    blocks: HashMap<usize, AnthropicContentBlock>,
+    finish_reason: Option<String>,
+    usage: Option<Value>,
+    finished: bool,
+}
+
+#[derive(Debug, Default)]
+struct AnthropicContentBlock {
+    block_type: String,
+    /// Accumulated text for "text" or "thinking" blocks.
+    text: String,
+    /// Cryptographic signature for a thinking block. It must be replayed unchanged.
+    signature: Option<String>,
+    /// Opaque payload for a redacted_thinking block.
+    redacted_data: Option<String>,
+    /// Tool call fields for "tool_use" blocks.
+    tool_id: Option<String>,
+    tool_name: Option<String>,
+    tool_input_json: String,
+    emitted: bool,
+}
+
+impl AnthropicStreamParser {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push_str(&mut self, chunk: &str) -> Result<Vec<LlmStreamEvent>, String> {
+        self.buffer.push_str(chunk);
+        let mut events = Vec::new();
+        while let Some((block, consumed)) = next_sse_block(&self.buffer) {
+            self.buffer.drain(..consumed);
+            if let Some(data) = sse_data(&block) {
+                events.extend(self.parse_data(&data)?);
+            }
+        }
+        Ok(events)
+    }
+
+    pub fn finish(&mut self) -> Result<Vec<LlmStreamEvent>, String> {
+        let mut events = Vec::new();
+        if !self.buffer.trim().is_empty() {
+            let block = std::mem::take(&mut self.buffer);
+            if let Some(data) = sse_data(&block) {
+                events.extend(self.parse_data(&data)?);
+            }
+        }
+        events.extend(self.emit_terminal_events());
+        events.extend(self.emit_finish());
+        Ok(events)
+    }
+
+    pub fn native_content(&self) -> Vec<Value> {
+        let mut blocks = self.blocks.iter().collect::<Vec<_>>();
+        blocks.sort_by_key(|(index, _)| **index);
+        blocks
+            .into_iter()
+            .filter_map(|(_, block)| block.native_value())
+            .collect()
+    }
+
+    fn parse_data(&mut self, data: &str) -> Result<Vec<LlmStreamEvent>, String> {
+        let trimmed = data.trim();
+        if trimmed.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let payload: Value = serde_json::from_str(trimmed)
+            .map_err(|error| format!("AI 服务返回了无效 streaming JSON: {error}"))?;
+        self.parse_payload(&payload)
+    }
+
+    fn parse_payload(&mut self, payload: &Value) -> Result<Vec<LlmStreamEvent>, String> {
+        let mut events = Vec::new();
+        let event_type = payload
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        match event_type {
+            "message_start" => {
+                if let Some(message) = payload.get("message") {
+                    if let Some(usage) = message.get("usage") {
+                        merge_usage(&mut self.usage, usage);
+                    }
+                }
+            }
+            "content_block_start" => {
+                let index = payload.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                if let Some(block) = payload.get("content_block") {
+                    let block_type = block
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("text")
+                        .to_string();
+                    let entry = self.blocks.entry(index).or_default();
+                    entry.block_type = block_type.clone();
+                    match block_type.as_str() {
+                        "text" => {
+                            if let Some(text) = block.get("text").and_then(Value::as_str) {
+                                entry.text.push_str(text);
+                            }
+                        }
+                        "thinking" => {
+                            if let Some(thinking) = block.get("thinking").and_then(Value::as_str) {
+                                entry.text.push_str(thinking);
+                            }
+                            entry.signature = block
+                                .get("signature")
+                                .and_then(Value::as_str)
+                                .map(String::from);
+                        }
+                        "redacted_thinking" => {
+                            entry.redacted_data =
+                                block.get("data").and_then(Value::as_str).map(String::from);
+                        }
+                        "tool_use" => {
+                            entry.tool_id =
+                                block.get("id").and_then(Value::as_str).map(String::from);
+                            entry.tool_name =
+                                block.get("name").and_then(Value::as_str).map(String::from);
+                            if let Some(input) = block.get("input").filter(|value| {
+                                !value.is_null()
+                                    && value.as_object().map(|map| !map.is_empty()).unwrap_or(true)
+                            }) {
+                                entry.tool_input_json = input.to_string();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "content_block_delta" => {
+                let index = payload.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                if let Some(delta) = payload.get("delta") {
+                    let delta_type = delta
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+
+                    match delta_type {
+                        "text_delta" => {
+                            if let Some(text) = delta
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .filter(|t| !t.is_empty())
+                            {
+                                let entry = self.blocks.entry(index).or_default();
+                                entry.text.push_str(text);
+                                events.push(LlmStreamEvent::TextDelta {
+                                    part_id: format!("text-{index}"),
+                                    text: text.to_string(),
+                                });
+                            }
+                        }
+                        "thinking_delta" => {
+                            if let Some(text) = delta
+                                .get("thinking")
+                                .and_then(Value::as_str)
+                                .filter(|t| !t.is_empty())
+                            {
+                                self.blocks.entry(index).or_default().text.push_str(text);
+                                events.push(LlmStreamEvent::ReasoningDelta {
+                                    part_id: format!("reasoning-{index}"),
+                                    text: text.to_string(),
+                                });
+                            }
+                        }
+                        "signature_delta" => {
+                            if let Some(signature) = delta.get("signature").and_then(Value::as_str)
+                            {
+                                self.blocks.entry(index).or_default().signature =
+                                    Some(signature.to_string());
+                            }
+                        }
+                        "input_json_delta" => {
+                            if let Some(json_str) = delta
+                                .get("partial_json")
+                                .and_then(Value::as_str)
+                                .filter(|t| !t.is_empty())
+                            {
+                                let entry = self.blocks.entry(index).or_default();
+                                entry.tool_input_json.push_str(json_str);
+                                let tool_call_id = entry
+                                    .tool_id
+                                    .clone()
+                                    .unwrap_or_else(|| format!("tool-{index}"));
+                                events.push(LlmStreamEvent::ToolInputDelta {
+                                    tool_call_id,
+                                    name: entry.tool_name.clone(),
+                                    text: json_str.to_string(),
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "content_block_stop" => {
+                let index = payload.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let should_emit = self
+                    .blocks
+                    .get(&index)
+                    .map(|b| b.block_type == "tool_use" && !b.emitted)
+                    .unwrap_or(false);
+                if should_emit {
+                    if let Some(block) = self.blocks.get_mut(&index) {
+                        block.emitted = true;
+                    }
+                    if let Some(block) = self.blocks.get(&index) {
+                        events.push(self.emit_tool_call(index, block));
+                    }
+                }
+            }
+            "message_delta" => {
+                if let Some(delta) = payload.get("delta") {
+                    if let Some(reason) = delta.get("stop_reason").and_then(Value::as_str) {
+                        self.finish_reason = Some(reason.to_string());
+                    }
+                }
+                if let Some(usage) = payload.get("usage") {
+                    merge_usage(&mut self.usage, usage);
+                }
+                events.extend(self.emit_terminal_events());
+                events.extend(self.emit_finish());
+            }
+            "message_stop" => {
+                events.extend(self.emit_terminal_events());
+                events.extend(self.emit_finish());
+            }
+            "ping" => {}
+            "error" => {
+                let error_type = payload
+                    .pointer("/error/type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown_error");
+                let message = payload
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Anthropic streaming 请求失败");
+                return Err(format!(
+                    "AI 服务 streaming 请求失败: {error_type}: {message}"
+                ));
+            }
+            _ => {}
+        }
+
+        Ok(events)
+    }
+
+    fn emit_tool_call(&self, index: usize, block: &AnthropicContentBlock) -> LlmStreamEvent {
+        let original_name = block.tool_name.clone().unwrap_or_default();
+        let call_id = block
+            .tool_id
+            .clone()
+            .unwrap_or_else(|| format!("tool-{index}"));
+        let input_json = if block.tool_input_json.trim().is_empty() {
+            "{}"
+        } else {
+            &block.tool_input_json
+        };
+        let (name, input) = match serde_json::from_str(input_json) {
+            Ok(value) => (normalize_tool_name(&original_name), value),
+            Err(error) => (
+                "invalid".to_string(),
+                serde_json::json!({
+                    "tool": original_name,
+                    "error": error.to_string(),
+                    "arguments": block.tool_input_json,
+                    "callId": call_id
+                }),
+            ),
+        };
+        LlmStreamEvent::ToolCall(ToolCallRequest {
+            tool_call_id: Some(call_id),
+            name,
+            input,
+        })
+    }
+
+    fn emit_terminal_events(&mut self) -> Vec<LlmStreamEvent> {
+        let mut events = Vec::new();
+        for block in self.blocks.values_mut() {
+            if block.block_type == "tool_use" && !block.emitted {
+                block.emitted = true;
+                // Can't call emit_tool_call here because we need index;
+                // Use tool_id as fallback.
+                let original_name = block.tool_name.clone().unwrap_or_default();
+                let call_id = block.tool_id.clone().unwrap_or_default();
+                let input_json = if block.tool_input_json.trim().is_empty() {
+                    "{}"
+                } else {
+                    &block.tool_input_json
+                };
+                let (name, input) = match serde_json::from_str(input_json) {
+                    Ok(value) => (normalize_tool_name(&original_name), value),
+                    Err(error) => (
+                        "invalid".to_string(),
+                        serde_json::json!({
+                            "tool": original_name,
+                            "error": error.to_string(),
+                            "arguments": block.tool_input_json,
+                            "callId": call_id
+                        }),
+                    ),
+                };
+                events.push(LlmStreamEvent::ToolCall(ToolCallRequest {
+                    tool_call_id: Some(call_id),
+                    name,
+                    input,
+                }));
+            }
+        }
+        events
+    }
+
+    fn emit_finish(&mut self) -> Vec<LlmStreamEvent> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
+        vec![LlmStreamEvent::Finish {
+            finish_reason: self.finish_reason.clone(),
+            usage: self.usage.clone(),
+        }]
+    }
+}
+
+impl AnthropicContentBlock {
+    fn native_value(&self) -> Option<Value> {
+        match self.block_type.as_str() {
+            "text" => Some(serde_json::json!({ "type": "text", "text": self.text })),
+            "thinking" => {
+                let mut block = serde_json::Map::new();
+                block.insert("type".to_string(), serde_json::json!("thinking"));
+                block.insert("thinking".to_string(), serde_json::json!(self.text));
+                if let Some(signature) = &self.signature {
+                    block.insert("signature".to_string(), serde_json::json!(signature));
+                }
+                Some(Value::Object(block))
+            }
+            "redacted_thinking" => Some(serde_json::json!({
+                "type": "redacted_thinking",
+                "data": self.redacted_data.as_deref().unwrap_or_default()
+            })),
+            "tool_use" => {
+                let input = serde_json::from_str(&self.tool_input_json)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                Some(serde_json::json!({
+                    "type": "tool_use",
+                    "id": self.tool_id.as_deref().unwrap_or_default(),
+                    "name": self.tool_name.as_deref().unwrap_or_default(),
+                    "input": input
+                }))
+            }
+            _ => None,
+        }
+    }
+}
+
+fn merge_usage(target: &mut Option<Value>, update: &Value) {
+    match (
+        target.as_mut().and_then(Value::as_object_mut),
+        update.as_object(),
+    ) {
+        (Some(target), Some(update)) => {
+            for (key, value) in update {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+        _ => *target = Some(update.clone()),
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct OpenAiResponsesStreamParser {
     buffer: String,
@@ -752,6 +1134,7 @@ pub fn normalize_tool_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn parse(input: &str) -> Vec<LlmStreamEvent> {
         let mut parser = OpenAiChatStreamParser::new();
@@ -974,6 +1357,169 @@ mod tests {
     #[test]
     fn responses_parser_rejects_invalid_json() {
         let mut parser = OpenAiResponsesStreamParser::new();
+        let error = parser
+            .push_str("data: {not-json}\n\n")
+            .expect_err("invalid json");
+
+        assert!(error.contains("无效 streaming JSON"));
+    }
+
+    // ── Anthropic streaming parser tests ──
+
+    fn anthropic_parse(input: &str) -> Vec<LlmStreamEvent> {
+        let mut parser = AnthropicStreamParser::new();
+        parser.push_str(input).expect("stream events")
+    }
+
+    #[test]
+    fn anthropic_parses_text_delta() {
+        let events = anthropic_parse(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n\
+             data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n\
+             data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n\
+             data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}\n\n\
+             data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+             data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n\
+             data: {\"type\":\"message_stop\"}\n\n",
+        );
+
+        assert!(events.contains(&LlmStreamEvent::TextDelta {
+            part_id: "text-0".to_string(),
+            text: "hello".to_string()
+        }));
+        assert!(events.contains(&LlmStreamEvent::TextDelta {
+            part_id: "text-0".to_string(),
+            text: " world".to_string()
+        }));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            LlmStreamEvent::Finish {
+                finish_reason: Some(reason),
+                usage: Some(_)
+            } if reason == "end_turn"
+        )));
+    }
+
+    #[test]
+    fn anthropic_parses_tool_use() {
+        let events = anthropic_parse(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_123\",\"name\":\"read\"}}\n\n\
+             data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\"}}\n\n\
+             data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"src/main.rs\\\"}\"}}\n\n\
+             data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        );
+
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                LlmStreamEvent::ToolInputDelta {
+                    tool_call_id,
+                    name: Some(name),
+                    text,
+                } if tool_call_id == "toolu_123" && name == "read" && text.contains("path")
+            )
+        }));
+        let tool = events
+            .iter()
+            .find_map(|event| match event {
+                LlmStreamEvent::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .expect("tool call");
+        assert_eq!(tool.tool_call_id.as_deref(), Some("toolu_123"));
+        assert_eq!(tool.name, "read");
+        assert_eq!(tool.input["path"], "src/main.rs");
+    }
+
+    #[test]
+    fn anthropic_parses_thinking_delta() {
+        let events = anthropic_parse(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\"}}\n\n\
+             data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"let me think...\"}}\n\n",
+        );
+
+        assert!(events.contains(&LlmStreamEvent::ReasoningDelta {
+            part_id: "reasoning-0".to_string(),
+            text: "let me think...".to_string()
+        }));
+    }
+
+    #[test]
+    fn anthropic_preserves_signed_and_redacted_thinking_blocks() {
+        let mut parser = AnthropicStreamParser::new();
+        parser
+            .push_str(
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+                 data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"plan\"}}\n\n\
+                 data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"signed-value\"}}\n\n\
+                 data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+                 data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque\"}}\n\n\
+                 data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            )
+            .expect("stream events");
+
+        assert_eq!(
+            parser.native_content(),
+            vec![
+                json!({"type":"thinking","thinking":"plan","signature":"signed-value"}),
+                json!({"type":"redacted_thinking","data":"opaque"})
+            ]
+        );
+    }
+
+    #[test]
+    fn anthropic_merges_start_and_delta_usage() {
+        let mut parser = AnthropicStreamParser::new();
+        let events = parser
+            .push_str(
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":3}}}\n\n\
+                 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+            )
+            .expect("stream events");
+        let usage = events.iter().find_map(|event| match event {
+            LlmStreamEvent::Finish { usage, .. } => usage.as_ref(),
+            _ => None,
+        });
+        assert_eq!(
+            usage.and_then(|value| value.get("input_tokens")),
+            Some(&json!(10))
+        );
+        assert_eq!(
+            usage.and_then(|value| value.get("output_tokens")),
+            Some(&json!(5))
+        );
+        assert_eq!(
+            usage.and_then(|value| value.get("cache_read_input_tokens")),
+            Some(&json!(3))
+        );
+    }
+
+    #[test]
+    fn anthropic_empty_tool_input_is_an_empty_object() {
+        let events = anthropic_parse(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"skill_list\",\"input\":{}}}\n\n\
+             data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        );
+        let call = events.iter().find_map(|event| match event {
+            LlmStreamEvent::ToolCall(call) => Some(call),
+            _ => None,
+        });
+        assert_eq!(call.map(|call| &call.input), Some(&json!({})));
+    }
+
+    #[test]
+    fn anthropic_handles_error_event() {
+        let mut parser = AnthropicStreamParser::new();
+        let error = parser
+            .push_str("data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n")
+            .expect_err("error event");
+
+        assert!(error.contains("Overloaded"));
+    }
+
+    #[test]
+    fn anthropic_rejects_invalid_json() {
+        let mut parser = AnthropicStreamParser::new();
         let error = parser
             .push_str("data: {not-json}\n\n")
             .expect_err("invalid json");

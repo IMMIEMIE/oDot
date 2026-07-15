@@ -4,6 +4,7 @@ export type ProviderConfig = {
   apiKey?: string;
   model: string;
   temperature?: number;
+  type?: "openai" | "anthropic" | "openai-compatible" | "anthropic-compatible";
 };
 
 export type ProjectFile = {

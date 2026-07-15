@@ -51,6 +51,7 @@ import { useTranslation } from "react-i18next";
 import type {
   ChangeEvent,
   ClipboardEvent as ReactClipboardEvent,
+  CSSProperties,
   FormEvent,
   MouseEvent as ReactMouseEvent,
   PointerEvent,
@@ -536,6 +537,10 @@ export function App() {
     0,
     composerReasoningSliderOptions.indexOf(composerReasoningSelectedValue)
   );
+  const composerReasoningProgress =
+    composerReasoningSliderOptions.length <= 1
+      ? 0
+      : (composerReasoningSelectedIndex / (composerReasoningSliderOptions.length - 1)) * 100;
   const allowedAttachmentKinds = useMemo(
     () => attachmentKindsFromConfig(configContent, selectedProviderId),
     [configContent, selectedProviderId]
@@ -3003,14 +3008,9 @@ export function App() {
     >
       <header className="windowChrome">
         <div
-          className="windowChromeDrag"
-          data-tauri-drag-region
-          aria-hidden="true"
-        />
-        <div
-          className="windowControls"
+          className="windowUtilityControls"
           role="group"
-          aria-label="Window actions"
+          aria-label="Application actions"
         >
           <button
             className="windowControlButton floatEntry"
@@ -3030,6 +3030,17 @@ export function App() {
           >
             <Settings size={16} />
           </button>
+        </div>
+        <div
+          className="windowChromeDrag"
+          data-tauri-drag-region
+          aria-hidden="true"
+        />
+        <div
+          className="windowControls"
+          role="group"
+          aria-label="Window actions"
+        >
           <button
             className="windowControlButton"
             type="button"
@@ -3285,27 +3296,58 @@ export function App() {
                               <BrainCircuit size={14} />
                               {t("settings.reasoningEffort")}
                             </span>
-                            <strong>
-                              {reasoningEffortLabel(composerReasoningSelectedValue, t)}
+                            <strong aria-live="polite">
+                              {isComposerReasoningLoading
+                                ? t("settings.reasoningLoading")
+                                : isComposerReasoningSaving
+                                  ? t("settings.reasoningSaving")
+                                  : composerReasoningEfforts.length === 0
+                                    ? t("settings.reasoningUnavailable")
+                                    : reasoningEffortLabel(composerReasoningSelectedValue, t)}
                             </strong>
                           </div>
-                          <input
-                            type="range"
-                            min={0}
-                            max={Math.max(0, composerReasoningSliderOptions.length - 1)}
-                            step={1}
-                            value={composerReasoningSelectedIndex}
-                            disabled={
-                              isComposerReasoningLoading ||
-                              composerReasoningSliderOptions.length <= 1
+                          <div
+                            className="composerReasoningRangeShell"
+                            style={
+                              {
+                                "--reasoning-progress": `${composerReasoningProgress}%`
+                              } as CSSProperties
                             }
-                            onChange={(event) => {
-                              const nextIndex = Number(event.target.value);
-                              changeComposerReasoningEffort(
-                                composerReasoningSliderOptions[nextIndex] ?? ""
-                              );
-                            }}
-                          />
+                          >
+                            <div
+                              className="composerReasoningTrackDots"
+                              aria-hidden="true"
+                              style={{
+                                gridTemplateColumns: `repeat(${composerReasoningSliderOptions.length}, minmax(0, 1fr))`
+                              }}
+                            >
+                              {composerReasoningSliderOptions.map((item, index) => (
+                                <span
+                                  key={item || "auto"}
+                                  className={index <= composerReasoningSelectedIndex ? "active" : ""}
+                                />
+                              ))}
+                            </div>
+                            <input
+                              className="composerReasoningRange"
+                              type="range"
+                              min={0}
+                              max={Math.max(0, composerReasoningSliderOptions.length - 1)}
+                              step={1}
+                              value={composerReasoningSelectedIndex}
+                              aria-label={t("settings.reasoningEffort")}
+                              disabled={
+                                isComposerReasoningLoading ||
+                                composerReasoningSliderOptions.length <= 1
+                              }
+                              onChange={(event) => {
+                                const nextIndex = Number(event.target.value);
+                                changeComposerReasoningEffort(
+                                  composerReasoningSliderOptions[nextIndex] ?? ""
+                                );
+                              }}
+                            />
+                          </div>
                           <div
                             className="composerReasoningTicks"
                             style={{
@@ -3318,15 +3360,6 @@ export function App() {
                               </span>
                             ))}
                           </div>
-                          <small className="composerReasoningStatus" aria-live="polite">
-                            {isComposerReasoningLoading
-                              ? t("settings.reasoningLoading")
-                              : isComposerReasoningSaving
-                                ? t("settings.reasoningSaving")
-                                : composerReasoningEfforts.length === 0
-                                  ? t("settings.reasoningUnavailable")
-                                  : "\u00a0"}
-                          </small>
                         </div>
                       </div>
                     )}

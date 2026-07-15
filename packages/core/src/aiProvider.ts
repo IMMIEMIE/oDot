@@ -18,10 +18,26 @@ type ChatCompletionResponse = {
   };
 };
 
+type AnthropicResponse = {
+  content?: Array<{
+    type?: string;
+    text?: string;
+  }>;
+  error?: {
+    message?: string;
+    type?: string;
+  };
+};
+
 type ModelChangeResponse = {
   summary?: unknown;
   files?: unknown;
 };
+
+function isAnthropicProvider(provider: ProviderConfig): boolean {
+  const t = provider.type ?? "";
+  return t === "anthropic" || t === "anthropic-compatible";
+}
 
 export async function proposeCodeChange(
   provider: ProviderConfig,
@@ -32,7 +48,9 @@ export async function proposeCodeChange(
     throw new Error("Select at least one file before asking for a code change.");
   }
 
-  const rawResponse = await callOpenAICompatibleProvider(provider, instruction, files);
+  const rawResponse = isAnthropicProvider(provider)
+    ? await callAnthropicCompatibleProvider(provider, instruction, files)
+    : await callOpenAICompatibleProvider(provider, instruction, files);
   const parsed = parseModelChangeResponse(rawResponse);
   const changes = buildProposedChanges(files, parsed);
 
@@ -100,6 +118,73 @@ async function callOpenAICompatibleProvider(
   }
 
   const content = payload?.choices?.[0]?.message?.content;
+  if (!content) {
+    throw new Error("Provider returned an empty response.");
+  }
+
+  return content;
+}
+
+async function callAnthropicCompatibleProvider(
+  provider: ProviderConfig,
+  instruction: string,
+  files: FileContent[]
+): Promise<string> {
+  const baseUrl = (provider.baseUrl ?? "https://api.anthropic.com/v1")
+    .trim()
+    .replace(/\/+$/, "");
+  const endpoint = baseUrl.endsWith("/messages")
+    ? baseUrl
+    : `${baseUrl}/messages`;
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "anthropic-version": "2023-06-01"
+  };
+
+  if (provider.apiKey?.trim()) {
+    headers["x-api-key"] = provider.apiKey.trim();
+  }
+
+  const systemPrompt = [
+    "You are oDot, a local code editing engine.",
+    "Return strict JSON only. Do not wrap it in Markdown.",
+    'The JSON schema is: {"summary":"short change summary","files":[{"path":"relative/path","updatedContent":"complete updated file contents"}]}',
+    "Only edit files included by the user. Preserve unrelated code and formatting."
+  ].join("\n");
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: provider.model,
+      temperature: provider.temperature ?? 0.2,
+      max_tokens: 4096,
+      system: systemPrompt,
+      messages: [
+        {
+          role: "user",
+          content: buildUserPrompt(instruction, files)
+        }
+      ]
+    })
+  });
+
+  const payload = (await response.json().catch(() => null)) as
+    | AnthropicResponse
+    | null;
+
+  if (!response.ok) {
+    const message =
+      payload?.error?.message ?? response.statusText;
+    throw new Error(`Provider request failed: ${message}`);
+  }
+
+  const content = payload?.content
+    ?.filter((block) => block.type === "text")
+    .map((block) => block.text ?? "")
+    .join("");
+
   if (!content) {
     throw new Error("Provider returned an empty response.");
   }

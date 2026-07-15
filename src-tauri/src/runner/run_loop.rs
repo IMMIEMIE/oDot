@@ -178,17 +178,6 @@ where
             plan_path.as_deref(),
         );
         let turn = if native_runtime {
-            storage::append_event(
-                conn,
-                &session.id,
-                "llm.stream.started",
-                json!({
-                    "step": step_index,
-                    "runtime": "rust-openai-chat",
-                    "providerId": provider_id_str,
-                    "model": &request_config.model
-                }),
-            )?;
             let stream_system_prompt = build_stream_system_prompt(
                 conn,
                 session,
@@ -207,20 +196,51 @@ where
                 &request_config,
                 &skill_config.sources,
             )?;
-            match stream_openai_compatible_with_retry(
+            let is_anthropic = matches!(
+                request_config.kind,
+                ProviderKind::Anthropic | ProviderKind::AnthropicCompatible
+            );
+            storage::append_event(
                 conn,
                 &session.id,
-                step_index,
-                &session.provider_id,
-                &request_config,
-                &mcp_tools,
-                &stream_system_prompt,
-                &current_prompt,
-                &messages,
-                &skill_config.sources,
-            )
-            .await
-            {
+                "llm.stream.started",
+                json!({
+                    "step": step_index,
+                    "runtime": if is_anthropic { "rust-anthropic" } else { "rust-openai-chat" },
+                    "providerId": provider_id_str,
+                    "model": &request_config.model
+                }),
+            )?;
+            let stream_result = if is_anthropic {
+                stream_anthropic_compatible_with_retry(
+                    conn,
+                    &session.id,
+                    step_index,
+                    &session.provider_id,
+                    &request_config,
+                    &mcp_tools,
+                    &stream_system_prompt,
+                    &current_prompt,
+                    &messages,
+                    &skill_config.sources,
+                )
+                .await
+            } else {
+                stream_openai_compatible_with_retry(
+                    conn,
+                    &session.id,
+                    step_index,
+                    &session.provider_id,
+                    &request_config,
+                    &mcp_tools,
+                    &stream_system_prompt,
+                    &current_prompt,
+                    &messages,
+                    &skill_config.sources,
+                )
+                .await
+            };
+            match stream_result {
                 Ok(value) => value,
                 Err(error) => {
                     if stop_if_cancelled(conn, &session.id, step_index)? {
@@ -341,6 +361,23 @@ where
                 }),
             )?;
             break;
+        }
+
+        if let Some(content) = provider::supports_native_tools(&request_config)
+            .then_some(turn.native_assistant_content.as_ref())
+            .flatten()
+            .filter(|content| !content.is_empty())
+        {
+            storage::append_event(
+                conn,
+                &session.id,
+                "assistant.native_content",
+                json!({
+                    "step": step_index,
+                    "providerKind": request_config.kind.as_str(),
+                    "content": content
+                }),
+            )?;
         }
 
         if let Some(summary) = turn
@@ -704,6 +741,7 @@ mod tests {
                 input: json!({ "command": command }),
             }],
             done: false,
+            native_assistant_content: None,
         }
     }
 

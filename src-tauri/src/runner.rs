@@ -5,7 +5,7 @@ use crate::{
     mcp, provider, session_coordinator, skills, storage, task_registry, tools,
     types::{
         AgentMode, ContextSummaryRecord, EventRecord, McpToolDefinition, ModelTurn,
-        PromptAttachment, PromptAttachmentKind, PromptSessionInput, ProviderPricing,
+        PromptAttachment, PromptAttachmentKind, PromptSessionInput, ProviderKind, ProviderPricing,
         ProviderRequestConfig, RecoverBackgroundTaskAction, RecoverBackgroundTaskInput,
         SessionEventsResponse, SessionInputDelivery, SubmitPromptInput, ToolCallRequest, ToolMode,
     },
@@ -751,8 +751,100 @@ async fn stream_openai_compatible_with_retry(
                     attempt,
                     emitted_stream_event,
                 );
-                let can_retry = ((info.retryable && !emitted_stream_event) || can_compact_retry)
-                    && attempt < LLM_RETRY_ATTEMPTS;
+                let can_retry = should_retry_stream_error(
+                    &info,
+                    attempt,
+                    emitted_stream_event,
+                    can_compact_retry,
+                );
+                storage::append_event(
+                    conn,
+                    session_id,
+                    "llm.retry",
+                    json!({
+                        "step": step_index,
+                        "attempt": attempt,
+                        "maxAttempts": LLM_RETRY_ATTEMPTS,
+                        "retrying": can_retry,
+                        "compacting": can_compact_retry,
+                        "error": info.to_value()
+                    }),
+                )?;
+                if !can_retry {
+                    return Err(error);
+                }
+                last_error = Some(error);
+                if can_compact_retry {
+                    let _ = compact_session_with_provider(conn, session_id, request_config).await?;
+                    messages = build_stream_messages(
+                        conn,
+                        session_id,
+                        stream_system_prompt,
+                        current_prompt,
+                        request_config,
+                        skill_sources,
+                    )?;
+                    compacted_after_context_overflow = true;
+                    continue;
+                }
+                let delay_ms = LLM_RETRY_BASE_DELAY_MS * 2_u64.pow((attempt - 1) as u32);
+                sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(crate::i18n::ai_request_failed))
+}
+
+async fn stream_anthropic_compatible_with_retry(
+    conn: &Connection,
+    session_id: &str,
+    step_index: usize,
+    provider_record_id: &str,
+    request_config: &ProviderRequestConfig,
+    mcp_tools: &[McpToolDefinition],
+    stream_system_prompt: &str,
+    current_prompt: &str,
+    initial_messages: &[Value],
+    skill_sources: &[String],
+) -> Result<ModelTurn, String> {
+    let mut last_error = None;
+    let mut compacted_after_context_overflow = false;
+    let mut messages = initial_messages.to_vec();
+    for attempt in 1..=LLM_RETRY_ATTEMPTS {
+        let mut sink = StreamEventSink::new(
+            conn,
+            session_id,
+            step_index,
+            provider_record_id,
+            request_config,
+        );
+        let mut emitted_stream_event = false;
+        let result =
+            provider::stream_anthropic_compatible(request_config, &messages, mcp_tools, |event| {
+                emitted_stream_event = true;
+                sink.handle(event)
+            })
+            .await;
+
+        match result {
+            Ok(turn) => {
+                sink.flush_all()?;
+                return Ok(turn);
+            }
+            Err(error) => {
+                let info = AppErrorInfo::from_message(&error);
+                let can_compact_retry = should_compact_retry_after_context_error(
+                    &info,
+                    compacted_after_context_overflow,
+                    attempt,
+                    emitted_stream_event,
+                );
+                let can_retry = should_retry_stream_error(
+                    &info,
+                    attempt,
+                    emitted_stream_event,
+                    can_compact_retry,
+                );
                 storage::append_event(
                     conn,
                     session_id,
@@ -801,6 +893,15 @@ fn should_compact_retry_after_context_error(
         && !already_compacted
         && !emitted_stream_event
         && attempt < LLM_RETRY_ATTEMPTS
+}
+
+fn should_retry_stream_error(
+    info: &AppErrorInfo,
+    attempt: usize,
+    emitted_stream_event: bool,
+    can_compact_retry: bool,
+) -> bool {
+    ((info.retryable && !emitted_stream_event) || can_compact_retry) && attempt < LLM_RETRY_ATTEMPTS
 }
 
 fn record_agent_failure(
@@ -1248,6 +1349,8 @@ fn build_stream_messages(
     })];
     let mut included_current_prompt = false;
     let mut emitted_tool_call_ids = Vec::new();
+    let mut native_steps = HashSet::new();
+    let mut native_tool_call_ids = HashSet::new();
 
     for event in &events {
         match event.event_type.as_str() {
@@ -1274,6 +1377,15 @@ fn build_stream_messages(
                 }));
             }
             "assistant.message" => {
+                if event
+                    .data
+                    .get("step")
+                    .and_then(Value::as_u64)
+                    .map(|step| native_steps.contains(&step))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 let text = event.data.get("text").and_then(Value::as_str).unwrap_or("");
                 let sanitized = sanitize_assistant_content(text);
                 let text = sanitized.text.as_str();
@@ -1285,10 +1397,38 @@ fn build_stream_messages(
                     "content": text
                 }));
             }
+            "assistant.native_content" => {
+                let Some(content) = event.data.get("content").and_then(Value::as_array) else {
+                    continue;
+                };
+                if event.data.get("providerKind").and_then(Value::as_str)
+                    != Some(provider.kind.as_str())
+                {
+                    continue;
+                }
+                if let Some(step) = event.data.get("step").and_then(Value::as_u64) {
+                    native_steps.insert(step);
+                }
+                for block in content {
+                    if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                        if let Some(id) = block.get("id").and_then(Value::as_str) {
+                            native_tool_call_ids.insert(id.to_string());
+                            emitted_tool_call_ids.push(id.to_string());
+                        }
+                    }
+                }
+                messages.push(json!({
+                    "role": "assistant",
+                    "content": content
+                }));
+            }
             "tool.called" => {
                 if let Some((tool_call_id, message)) =
                     assistant_tool_call_message(event, &tool_call_ids)
                 {
+                    if native_tool_call_ids.contains(&tool_call_id) {
+                        continue;
+                    }
                     emitted_tool_call_ids.push(tool_call_id);
                     messages.push(message);
                 }
@@ -1320,7 +1460,8 @@ fn build_stream_messages(
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": tool_call_id,
-                    "content": tool_result_content(event)
+                    "content": tool_result_content(event),
+                    "is_error": event.event_type != "tool.success"
                 }));
             }
             _ => {}
@@ -2345,6 +2486,102 @@ mod tests {
             task_optional_string(&json!({}), &["task_id", "taskId"]),
             None
         );
+    }
+
+    #[test]
+    fn stream_history_prefers_native_anthropic_content_without_duplicates() {
+        let conn = Connection::open_in_memory().unwrap();
+        storage::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, project_root, mode, provider_id, title, status, shell_mode, created_at, updated_at)
+             VALUES ('s1', 'E:/oDot', 'agent', 'anthropic/model', 'Test', 'active', 'auto', '1', '1')",
+            [],
+        )
+        .unwrap();
+        storage::append_event(&conn, "s1", "prompt.submitted", json!({"prompt":"go"})).unwrap();
+        storage::append_event(
+            &conn,
+            "s1",
+            "assistant.native_content",
+            json!({
+                "step": 1,
+                "providerKind": "anthropic",
+                "content": [
+                    {"type":"thinking","thinking":"plan","signature":"sig"},
+                    {"type":"text","text":"checking"},
+                    {"type":"tool_use","id":"toolu_1","name":"read","input":{"path":"a.rs"}}
+                ]
+            }),
+        )
+        .unwrap();
+        storage::append_event(
+            &conn,
+            "s1",
+            "assistant.message",
+            json!({"step":1,"text":"checking"}),
+        )
+        .unwrap();
+        let called = storage::append_event(
+            &conn,
+            "s1",
+            "tool.called",
+            json!({"toolCallId":"toolu_1","name":"read","input":{"path":"a.rs"}}),
+        )
+        .unwrap();
+        storage::append_event(
+            &conn,
+            "s1",
+            "tool.success",
+            json!({"toolCallEventId":called.id,"result":{"content":"ok"}}),
+        )
+        .unwrap();
+        let provider = ProviderRequestConfig {
+            kind: ProviderKind::Anthropic,
+            tool_mode: ToolMode::Native,
+            openai_api_mode: crate::types::OpenAiApiMode::ChatCompletions,
+            base_url: None,
+            model: "claude-sonnet-4-6".to_string(),
+            api_key: "test".to_string(),
+            headers: HashMap::new(),
+            body: serde_json::Map::new(),
+            context_token_limit: None,
+            input_token_limit: None,
+            output_token_limit: None,
+            pricing: ProviderPricing::default(),
+            config_path: "odot.json".to_string(),
+        };
+
+        let messages = build_stream_messages(&conn, "s1", "system", "go", &provider, &[])
+            .expect("stream messages");
+        let assistants = messages
+            .iter()
+            .filter(|message| message["role"] == json!("assistant"))
+            .collect::<Vec<_>>();
+        assert_eq!(assistants.len(), 1);
+        assert_eq!(assistants[0]["content"][0]["signature"], json!("sig"));
+        assert!(assistants[0].get("tool_calls").is_none());
+        let tools = messages
+            .iter()
+            .filter(|message| message["role"] == json!("tool"))
+            .collect::<Vec<_>>();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["tool_call_id"], json!("toolu_1"));
+        assert_eq!(tools[0]["is_error"], json!(false));
+    }
+
+    #[test]
+    fn stream_retry_stops_after_visible_output_except_for_compaction() {
+        let retryable =
+            AppErrorInfo::from_message("AI 服务请求失败: overloaded_error\nHTTP 状态码: 529");
+        assert!(should_retry_stream_error(&retryable, 1, false, false));
+        assert!(!should_retry_stream_error(&retryable, 1, true, false));
+        assert!(should_retry_stream_error(&retryable, 1, true, true));
+        assert!(!should_retry_stream_error(
+            &retryable,
+            LLM_RETRY_ATTEMPTS,
+            false,
+            false
+        ));
     }
 
     #[test]

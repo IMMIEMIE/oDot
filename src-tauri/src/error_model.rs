@@ -72,6 +72,7 @@ impl AppErrorInfo {
 
 pub fn classify_error(message: &str) -> ErrorKind {
     let lower = message.to_ascii_lowercase();
+    let status = http_status_code(message);
     if lower.contains("cancel") || message.contains("停止") || message.contains("中断") {
         return ErrorKind::Cancelled;
     }
@@ -87,12 +88,18 @@ pub fn classify_error(message: &str) -> ErrorKind {
     {
         return ErrorKind::Authentication;
     }
-    if lower.contains("429")
+    if matches!(status, Some(429 | 529))
+        || lower.contains("429")
         || lower.contains("rate limit")
         || lower.contains("too many requests")
+        || lower.contains("529")
+        || lower.contains("overloaded")
         || message.contains("限流")
     {
         return ErrorKind::RateLimit;
+    }
+    if lower.contains("invalid_request_error") || matches!(status, Some(400 | 404 | 422)) {
+        return ErrorKind::Provider;
     }
     if lower.contains("context")
         || lower.contains("token")
@@ -140,18 +147,30 @@ pub fn classify_error(message: &str) -> ErrorKind {
 }
 
 fn is_retryable(kind: ErrorKind, message: &str) -> bool {
-    if matches!(
-        kind,
-        ErrorKind::Network | ErrorKind::RateLimit | ErrorKind::Provider
-    ) {
+    if matches!(kind, ErrorKind::Network | ErrorKind::RateLimit) {
         return true;
     }
     let lower = message.to_ascii_lowercase();
-    lower.contains("502")
-        || lower.contains("503")
-        || lower.contains("504")
-        || lower.contains("temporar")
-        || lower.contains("try again")
+    let status = http_status_code(message);
+    if lower.contains("invalid_request_error") || matches!(status, Some(400 | 404 | 422)) {
+        return false;
+    }
+    matches!(kind, ErrorKind::Provider)
+        && (matches!(status, Some(408) | Some(500..=599))
+            || lower.contains("temporar")
+            || lower.contains("try again"))
+}
+
+fn http_status_code(message: &str) -> Option<u16> {
+    let lower = message.to_ascii_lowercase();
+    ["http 状态码:", "http 状态码 "].iter().find_map(|marker| {
+        let tail = lower.split_once(marker)?.1.trim_start();
+        let digits = tail
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .collect::<String>();
+        digits.parse().ok()
+    })
 }
 
 fn is_recoverable(kind: ErrorKind) -> bool {
@@ -251,11 +270,51 @@ mod tests {
 鉴权方式: Authorization: Bearer <redacted>",
         );
         assert_eq!(info.kind, ErrorKind::Provider);
-        assert!(info.retryable);
-        assert!(info.suggested_actions.iter().any(|item| item.id == "retry"));
+        assert!(!info.retryable);
         assert!(!info
             .suggested_actions
             .iter()
             .any(|item| item.id == "settings"));
+    }
+
+    #[test]
+    fn classifies_anthropic_529_overloaded_as_retryable() {
+        let info = AppErrorInfo::from_message(
+            "AI 服务 streaming 请求失败: overloaded_error\n\
+             HTTP 状态码 529",
+        );
+        assert_eq!(info.kind, ErrorKind::RateLimit);
+        assert!(info.retryable);
+        assert!(info.suggested_actions.iter().any(|item| item.id == "retry"));
+    }
+
+    #[test]
+    fn classifies_anthropic_rate_limit_as_retryable() {
+        let info = AppErrorInfo::from_message(
+            "AI 服务请求失败: rate_limit_error\n\
+             HTTP 状态码 429",
+        );
+        assert_eq!(info.kind, ErrorKind::RateLimit);
+        assert!(info.retryable);
+    }
+
+    #[test]
+    fn anthropic_invalid_request_is_not_retryable_or_compactable() {
+        let info = AppErrorInfo::from_message(
+            "AI 服务请求失败: invalid_request_error: max_tokens is invalid\n\
+             HTTP 状态码: 400",
+        );
+        assert_eq!(info.kind, ErrorKind::Provider);
+        assert!(!info.retryable);
+    }
+
+    #[test]
+    fn transient_provider_statuses_are_retryable() {
+        for status in [408, 500, 502, 503, 504] {
+            let info = AppErrorInfo::from_message(format!(
+                "AI 服务请求失败: provider_error\nHTTP 状态码: {status}"
+            ));
+            assert!(info.retryable, "status {status}");
+        }
     }
 }
