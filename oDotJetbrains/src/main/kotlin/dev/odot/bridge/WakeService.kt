@@ -3,9 +3,9 @@ package dev.odot.bridge
 import com.intellij.ide.BrowserUtil
 import java.net.URI
 
-/** Best-effort relaunch of the oDot desktop app when the bridge is unreachable.
- *  Mirrors wakeODot() in the VS Code extension: 15s throttle, honors the manual-shutdown
- *  marker, spawns the discovered executable, and falls back to the odot:// URI once. */
+/** Best-effort relaunch of the oDot desktop app for an explicit user action.
+ *  Background heartbeat and workspace events are observation-only so they cannot
+ *  resurrect an app that was closed or force-killed. */
 object WakeService {
     private const val RETRY_MS = 15_000L
 
@@ -14,12 +14,12 @@ object WakeService {
 
     @Synchronized
     fun wake(reason: String) {
+        if (!WorkspaceModel.canRestartAfterManualShutdown(reason)) return
         val now = System.currentTimeMillis()
         if (now - lastAttempt < RETRY_MS) return
         lastAttempt = now
 
         val manuallyStopped = BridgeDiscovery.manualShutdownExists()
-        if (manuallyStopped && !WorkspaceModel.canRestartAfterManualShutdown(reason)) return
         if (manuallyStopped) BridgeDiscovery.clearManualShutdown()
 
         val exe = runCatching { BridgeDiscovery.read().executablePath }.getOrNull()

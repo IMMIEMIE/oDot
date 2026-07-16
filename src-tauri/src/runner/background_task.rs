@@ -120,6 +120,9 @@ pub(super) async fn execute_agent_turn_tools(
     let mut has_pending = false;
     let mut task_runs = Vec::new();
     for call in calls {
+        if storage::is_session_cancel_requested(conn, &session.id)? {
+            break;
+        }
         if normalize_tool_name(&call.name) == "task" {
             let task = start_task_tool(app, conn, session, call)?;
             if task_background(&call.input) {
@@ -140,6 +143,10 @@ pub(super) async fn execute_agent_turn_tools(
         }
     }
     for task in task_runs {
+        if storage::is_session_cancel_requested(conn, &session.id)? {
+            cancel_foreground_task(conn, &session.id, &task)?;
+            continue;
+        }
         let outcome = finish_task_tool(app, conn, &session.id, task).await?;
         has_pending |= outcome.pending;
     }
@@ -262,7 +269,25 @@ async fn finish_task_tool(
     let (promote_sender, promote_receiver) = tokio::sync::oneshot::channel();
     task_registry::register_promotable(&child_id, promote_sender);
 
-    let result = match select(&mut task.handle, promote_receiver).await {
+    let mut interrupt = session_coordinator::subscribe_interrupt(parent_session_id);
+    if storage::is_session_cancel_requested(conn, parent_session_id)? {
+        task_registry::unregister_promotable(&child_id);
+        cancel_foreground_task(conn, parent_session_id, &task)?;
+        return Ok(tools::ToolOutcome { pending: false });
+    }
+    let selected = tokio::select! {
+        result = select(&mut task.handle, promote_receiver) => Some(result),
+        changed = interrupt.changed() => {
+            let _ = changed;
+            None
+        }
+    };
+    let Some(selected) = selected else {
+        task_registry::unregister_promotable(&child_id);
+        cancel_foreground_task(conn, parent_session_id, &task)?;
+        return Ok(tools::ToolOutcome { pending: false });
+    };
+    let result = match selected {
         Either::Left((result, _)) => {
             task_registry::unregister_promotable(&child_id);
             result.map_err(|error| error.to_string())?
@@ -340,6 +365,44 @@ async fn finish_task_tool(
     }
 
     Ok(tools::ToolOutcome { pending: false })
+}
+
+fn cancel_foreground_task(
+    conn: &Connection,
+    parent_session_id: &str,
+    task: &TaskRun,
+) -> Result<(), String> {
+    let _ = super::cancel_session(conn, &task.child_id)?;
+    storage::append_event(
+        conn,
+        parent_session_id,
+        "tool.failed",
+        json!({
+            "toolCallEventId": task.called_event_id,
+            "name": task.call_name,
+            "result": {
+                "taskId": task.child_id,
+                "sessionId": task.child_id,
+                "description": task.description,
+                "subagentType": task.subagent_type,
+                "status": BackgroundTaskStatus::Cancelled.as_str(),
+                "error": "Task stopped with the parent agent."
+            }
+        }),
+    )?;
+    storage::append_event(
+        conn,
+        parent_session_id,
+        "task.failed",
+        json!({
+            "toolCallEventId": task.called_event_id,
+            "sessionId": task.child_id,
+            "description": task.description,
+            "cancelled": true,
+            "error": "Task stopped with the parent agent."
+        }),
+    )?;
+    Ok(())
 }
 
 fn mark_task_tool_background_started(

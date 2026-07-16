@@ -26,10 +26,5 @@ export function shouldWakeODot(error: unknown) {
 }
 
 export function canRestartAfterManualShutdown(reason: string) {
-  return (
-    reason === "activation" ||
-    reason === "folder-change" ||
-    reason === "editor-change" ||
-    reason === "explicit"
-  );
+  return reason === "explicit";
 }

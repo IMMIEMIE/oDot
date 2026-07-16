@@ -22,7 +22,12 @@ class CheckBridgeAction : AnAction() {
                     OdotNotifications.error(project, "Bridge responded with HTTP ${response.statusCode}: ${response.body}")
                 }
             } catch (ex: Exception) {
-                OdotNotifications.error(project, "oDot: ${ex.message ?: ex.toString()}")
+                if (WorkspaceModel.shouldWake(ex)) {
+                    WakeService.wake("explicit")
+                    OdotNotifications.info(project, "oDot is starting. Check the Bridge again when it opens.")
+                } else {
+                    OdotNotifications.error(project, "oDot: ${ex.message ?: ex.toString()}")
+                }
             }
         }
     }

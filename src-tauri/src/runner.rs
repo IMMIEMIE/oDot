@@ -20,6 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::AppHandle;
+use tokio::sync::watch;
 use tokio::time::sleep;
 
 mod background_task;
@@ -59,6 +60,7 @@ Rules:
 - No quotes, Markdown, explanations, or punctuation-only filler.
 - Focus on the user's main task or topic.
 - Never mention that you are generating a title."#;
+const INTERRUPTED_REQUEST: &str = "Agent request interrupted by user.";
 pub async fn submit_prompt(
     app: &AppHandle,
     conn: &Connection,
@@ -89,6 +91,16 @@ pub async fn prompt_session(
     let admitted = input_queue::admit(conn, input)?;
 
     if admitted.input.resume {
+        if session_coordinator::activity_status(&admitted.input.session_id)
+            == session_coordinator::RunActivityStatus::Running
+        {
+            schedule_session_wake(
+                app.clone(),
+                admitted.input.session_id.clone(),
+                Some(admitted.event.seq),
+            );
+            return storage::session_events_response(conn, &admitted.input.session_id);
+        }
         wake_session(
             app,
             conn,
@@ -99,6 +111,13 @@ pub async fn prompt_session(
     } else {
         storage::session_events_response(conn, &admitted.input.session_id)
     }
+}
+
+fn schedule_session_wake(app: AppHandle, session_id: String, seq: Option<i64>) {
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        let conn = storage::open_db(&app)?;
+        tauri::async_runtime::block_on(wake_session(&app, &conn, session_id, seq))
+    });
 }
 
 async fn wake_session(
@@ -589,7 +608,17 @@ async fn maybe_generate_session_title(
         "Generate a title for this user message:\n\n<user_message>\n{}\n</user_message>",
         truncate(prompt, 2_000)
     );
-    let completion = provider::complete(&title_config, TITLE_SYSTEM_PROMPT, &user_prompt).await?;
+    let mut interrupt = session_coordinator::subscribe_interrupt(&session.id);
+    if storage::is_session_cancel_requested(conn, &session.id)? {
+        return Ok(());
+    }
+    let completion = tokio::select! {
+        result = provider::complete(&title_config, TITLE_SYSTEM_PROMPT, &user_prompt) => result?,
+        changed = interrupt.changed() => {
+            let _ = changed;
+            return Ok(());
+        }
+    };
     let title = clean_generated_title(&completion.raw_response);
     if title.is_empty() || title == session.title {
         return Ok(());
@@ -653,12 +682,20 @@ async fn complete_with_retry(
     current_prompt: &str,
     initial_user_prompt: &str,
     skill_sources: &[String],
+    interrupt: &mut watch::Receiver<u64>,
 ) -> Result<provider::ProviderCompletion, String> {
     let mut last_error = None;
     let mut compacted_after_context_overflow = false;
     let mut user_prompt = initial_user_prompt.to_string();
     for attempt in 1..=LLM_RETRY_ATTEMPTS {
-        match provider::complete(request_config, system_prompt, &user_prompt).await {
+        let result = tokio::select! {
+            result = provider::complete(request_config, system_prompt, &user_prompt) => result,
+            changed = interrupt.changed() => {
+                let _ = changed;
+                return Err(INTERRUPTED_REQUEST.to_string());
+            }
+        };
+        match result {
             Ok(value) => return Ok(value),
             Err(error) => {
                 let info = AppErrorInfo::from_message(&error);
@@ -700,7 +737,9 @@ async fn complete_with_retry(
                     continue;
                 }
                 let delay_ms = LLM_RETRY_BASE_DELAY_MS * 2_u64.pow((attempt - 1) as u32);
-                sleep(Duration::from_millis(delay_ms)).await;
+                if wait_for_retry_or_interrupt(interrupt, delay_ms).await {
+                    return Err(INTERRUPTED_REQUEST.to_string());
+                }
             }
         }
     }
@@ -718,6 +757,7 @@ async fn stream_openai_compatible_with_retry(
     current_prompt: &str,
     initial_messages: &[Value],
     skill_sources: &[String],
+    interrupt: &mut watch::Receiver<u64>,
 ) -> Result<ModelTurn, String> {
     let mut last_error = None;
     let mut compacted_after_context_overflow = false;
@@ -731,12 +771,18 @@ async fn stream_openai_compatible_with_retry(
             request_config,
         );
         let mut emitted_stream_event = false;
-        let result =
+        let stream =
             provider::stream_openai_compatible(request_config, &messages, mcp_tools, |event| {
                 emitted_stream_event = true;
                 sink.handle(event)
-            })
-            .await;
+            });
+        let result = tokio::select! {
+            result = stream => result,
+            changed = interrupt.changed() => {
+                let _ = changed;
+                return Err(INTERRUPTED_REQUEST.to_string());
+            }
+        };
 
         match result {
             Ok(turn) => {
@@ -788,7 +834,9 @@ async fn stream_openai_compatible_with_retry(
                     continue;
                 }
                 let delay_ms = LLM_RETRY_BASE_DELAY_MS * 2_u64.pow((attempt - 1) as u32);
-                sleep(Duration::from_millis(delay_ms)).await;
+                if wait_for_retry_or_interrupt(interrupt, delay_ms).await {
+                    return Err(INTERRUPTED_REQUEST.to_string());
+                }
             }
         }
     }
@@ -806,6 +854,7 @@ async fn stream_anthropic_compatible_with_retry(
     current_prompt: &str,
     initial_messages: &[Value],
     skill_sources: &[String],
+    interrupt: &mut watch::Receiver<u64>,
 ) -> Result<ModelTurn, String> {
     let mut last_error = None;
     let mut compacted_after_context_overflow = false;
@@ -819,12 +868,18 @@ async fn stream_anthropic_compatible_with_retry(
             request_config,
         );
         let mut emitted_stream_event = false;
-        let result =
+        let stream =
             provider::stream_anthropic_compatible(request_config, &messages, mcp_tools, |event| {
                 emitted_stream_event = true;
                 sink.handle(event)
-            })
-            .await;
+            });
+        let result = tokio::select! {
+            result = stream => result,
+            changed = interrupt.changed() => {
+                let _ = changed;
+                return Err(INTERRUPTED_REQUEST.to_string());
+            }
+        };
 
         match result {
             Ok(turn) => {
@@ -876,11 +931,23 @@ async fn stream_anthropic_compatible_with_retry(
                     continue;
                 }
                 let delay_ms = LLM_RETRY_BASE_DELAY_MS * 2_u64.pow((attempt - 1) as u32);
-                sleep(Duration::from_millis(delay_ms)).await;
+                if wait_for_retry_or_interrupt(interrupt, delay_ms).await {
+                    return Err(INTERRUPTED_REQUEST.to_string());
+                }
             }
         }
     }
     Err(last_error.unwrap_or_else(crate::i18n::ai_request_failed))
+}
+
+async fn wait_for_retry_or_interrupt(interrupt: &mut watch::Receiver<u64>, delay_ms: u64) -> bool {
+    tokio::select! {
+        _ = sleep(Duration::from_millis(delay_ms)) => false,
+        changed = interrupt.changed() => {
+            let _ = changed;
+            true
+        }
+    }
 }
 
 fn should_compact_retry_after_context_error(

@@ -24,9 +24,9 @@ class WorkspaceModelTest {
 
     @Test
     fun restartReasons() {
-        assertTrue(WorkspaceModel.canRestartAfterManualShutdown("activation"))
-        assertTrue(WorkspaceModel.canRestartAfterManualShutdown("editor-change"))
-        assertTrue(WorkspaceModel.canRestartAfterManualShutdown("folder-change"))
+        assertFalse(WorkspaceModel.canRestartAfterManualShutdown("activation"))
+        assertFalse(WorkspaceModel.canRestartAfterManualShutdown("editor-change"))
+        assertFalse(WorkspaceModel.canRestartAfterManualShutdown("folder-change"))
         assertTrue(WorkspaceModel.canRestartAfterManualShutdown("explicit"))
         assertFalse(WorkspaceModel.canRestartAfterManualShutdown("heartbeat"))
         assertFalse(WorkspaceModel.canRestartAfterManualShutdown("focus"))

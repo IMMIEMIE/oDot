@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>oDot 首页重设计原型</title>
+<style>
+  :root {
+    --bg: #eef5f0; --surface: #ffffff; --surface-soft: #f7faf8; --surface-elevated: #fcfdfb;
+    --surface-strong: #e7eee9; --border: #d7e3dc; --border-strong: #acc0b6;
+    --ink: #1d2b2b; --text-soft: #3b534f; --muted: #6f817a;
+    --accent: #d34947; --accent-hover: #bb3f3e; --accent-contrast: #fff;
+    --accent-soft: rgba(211,73,71,.12); --accent-border: rgba(211,73,71,.34);
+    --green: #12805f; --amber: #a87319; --red: #bd3a2d;
+    --success-soft: #e8f6ef; --success-text: #126442;
+    --warning-soft: #fff4de; --warning-text: #805417;
+    --danger-soft: #fbecea; --danger-text: #7a2a22;
+    --shadow-card: 0 10px 28px rgba(20,35,31,.09);
+    --shadow-soft: 0 16px 42px rgba(20,35,31,.13);
+  }
+  [data-theme="dark"] {
+    --bg: #101816; --surface: #17231f; --surface-soft: #1d2c27; --surface-elevated: #22342e;
+    --surface-strong: #111c19; --border: #31483f; --border-strong: #4c6a5f;
+    --ink: #e8f2ee; --text-soft: #c5d7d0; --muted: #91a89d;
+    --accent: #76dfc3; --accent-hover: #95ead5; --accent-contrast: #0d2420;
+    --accent-soft: rgba(118,223,195,.15); --accent-border: rgba(118,223,195,.38);
+    --green: #5ee8a0; --amber: #f0b860; --red: #ef7a6a;
+    --success-soft: rgba(22,132,93,.2); --success-text: #5ee8a0;
+    --warning-soft: rgba(169,111,22,.24); --warning-text: #f0b860;
+    --danger-soft: rgba(189,58,45,.22); --danger-text: #f2a196;
+    --shadow-card: 0 10px 28px rgba(0,0,0,.35); --shadow-soft: 0 16px 42px rgba(0,0,0,.4);
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--bg); color: var(--ink); height: 100vh; overflow: hidden;
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 13px; -webkit-font-smoothing: antialiased;
+  }
+  button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+  code { font-family: "JetBrains Mono", ui-monospace, Consolas, monospace; font-size: 11.5px; }
+
+  .shell {
+    display: grid; height: 100vh;
+    grid-template-rows: 40px 1fr;
+    grid-template-columns: 240px minmax(0,1fr) auto;
+    grid-template-areas: "chrome chrome chrome" "left main right";
+  }
+
+  /* ── 顶栏 ─────────────────────────── */
+  .chrome {
+    grid-area: chrome; display: flex; align-items: center; gap: 8px; padding: 0 10px;
+    border-bottom: 1px solid var(--border); background: var(--surface);
+  }
+  .brand { display: flex; align-items: center; gap: 7px; font-weight: 650; font-size: 13px; }
+  .brand .dot { width: 18px; height: 18px; border-radius: 6px; background: var(--accent); display: grid; place-items: center; color: var(--accent-contrast); font-size: 10px; font-weight: 800; }
+  .crumb { color: var(--muted); font-size: 12px; }
+  .chromeSpacer { flex: 1; }
+  .pendingChip {
+    display: none; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+    background: var(--warning-soft); color: var(--warning-text); font-weight: 600; font-size: 12px;
+    border: 1px solid transparent; transition: transform .15s;
+  }
+  .pendingChip:hover { transform: translateY(-1px); }
+  .pendingChip .pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--amber); animation: pulse 1.4s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  [data-state="busy"] .pendingChip { display: inline-flex; }
+  .winBtn { width: 28px; height: 28px; border-radius: 7px; display: grid; place-items: center; color: var(--muted); }
+  .winBtn:hover { background: var(--surface-strong); color: var(--ink); }
+
+  /* ── 左栏：项目树 ─────────────────── */
+  .left {
+    grid-area: left; border-right: 1px solid var(--border); background: var(--surface-soft);
+    display: flex; flex-direction: column; padding: 10px; gap: 8px; overflow-y: auto;
+  }
+  .newSession {
+    display: flex; align-items: center; justify-content: center; gap: 6px; padding: 8px;
+    border-radius: 10px; border: 1px dashed var(--border-strong); color: var(--text-soft); font-weight: 600;
+  }
+  .newSession:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+  .projLabel { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .4px; padding: 6px 4px 2px; text-transform: uppercase; }
+  .sess {
+    display: flex; flex-direction: column; gap: 2px; padding: 7px 9px; border-radius: 9px; text-align: left; width: 100%;
+  }
+  .sess:hover { background: var(--surface-strong); }
+  .sess.active { background: var(--accent-soft); outline: 1px solid var(--accent-border); }
+  .sess .t { font-weight: 600; font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sess .m { display: flex; gap: 6px; align-items: center; color: var(--muted); font-size: 11px; }
+  .statusDot { width: 6px; height: 6px; border-radius: 50%; background: var(--border-strong); flex: none; }
+  .statusDot.run { background: var(--green); animation: pulse 1.4s infinite; }
+
+  /* ── 中央 ─────────────────────────── */
+  .main { grid-area: main; display: flex; flex-direction: column; min-width: 0; }
+  .view { flex: 1; overflow-y: auto; display: none; }
+  [data-state="home"] #viewHome { display: block; }
+  [data-state="busy"] #viewBusy { display: block; }
+
+  /* 首页（空状态） */
+  .homeWrap { max-width: 720px; margin: 0 auto; padding: 56px 28px 28px; }
+  .hello h1 { font-size: 24px; font-weight: 700; letter-spacing: -.3px; }
+  .hello p { color: var(--muted); margin-top: 6px; }
+  .modeCards { display: grid; grid-template-columns: repeat(3,1fr); gap: 12px; margin-top: 26px; }
+  .modeCard {
+    text-align: left; padding: 16px 14px; border-radius: 14px; border: 1px solid var(--border);
+    background: var(--surface); box-shadow: var(--shadow-card); display: flex; flex-direction: column; gap: 8px;
+    transition: transform .15s, border-color .15s;
+  }
+  .modeCard:hover { transform: translateY(-2px); border-color: var(--accent-border); }
+  .modeCard .ic { width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent); }
+  .modeCard b { font-size: 13.5px; }
+  .modeCard span { color: var(--muted); font-size: 12px; line-height: 1.5; }
+  .homeSection { margin-top: 34px; }
+  .homeSection h2 { font-size: 12px; color: var(--muted); font-weight: 700; letter-spacing: .5px; text-transform: uppercase; margin-bottom: 10px; }
+  .recentRow {
+    width: 100%; display: flex; align-items: center; gap: 12px; padding: 11px 13px; border-radius: 12px;
+    border: 1px solid var(--border); background: var(--surface); margin-bottom: 8px; text-align: left;
+  }
+  .recentRow:hover { border-color: var(--accent-border); background: var(--surface-elevated); }
+  .recentRow .info { flex: 1; min-width: 0; }
+  .recentRow .info b { display: block; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .recentRow .info small { color: var(--muted); }
+  .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; font-weight: 650; flex: none; }
+  .badge.ok { background: var(--success-soft); color: var(--success-text); }
+  .badge.warn { background: var(--warning-soft); color: var(--warning-text); }
+  .badge.runb { background: var(--accent-soft); color: var(--accent); }
+
+  /* 会话时间线 */
+  .timeline { max-width: 780px; margin: 0 auto; padding: 22px 24px 12px; display: flex; flex-direction: column; gap: 14px; }
+  .msg { display: flex; gap: 10px; }
+  .avatar { width: 26px; height: 26px; border-radius: 8px; flex: none; display: grid; place-items: center; font-size: 11px; font-weight: 800; }
+  .avatar.u { background: var(--surface-strong); color: var(--text-soft); }
+  .avatar.a { background: var(--accent); color: var(--accent-contrast); }
+  .bubble { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 10px 13px; line-height: 1.6; max-width: 640px; }
+  .toolLine {
+    display: flex; align-items: center; gap: 8px; margin-left: 36px; padding: 6px 10px; border-radius: 8px;
+    background: var(--surface-soft); border: 1px solid var(--border); color: var(--muted); font-size: 12px; width: fit-content;
+  }
+  .toolLine.done svg { color: var(--green); }
+
+  /* 内联审批卡片（重点） */
+  .approvalCard {
+    margin-left: 36px; border-radius: 14px; border: 1px solid var(--accent-border);
+    background: var(--surface); box-shadow: var(--shadow-card); overflow: hidden; max-width: 640px;
+  }
+  .approvalCard header { display: flex; align-items: center; gap: 8px; padding: 9px 13px; background: var(--warning-soft); color: var(--warning-text); font-weight: 650; font-size: 12.5px; }
+  .approvalBody { padding: 11px 13px; display: flex; flex-direction: column; gap: 10px; }
+  .approvalBody code { display: block; background: var(--surface-strong); border-radius: 8px; padding: 8px 10px; }
+  .approvalActions { display: flex; gap: 8px; }
+  .btn { display: inline-flex; align-items: center; gap: 6px; padding: 6px 13px; border-radius: 9px; font-weight: 650; font-size: 12.5px; border: 1px solid var(--border); }
+  .btn:hover { background: var(--surface-strong); }
+  .btn.primary { background: var(--accent); color: var(--accent-contrast); border-color: transparent; }
+  .btn.primary:hover { background: var(--accent-hover); }
+  .btn.ghost { color: var(--muted); }
+
+  /* Composer */
+  .composerZone { padding: 10px 24px 16px; }
+  .composer {
+    max-width: 780px; margin: 0 auto; border: 1px solid var(--border); border-radius: 16px;
+    background: var(--surface); box-shadow: var(--shadow-card); padding: 10px 12px 8px;
+  }
+  .composer:focus-within { border-color: var(--accent-border); }
+  .composer textarea {
+    width: 100%; border: none; outline: none; resize: none; background: transparent; color: var(--ink);
+    font: inherit; font-size: 13.5px; line-height: 1.5; min-height: 40px;
+  }
+  .composerBar { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+  .modeSeg { display: flex; background: var(--surface-strong); border-radius: 9px; padding: 2px; }
+  .modeSeg button { padding: 4px 11px; border-radius: 7px; font-size: 12px; font-weight: 600; color: var(--muted); }
+  .modeSeg button.on { background: var(--surface); color: var(--ink); box-shadow: 0 1px 3px rgba(0,0,0,.1); }
+  .composerBar .spacer { flex: 1; }
+  .metaChip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 9px; border-radius: 8px; color: var(--muted); font-size: 12px; }
+  .metaChip:hover { background: var(--surface-strong); color: var(--ink); }
+  .ctxRing { width: 18px; height: 18px; transform: rotate(-90deg); }
+  .ctxRing .track { stroke: var(--border); }
+  .ctxRing .fill { stroke: var(--green); }
+  .sendBtn { width: 32px; height: 32px; border-radius: 10px; background: var(--accent); color: var(--accent-contrast); display: grid; place-items: center; }
+  .sendBtn:hover { background: var(--accent-hover); }
+
+  /* ── 右侧：图标栏 + 面板 ───────────── */
+  .right { grid-area: right; display: flex; }
+  .panel {
+    width: 0; overflow: hidden; border-left: 1px solid transparent; background: var(--surface-soft);
+    transition: width .18s ease; display: flex; flex-direction: column;
+  }
+  .panel.open { width: 300px; border-left-color: var(--border); }
+  .panelHead { display: flex; align-items: center; gap: 4px; padding: 10px 12px 0; }
+  .panelHead .tab { padding: 5px 11px; border-radius: 8px; font-weight: 650; font-size: 12.5px; color: var(--muted); }
+  .panelHead .tab.on { background: var(--surface); color: var(--ink); box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .panelHead .close { margin-left: auto; color: var(--muted); width: 24px; height: 24px; border-radius: 6px; display: grid; place-items: center; }
+  .panelHead .close:hover { background: var(--surface-strong); }
+  .panelBody { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 12px; min-width: 276px; }
+  .tabPage { display: none; flex-direction: column; gap: 12px; }
+  .tabPage.on { display: flex; }
+
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 11px 12px; display: flex; flex-direction: column; gap: 8px; }
+  .card h3 { font-size: 12px; display: flex; align-items: center; gap: 6px; color: var(--text-soft); }
+  .progressRow { display: flex; justify-content: space-between; font-size: 12px; font-weight: 650; }
+  .track { height: 5px; border-radius: 999px; background: var(--surface-strong); overflow: hidden; }
+  .track span { display: block; height: 100%; width: 60%; background: var(--green); border-radius: 999px; }
+  .todo { display: flex; gap: 8px; align-items: flex-start; font-size: 12.5px; padding: 3px 0; }
+  .todo .tick { width: 15px; height: 15px; border-radius: 50%; border: 1.5px solid var(--border-strong); flex: none; margin-top: 1px; display: grid; place-items: center; }
+  .todo.done .tick { background: var(--green); border-color: var(--green); color: #fff; }
+  .todo.done span { color: var(--muted); text-decoration: line-through; }
+  .todo.doing .tick { border-color: var(--accent); }
+  .todo.doing .tick::after { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: pulse 1.4s infinite; }
+  .jobRow { display: flex; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 12.5px; }
+  .jobRow:last-child { border-bottom: none; }
+  .jobRow .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mini { width: 22px; height: 22px; border-radius: 6px; display: grid; place-items: center; color: var(--muted); }
+  .mini:hover { background: var(--surface-strong); color: var(--ink); }
+  .fileRow { display: flex; align-items: center; gap: 8px; padding: 6px 0; font-size: 12px; }
+  .fileRow .diffStat { margin-left: auto; font-family: ui-monospace, monospace; font-size: 11px; }
+  .add { color: var(--green); } .del { color: var(--red); }
+  .emptyHint { color: var(--muted); text-align: center; padding: 24px 8px; font-size: 12px; line-height: 1.7; }
+
+  .rail {
+    width: 44px; border-left: 1px solid var(--border); background: var(--surface);
+    display: flex; flex-direction: column; align-items: center; padding: 10px 0; gap: 6px;
+  }
+  .railBtn { position: relative; width: 32px; height: 32px; border-radius: 9px; display: grid; place-items: center; color: var(--muted); }
+  .railBtn:hover { background: var(--surface-strong); color: var(--ink); }
+  .railBtn.on { background: var(--accent-soft); color: var(--accent); }
+  .railBtn .count {
+    position: absolute; top: -3px; right: -3px; min-width: 15px; height: 15px; padding: 0 4px;
+    border-radius: 999px; background: var(--accent); color: var(--accent-contrast);
+    font-size: 9.5px; font-weight: 800; display: none; place-items: center; line-height: 15px;
+  }
+  [data-state="busy"] .railBtn .count.show { display: grid; }
+
+  /* 演示控制 */
+  .demoBar {
+    position: fixed; bottom: 14px; left: 14px; z-index: 50; display: flex; gap: 6px; align-items: center;
+    background: var(--surface-elevated); border: 1px solid var(--border-strong); border-radius: 12px;
+    padding: 6px 8px; box-shadow: var(--shadow-soft); font-size: 12px;
+  }
+  .demoBar b { color: var(--muted); font-size: 11px; margin-right: 2px; }
+  .demoBar button { padding: 4px 10px; border-radius: 8px; font-weight: 600; border: 1px solid var(--border); }
+  .demoBar button.on { background: var(--accent); color: var(--accent-contrast); border-color: transparent; }
+</style>
+</head>
+<body>
+<div class="shell" data-state="home" id="shell">
+
+  <!-- 顶栏：只保留身份 + 全局待办提示 + 窗口控制 -->
+  <header class="chrome">
+    <div class="brand"><span class="dot">oD</span> oDot <span class="crumb">/ my-project</span></div>
+    <div class="chromeSpacer"></div>
+    <button class="pendingChip" onclick="openPanel('plan')"><span class="pulse"></span> 1 项待审批 · 计划执行中</button>
+    <button class="winBtn" title="悬浮球">◐</button>
+    <button class="winBtn" title="设置">⚙</button>
+    <button class="winBtn">–</button><button class="winBtn">▢</button><button class="winBtn">✕</button>
+  </header>
+
+  <!-- 左栏：项目 / 会话树（保持现状，弱化视觉） -->
+  <aside class="left">
+    <button class="newSession">＋ 新建会话</button>
+    <div class="projLabel">▸ my-project</div>
+    <button class="sess active">
+      <span class="t">重构鉴权中间件</span>
+      <span class="m"><span class="statusDot run"></span> Agent · 运行中 · 4 分钟前</span>
+    </button>
+    <button class="sess">
+      <span class="t">修复 SSE 断流重连</span>
+      <span class="m"><span class="statusDot"></span> 昨天</span>
+    </button>
+    <div class="projLabel">▸ odot-docs</div>
+    <button class="sess">
+      <span class="t">生成 API 文档大纲</span>
+      <span class="m"><span class="statusDot"></span> 3 天前</span>
+    </button>
+  </aside>
+
+  <!-- 中央 -->
+  <main class="main">
+
+    <!-- 状态 A：首页（无活动会话时不再是空时间线） -->
+    <div class="view" id="viewHome">
+      <div class="homeWrap">
+        <div class="hello">
+          <h1>下午好，Leo</h1>
+          <p>选择一种模式开始，或继续最近的会话。</p>
+        </div>
+        <div class="modeCards">
+          <button class="modeCard">
+            <span class="ic">?</span><b>Ask · 提问</b>
+            <span>快速问答，不修改任何文件，适合理解代码。</span>
+          </button>
+          <button class="modeCard">
+            <span class="ic">☰</span><b>Plan · 规划</b>
+            <span>先产出可审阅的执行计划，确认后再动手。</span>
+          </button>
+          <button class="modeCard">
+            <span class="ic">⚡</span><b>Agent · 代理</b>
+            <span>自主执行任务，每次改动自动快照、可回滚。</span>
+          </button>
+        </div>
+        <div class="homeSection">
+          <h2>最近会话</h2>
+          <button class="recentRow" onclick="setState('busy')">
+            <div class="info"><b>重构鉴权中间件</b><small>my-project · Agent 模式 · 4 分钟前</small></div>
+            <span class="badge runb">运行中</span>
+          </button>
+          <button class="recentRow">
+            <div class="info"><b>修复 SSE 断流重连</b><small>my-project · 已完成 · 昨天</small></div>
+            <span class="badge ok">12 处变更</span>
+          </button>
+          <button class="recentRow">
+            <div class="info"><b>生成 API 文档大纲</b><small>odot-docs · 有待处理审批 · 3 天前</small></div>
+            <span class="badge warn">1 项待审批</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 状态 B：会话运行中 —— 审批内联到时间线 -->
+    <div class="view" id="viewBusy">
+      <div class="timeline">
+        <div class="msg"><span class="avatar u">L</span><div class="bubble">把 auth 中间件里的 token 校验抽成独立模块，补上过期刷新逻辑。</div></div>
+        <div class="msg"><span class="avatar a">oD</span><div class="bubble">好的。我先梳理现有调用点，然后按计划分四步重构。已生成执行计划（见右侧「计划」页签）。</div></div>
+        <div class="toolLine done">✓ 读取 <code>src/middleware/auth.ts</code></div>
+        <div class="toolLine done">✓ 编辑 <code>src/auth/token.ts</code>（已快照 · 可回滚）</div>
+
+        <!-- 重点：阻塞式审批不再挤在右栏，直接出现在对话流里 -->
+        <div class="approvalCard">
+          <header>⏸ 等待审批 — 命令执行</header>
+          <div class="approvalBody">
+            <code>npm test -- --filter auth</code>
+            <div class="approvalActions">
+              <button class="btn primary">✓ 批准</button>
+              <button class="btn">✓ 批准并信任此命令</button>
+              <button class="btn ghost">✕ 拒绝</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="composerZone">
+        <div class="composer">
+          <textarea placeholder="继续输入…（Agent 运行时将加入队列）"></textarea>
+          <div class="composerBar">
+            <div class="modeSeg">
+              <button>Ask</button><button>Plan</button><button class="on">Agent</button>
+            </div>
+            <div class="spacer"></div>
+            <!-- 元信息下沉：上下文用量 + 模型不再占右栏一整节 -->
+            <button class="metaChip" title="上下文已用 62% · 点击压缩">
+              <svg class="ctxRing" viewBox="0 0 20 20"><circle class="track" cx="10" cy="10" r="8" fill="none" stroke-width="3"/><circle class="fill" cx="10" cy="10" r="8" fill="none" stroke-width="3" stroke-dasharray="31.2 50.3" stroke-linecap="round"/></svg>
+              62%
+            </button>
+            <button class="metaChip">claude-sonnet-5 ▾</button>
+            <button class="sendBtn" title="发送">➤</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 首页状态下 composer 也存在（居中偏下），此处复用同一个演示 -->
+  </main>
+
+  <!-- 右侧：常驻 44px 图标栏 + 按需展开的页签面板 -->
+  <div class="right">
+    <aside class="panel" id="panel">
+      <div class="panelHead">
+        <button class="tab" data-tab="plan" onclick="openPanel('plan')">计划</button>
+        <button class="tab" data-tab="jobs" onclick="openPanel('jobs')">任务</button>
+        <button class="tab" data-tab="changes" onclick="openPanel('changes')">变更</button>
+        <button class="close" onclick="closePanel()">✕</button>
+      </div>
+      <div class="panelBody">
+
+        <div class="tabPage" data-page="plan">
+          <div class="card">
+            <div class="progressRow"><span>计划进度 3 / 5</span><span>60%</span></div>
+            <div class="track"><span></span></div>
+            <div>
+              <div class="todo done"><span class="tick">✓</span><span>梳理 auth 中间件调用点</span></div>
+              <div class="todo done"><span class="tick">✓</span><span>抽出 token 校验模块</span></div>
+              <div class="todo done"><span class="tick">✓</span><span>实现过期刷新逻辑</span></div>
+              <div class="todo doing"><span class="tick"></span><span>运行测试并修复失败用例</span></div>
+              <div class="todo"><span class="tick"></span><span>更新调用方与文档</span></div>
+            </div>
+          </div>
+          <div class="card">
+            <h3>📄 计划文档</h3>
+            <code>.odot/plans/auth-refactor.md</code>
+            <button class="btn" style="align-self:flex-start">在文件管理器中打开</button>
+          </div>
+        </div>
+
+        <div class="tabPage" data-page="jobs">
+          <div class="card">
+            <h3>🕐 后台任务</h3>
+            <div class="jobRow"><span class="statusDot run"></span><span class="grow">子代理：批量更新调用点</span><button class="mini" title="停止">✕</button></div>
+            <div class="jobRow"><span class="statusDot"></span><span class="grow">依赖安全扫描</span><span class="badge ok">完成</span></div>
+          </div>
+          <div class="card">
+            <h3>💬 排队输入 (1)</h3>
+            <div class="jobRow"><span class="grow">"顺便把日志级别改成 debug"</span><button class="mini" title="删除">🗑</button></div>
+          </div>
+        </div>
+
+        <div class="tabPage" data-page="changes">
+          <div class="card">
+            <h3>🗂 本次会话变更 · 全部可回滚</h3>
+            <div class="fileRow"><code>src/auth/token.ts</code><span class="diffStat"><span class="add">+84</span> <span class="del">−12</span></span></div>
+            <div class="fileRow"><code>src/middleware/auth.ts</code><span class="diffStat"><span class="add">+9</span> <span class="del">−61</span></span></div>
+            <div class="fileRow"><code>src/auth/refresh.ts</code><span class="diffStat"><span class="add">+47</span> <span class="del">−0</span></span></div>
+            <button class="btn" style="align-self:flex-start">回滚全部</button>
+          </div>
+        </div>
+
+      </div>
+    </aside>
+
+    <nav class="rail">
+      <button class="railBtn" data-tab="plan" onclick="togglePanel('plan')" title="计划进度">☰<span class="count show">1</span></button>
+      <button class="railBtn" data-tab="jobs" onclick="togglePanel('jobs')" title="后台任务 / 队列">🕐<span class="count show">3</span></button>
+      <button class="railBtn" data-tab="changes" onclick="togglePanel('changes')" title="文件变更 / 快照">±<span class="count show">3</span></button>
+    </nav>
+  </div>
+
+  <!-- 原型演示控制（非产品 UI） -->
+  <div class="demoBar">
+    <b>演示</b>
+    <button id="dHome" class="on" onclick="setState('home')">首页（空闲）</button>
+    <button id="dBusy" onclick="setState('busy')">会话运行中</button>
+    <button onclick="toggleTheme()">🌓 主题</button>
+  </div>
+</div>
+
+<script>
+  const shell = document.getElementById("shell");
+  const panel = document.getElementById("panel");
+  let currentTab = null;
+
+  function setState(s) {
+    shell.dataset.state = s;
+    document.getElementById("dHome").classList.toggle("on", s === "home");
+    document.getElementById("dBusy").classList.toggle("on", s === "busy");
+    if (s === "busy") openPanel("plan");   // 运行中：自动展开并定位到「计划」
+    else closePanel();                     // 空闲：右侧只留图标栏
+  }
+  function openPanel(tab) {
+    currentTab = tab;
+    panel.classList.add("open");
+    document.querySelectorAll(".tab").forEach(t => t.classList.toggle("on", t.dataset.tab === tab));
+    document.querySelectorAll(".tabPage").forEach(p => p.classList.toggle("on", p.dataset.page === tab));
+    document.querySelectorAll(".railBtn").forEach(b => b.classList.toggle("on", b.dataset.tab === tab));
+  }
+  function togglePanel(tab) {
+    if (panel.classList.contains("open") && currentTab === tab) closePanel();
+    else openPanel(tab);
+  }
+  function closePanel() {
+    currentTab = null;
+    panel.classList.remove("open");
+    document.querySelectorAll(".railBtn").forEach(b => b.classList.remove("on"));
+  }
+  function toggleTheme() {
+    const root = document.documentElement;
+    root.dataset.theme = root.dataset.theme === "dark" ? "light" : "dark";
+  }
+</script>
+</body>
+</html>

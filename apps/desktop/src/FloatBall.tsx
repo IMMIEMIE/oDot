@@ -584,6 +584,13 @@ export function FloatBall() {
     }
     if ((agentStatus.kind === "idle" || agentStatus.kind === "complete") && expandedMode !== "prompt") {
       openPromptPanel();
+      return;
+    }
+    // Active and error states cannot open the prompt capsule. Falling through used
+    // to make a valid click look ignored, especially before streaming text arrived.
+    // Restore the main window so every non-drag click has a meaningful action.
+    if (agentStatus.kind === "working" || agentStatus.kind === "thinking" || agentStatus.kind === "error") {
+      void restoreMainWindow();
     }
   };
 

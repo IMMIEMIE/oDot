@@ -264,8 +264,7 @@ button:focus-visible {
   background: var(--accent-soft);
 }
 
-.leftPane,
-.rightPane {
+.leftPane {
   grid-row: 2;
   height: 100%;
   background: var(--surface-elevated);
@@ -275,17 +274,6 @@ button:focus-visible {
   min-width: 0;
   overflow: hidden;
   box-shadow: var(--inset-line);
-}
-
-.rightPane {
-  position: relative;
-  border-right: 0;
-  border-left: 1px solid var(--border);
-  overflow-x: hidden;
-  overflow-y: auto;
-  box-shadow:
-    -10px 0 30px rgba(20, 35, 31, 0.05),
-    var(--inset-line);
 }
 
 .resizeHandle {
@@ -1063,7 +1051,7 @@ button:focus-visible {
   display: grid;
   grid-template-rows: 1fr 1fr;
   align-items: center;
-  border-right: 1px solid rgba(255, 255, 255, 0.28);
+  border-right: 1px solid var(--composer-submit-divider, rgba(255, 255, 255, 0.28));
 }
 
 .promptNavIconButton {
@@ -1078,7 +1066,7 @@ button:focus-visible {
   border: 0;
   border-radius: 0;
   background: transparent;
-  color: var(--accent-contrast);
+  color: var(--composer-submit-fg, var(--accent-contrast));
   cursor: pointer;
   transition:
     transform 0.15s ease,
@@ -1087,13 +1075,13 @@ button:focus-visible {
 }
 
 .promptNavIconButton:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.14);
-  color: var(--accent-contrast);
+  background: var(--composer-submit-hover, rgba(255, 255, 255, 0.14));
+  color: var(--composer-submit-fg, var(--accent-contrast));
   transform: scale(1.12);
 }
 
 .promptNavIconButton:active:not(:disabled) {
-  background: rgba(255, 255, 255, 0.22);
+  background: var(--composer-submit-active, rgba(255, 255, 255, 0.22));
 }
 
 .promptNavIconButton:disabled {
@@ -1228,18 +1216,6 @@ button:focus-visible {
   display: block;
 }
 
-.contextUsage {
-  position: relative;
-  width: min(260px, 100%);
-  display: grid;
-  grid-template-columns: auto minmax(64px, 1fr);
-  align-items: center;
-  gap: 8px;
-  color: var(--text-soft);
-  font-size: 12px;
-  outline: none;
-}
-
 .agentStatus {
   width: fit-content;
   min-height: 24px;
@@ -1264,32 +1240,6 @@ button:focus-visible {
   color: var(--accent);
 }
 
-.contextUsage span {
-  white-space: nowrap;
-}
-
-.contextTrack {
-  height: 6px;
-  overflow: hidden;
-  border-radius: 999px;
-  background: var(--surface-strong);
-}
-
-.contextTrack i {
-  display: block;
-  height: 100%;
-  border-radius: inherit;
-  background: var(--accent);
-}
-
-.contextUsage.warning .contextTrack i {
-  background: #a96f16;
-}
-
-.contextUsage.danger .contextTrack i {
-  background: var(--red);
-}
-
 .contextUsagePopover {
   position: absolute;
   top: calc(100% + 8px);
@@ -1306,13 +1256,6 @@ button:focus-visible {
   pointer-events: none;
   transform: translateY(-4px);
   transition: opacity 0.14s ease, transform 0.14s ease;
-}
-
-.contextUsage:hover .contextUsagePopover,
-.contextUsage:focus-within .contextUsagePopover,
-.contextUsage:focus .contextUsagePopover {
-  opacity: 1;
-  transform: translateY(0);
 }
 
 .contextUsagePopover header {
@@ -2963,6 +2906,13 @@ pre {
   overflow-wrap: anywhere;
 }
 
+.composerRunConfigGroup {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
 .composerRunConfigSelect {
   position: relative;
   width: auto;
@@ -2972,21 +2922,17 @@ pre {
 }
 
 .composerRunConfigButton {
-  width: 116px;
-  min-width: 96px;
+  position: relative;
   height: 40px;
-  padding: 0 8px;
-  border: 1px solid var(--accent-border);
-  border-radius: 8px;
-  background: var(--accent-softer);
+  padding: 3px 28px 3px 10px;
+  border: 0;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
   color: var(--accent);
   display: inline-flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 5px;
-  font-size: 13px;
-  font-weight: 800;
-  box-shadow: var(--inset-line);
+  justify-content: center;
+  box-shadow: none;
   transition:
     transform 0.16s ease,
     border-color 0.16s ease,
@@ -2994,22 +2940,45 @@ pre {
     box-shadow 0.16s ease;
 }
 
-.composerRunConfigButton span,
-.composerRunConfigButton small {
+.composerRunConfigButton--mode {
+  width: 116px;
+}
+
+.composerRunConfigButton--approval {
+  width: 156px;
+}
+
+.composerRunConfigButtonCopy {
+  width: 100%;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+.composerRunConfigButtonCopy strong {
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.composerRunConfigButton small {
   color: var(--accent);
-  font-size: 13px;
+  font-size: 12.5px;
+  line-height: 1.25;
   font-weight: 800;
 }
 
 .composerRunConfigButton svg {
-  flex: 0 0 auto;
+  position: absolute;
+  top: 50%;
+  right: 9px;
+  transform: translateY(-50%);
+  transition: transform 0.16s ease;
+}
+
+.composerRunConfigButton[aria-expanded="true"] svg {
+  transform: translateY(-50%) rotate(180deg);
 }
 
 .composerRunConfigButton:hover:not(:disabled),
@@ -3025,45 +2994,47 @@ pre {
   right: 0;
   bottom: calc(100% + 8px);
   z-index: 45;
-  width: min(330px, calc(100vw - 48px));
+  width: min(214px, calc(100vw - 48px));
   padding: 8px;
   border: 1px solid var(--accent-border);
-  border-radius: 8px;
+  border-radius: 10px;
   background: var(--surface-elevated);
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 8px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 5px;
   box-shadow: var(--shadow-soft);
   animation: menuLiftIn 0.16s ease-out both;
 }
 
-.composerRunConfigColumn {
-  min-width: 0;
-  display: grid;
-  align-content: start;
-  gap: 5px;
+.composerRunConfigMenu--mode {
+  right: auto;
+  left: 0;
+  width: min(184px, calc(100vw - 48px));
 }
 
-.composerRunConfigColumn strong {
-  padding: 0 6px 2px;
+.composerRunConfigMenuTitle {
+  padding: 2px 8px 5px;
   color: var(--muted);
-  font-size: 11px;
-  font-weight: 800;
+  font-size: 10px;
+  line-height: 1.2;
+  font-weight: 750;
+  letter-spacing: 0.02em;
+  text-align: center;
 }
 
 .composerRunConfigOption {
+  position: relative;
   width: 100%;
-  min-height: 34px;
-  padding: 0 7px;
+  min-height: 38px;
+  padding: 0 30px;
   border: 0;
-  border-radius: 6px;
+  border-radius: 7px;
   background: transparent;
   color: var(--text-soft);
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 16px;
+  display: flex;
   align-items: center;
-  gap: 8px;
-  text-align: left;
+  justify-content: center;
+  text-align: center;
   font-size: 13px;
   font-weight: 820;
   transition:
@@ -3074,13 +3045,15 @@ pre {
 
 .composerRunConfigOption span {
   min-width: 0;
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .composerRunConfigOption svg {
-  grid-column: 2;
+  position: absolute;
+  right: 10px;
   color: var(--accent);
 }
 
@@ -3088,7 +3061,7 @@ pre {
 .composerRunConfigOption:focus-visible {
   background: var(--surface-soft);
   color: var(--ink);
-  transform: translateX(2px);
+  transform: translateY(-1px);
 }
 
 .composerRunConfigOption.active {
@@ -3097,13 +3070,21 @@ pre {
 }
 
 .composerSubmitCapsule {
+  --composer-submit-bg: var(--accent);
+  --composer-submit-fg: var(--accent-contrast);
+  --composer-submit-divider: rgba(255, 255, 255, 0.28);
+  --composer-submit-hover: rgba(255, 255, 255, 0.14);
+  --composer-submit-active: rgba(255, 255, 255, 0.22);
+  --composer-stop-bg: var(--red);
+  --composer-stop-fg: #ffffff;
+  --composer-stop-divider: rgba(255, 255, 255, 0.24);
   height: 40px;
   min-width: 68px;
   padding: 3px;
   border-radius: 8px;
   display: inline-flex;
   align-items: center;
-  background: var(--accent);
+  background: var(--composer-submit-bg);
   box-shadow:
     0 12px 24px var(--accent-focus),
     0 0 0 1px var(--accent-border);
@@ -3120,9 +3101,37 @@ pre {
     0 0 0 1px var(--accent-border);
 }
 
-.composerSubmitCapsule.stop {
-  background: var(--red);
-  box-shadow: 0 0 0 1px rgba(189, 58, 45, 0.45);
+.composerSubmitCapsule.working {
+  min-width: 105px;
+}
+
+.composerStopButton {
+  width: 34px;
+  min-width: 34px;
+  height: 34px;
+  min-height: 34px;
+  border: 0;
+  border-right: 1px solid var(--composer-stop-divider);
+  border-radius: 6px 0 0 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--composer-stop-fg);
+  background: var(--composer-stop-bg);
+  transition:
+    transform 0.16s ease,
+    filter 0.16s ease,
+    opacity 0.16s ease;
+}
+
+.composerStopButton:not(:disabled):hover {
+  filter: brightness(1.08);
+  transform: scale(1.06);
+}
+
+.composerStopButton:disabled {
+  cursor: wait;
+  opacity: 0.62;
 }
 
 .composerSendButton {
@@ -3135,7 +3144,7 @@ pre {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  color: var(--accent-contrast);
+  color: var(--composer-submit-fg);
   background: transparent;
   transition:
     transform 0.16s ease,
@@ -3143,12 +3152,12 @@ pre {
 }
 
 .composerSendButton:not(:disabled):hover {
-  background: rgba(255, 255, 255, 0.14);
+  background: var(--composer-submit-hover);
   transform: scale(1.08);
 }
 
 .composerSendButton:active:not(:disabled) {
-  background: rgba(255, 255, 255, 0.22);
+  background: var(--composer-submit-active);
 }
 
 .stopIconSolid {
@@ -3182,7 +3191,7 @@ pre {
 .planExecutionHeader {
   min-width: 0;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
   padding: 0;
@@ -3194,7 +3203,8 @@ pre {
   min-width: 24px;
   height: 24px;
   min-height: 24px;
-  margin-right: 28px;
+  flex: 0 0 24px;
+  margin-left: auto;
   padding: 0;
   border: 0;
   border-radius: 6px;
@@ -3504,31 +3514,6 @@ pre {
   flex-wrap: wrap;
 }
 
-.activityPauseBox {
-  display: grid;
-  gap: 8px;
-  padding: 10px;
-  border: 1px solid color-mix(in srgb, var(--warning-text) 44%, var(--border));
-  border-radius: 8px;
-  background: var(--warning-soft);
-  color: var(--warning-text);
-}
-
-.activityPauseBox strong {
-  color: var(--ink);
-  font-size: 12px;
-}
-
-.activityPauseBox span {
-  color: var(--text);
-  font-size: 12px;
-  line-height: 1.45;
-}
-
-.activityPauseBox .iconTextButton {
-  justify-self: end;
-}
-
 .patchStat {
   min-width: 42px;
   padding: 2px 6px;
@@ -3547,8 +3532,7 @@ pre {
   background: #fde8e5;
 }
 
-.emptyLine,
-.emptyTimeline {
+.emptyLine {
   min-height: 38px;
   display: grid;
   place-items: center;
@@ -3559,18 +3543,6 @@ pre {
     linear-gradient(135deg, var(--surface), var(--surface-soft));
   font-size: 13px;
   box-shadow: var(--inset-line);
-}
-
-.emptyTimeline {
-  min-height: 220px;
-  gap: 8px;
-  align-content: center;
-  animation: emptyTimelineGlow 2.8s ease-in-out infinite;
-}
-
-.emptyTimeline svg {
-  color: var(--accent);
-  filter: drop-shadow(0 8px 16px var(--accent-focus));
 }
 
 .rowIconAction {
@@ -4040,13 +4012,6 @@ pre {
   opacity: 0.55;
 }
 
-.providerActions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 4px;
-}
-
 .configFileActions {
   display: flex;
   align-items: center;
@@ -4192,6 +4157,44 @@ pre {
 
 :root[data-theme="dark"] .composerAttachButton:hover:not(:disabled) {
   background: var(--accent-soft);
+}
+
+:root[data-theme="dark"] .composerRunConfigButton {
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  box-shadow: none;
+}
+
+:root[data-theme="dark"] .composerRunConfigButton:hover:not(:disabled),
+:root[data-theme="dark"] .composerRunConfigButton[aria-expanded="true"] {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+
+:root[data-theme="dark"] .composerRunConfigMenu {
+  border-color: var(--border);
+  background: var(--surface-elevated);
+}
+
+:root[data-theme="dark"] .composerSubmitCapsule {
+  --composer-submit-bg: color-mix(in srgb, var(--surface-elevated) 78%, var(--accent) 22%);
+  --composer-submit-fg: var(--accent);
+  --composer-submit-divider: var(--accent-border);
+  --composer-submit-hover: var(--accent-soft);
+  --composer-submit-active: color-mix(in srgb, var(--accent) 24%, transparent);
+  --composer-stop-bg: color-mix(in srgb, var(--red) 68%, var(--surface-elevated));
+  --composer-stop-fg: #ffd9d4;
+  --composer-stop-divider: rgba(240, 168, 160, 0.28);
+  box-shadow:
+    0 12px 28px rgba(0, 0, 0, 0.28),
+    0 0 0 1px var(--accent-border),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+:root[data-theme="dark"] .composerSubmitCapsule:hover {
+  box-shadow:
+    0 16px 34px rgba(0, 0, 0, 0.34),
+    0 0 0 1px color-mix(in srgb, var(--accent) 58%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.07);
 }
 
 :root[data-theme="dark"] .composerModelSelect {
@@ -4355,17 +4358,6 @@ pre {
   to {
     opacity: 1;
     transform: translateY(0) scale(1);
-  }
-}
-
-@keyframes emptyTimelineGlow {
-  0%,
-  100% {
-    border-color: var(--border-strong);
-  }
-
-  50% {
-    border-color: var(--accent-border);
   }
 }
 
@@ -6251,4 +6243,581 @@ body.float-window-body {
   height: 26px;
   padding: 0 8px;
   font-size: 11px;
+}
+
+/* ── Right dock: icon rail + tabbed panel ─────────────────────────────── */
+
+.rightDock {
+  grid-row: 2;
+  height: 100%;
+  min-width: 0;
+  display: flex;
+  overflow: hidden;
+}
+
+.rightRail {
+  width: 46px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 0;
+  border-left: 1px solid var(--border);
+  background: var(--surface-elevated);
+  box-shadow: var(--inset-line);
+}
+
+.railButton {
+  position: relative;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 9px;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease;
+}
+
+.railButton:hover {
+  background: var(--surface-strong);
+  color: var(--ink);
+}
+
+.railButton.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.railBadge {
+  position: absolute;
+  top: -3px;
+  right: -4px;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-contrast);
+  font-size: 9.5px;
+  font-weight: 800;
+  line-height: 15px;
+  text-align: center;
+}
+
+.rightPanel {
+  width: 320px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--border);
+  background: var(--surface-elevated);
+  box-shadow:
+    -10px 0 30px rgba(20, 35, 31, 0.05),
+    var(--inset-line);
+}
+
+.rightPanelTabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 10px 10px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.rightPanelTab {
+  padding: 5px 11px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease;
+}
+
+.rightPanelTab:hover {
+  background: var(--surface-strong);
+  color: var(--ink);
+}
+
+.rightPanelTab.active {
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: var(--shadow-card);
+}
+
+.rightPanelClose {
+  margin-left: auto;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.rightPanelClose:hover {
+  background: var(--surface-strong);
+  color: var(--ink);
+}
+
+.rightPanelBody {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.rightPanelBody > .emptyLine {
+  padding: 24px 14px;
+  text-align: center;
+}
+
+.changesSection {
+  border-bottom: none;
+}
+
+.changesSummaryRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.changesStats {
+  display: inline-flex;
+  gap: 6px;
+  font-family: "JetBrains Mono", ui-monospace, Consolas, monospace;
+  font-size: 11px;
+}
+
+/* ── Pending-approval chip in the window chrome ───────────────────────── */
+
+.pendingApprovalChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 10px;
+  margin-right: 4px;
+  border: none;
+  border-radius: 999px;
+  background: var(--warning-soft);
+  color: var(--warning-text);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.pendingApprovalPulse {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--amber);
+  animation: pendingPulse 1.4s ease-in-out infinite;
+}
+
+@keyframes pendingPulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* ── Inline approval cards in the conversation flow ───────────────────── */
+
+.inlineApprovalCard {
+  max-width: 720px;
+  border: 1px solid var(--accent-border);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+}
+
+.inlineApprovalHeader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 13px;
+  background: var(--warning-soft);
+  color: var(--warning-text);
+  font-size: 12.5px;
+}
+
+.inlineApprovalBody {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 11px 13px;
+}
+
+.inlineApprovalBody code {
+  display: block;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface-strong);
+  font-size: 12px;
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+
+.inlineApprovalActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.inlineApprovalButton {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 13px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 12.5px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease;
+}
+
+.inlineApprovalButton:hover:not(:disabled) {
+  background: var(--surface-strong);
+}
+
+.inlineApprovalButton:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.inlineApprovalButton.primary {
+  background: var(--accent);
+  border-color: transparent;
+  color: var(--accent-contrast);
+}
+
+.inlineApprovalButton.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.inlineApprovalButton.danger {
+  color: var(--danger-text);
+}
+
+.inlineApprovalButton.danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+}
+
+/* ── Error banner above the composer ──────────────────────────────────── */
+
+.errorBanner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 0 clamp(12px, 2vw, 20px);
+  padding: 9px 12px;
+  border: 1px solid var(--danger-text);
+  border-radius: 10px;
+  background: var(--danger-soft);
+  color: var(--danger-text);
+}
+
+.errorBanner .errorDetails {
+  flex: 1;
+  min-width: 0;
+  max-height: 96px;
+  overflow: auto;
+  margin: 0;
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ── Context-usage chip in the composer ───────────────────────────────── */
+
+.contextUsageChip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 30px;
+  padding: 0 8px;
+  border-radius: 9px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: default;
+  outline: none;
+  transition: background 0.16s ease, color 0.16s ease;
+}
+
+.contextUsageChip:hover,
+.contextUsageChip:focus {
+  background: var(--surface-strong);
+  color: var(--ink);
+}
+
+.contextRing {
+  width: 18px;
+  height: 18px;
+}
+
+.contextRingTrack {
+  stroke: var(--surface-strong);
+}
+
+.contextRingFill {
+  stroke: var(--green);
+  transition: stroke-dasharray 0.3s ease;
+}
+
+.contextUsageChip.warning .contextRingFill {
+  stroke: var(--amber);
+}
+
+.contextUsageChip.danger .contextRingFill {
+  stroke: var(--red);
+}
+
+.contextUsageChip .contextUsagePopover {
+  top: auto;
+  bottom: calc(100% + 10px);
+  left: 50%;
+  transform: translate(-50%, 4px);
+}
+
+.contextUsageChip:hover .contextUsagePopover,
+.contextUsageChip:focus-within .contextUsagePopover,
+.contextUsageChip:focus .contextUsagePopover {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translate(-50%, 0);
+}
+
+.contextCompactButton {
+  margin-top: 10px;
+}
+
+/* ── Home view (empty session state) ──────────────────────────────────── */
+
+.homeView {
+  max-width: 680px;
+  width: 100%;
+  margin: 0 auto;
+  padding: clamp(24px, 6vh, 64px) 8px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 26px;
+}
+
+.homeHello h1 {
+  margin: 0;
+  font-size: 24px;
+  font-weight: 750;
+  letter-spacing: -0.3px;
+}
+
+.homeHello p {
+  margin: 6px 0 0;
+  color: var(--muted);
+}
+
+.homeModeCards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 12px;
+}
+
+.homeModeCard {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 16px 14px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+  box-shadow: var(--shadow-card);
+  transition: transform 0.15s ease, border-color 0.15s ease;
+}
+
+.homeModeCard:hover {
+  transform: translateY(-2px);
+  border-color: var(--accent-border);
+}
+
+.homeModeCard.active {
+  border-color: var(--accent-border);
+  background:
+    linear-gradient(180deg, var(--accent-softer), transparent 70%),
+    var(--surface);
+}
+
+.homeModeIcon {
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  display: grid;
+  place-items: center;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.homeModeDescription {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.homeSection h2 {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 750;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+.homeRecentRow {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 13px;
+  margin-bottom: 8px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.homeRecentRow:hover:not(:disabled) {
+  border-color: var(--accent-border);
+  background: var(--surface-elevated);
+}
+
+.homeRecentRow:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.homeRecentInfo {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.homeRecentInfo strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.homeRecentInfo small {
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.homeBadge {
+  flex: none;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.homeBadge.running {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.homeBadge.pending {
+  background: var(--warning-soft);
+  color: var(--warning-text);
+}
+
+:root[data-theme="dark"] .rightPanel {
+  box-shadow:
+    -10px 0 30px rgba(0, 0, 0, 0.25),
+    var(--inset-line);
+}
+
+.timeline > .inlineApprovalCard {
+  margin-left: 40px;
+}
+
+/* ── Transient notice toast ────────────────────────────────────────────── */
+
+.noticeToast {
+  position: fixed;
+  bottom: 108px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 60;
+  max-width: min(520px, calc(100vw - 48px));
+  padding: 8px 16px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface-elevated);
+  color: var(--ink);
+  font-size: 12.5px;
+  font-weight: 600;
+  box-shadow: var(--shadow-soft);
+  pointer-events: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  animation: noticeToastIn 0.18s ease-out both;
+}
+
+.noticeToast.success {
+  border-color: var(--green);
+  background: var(--success-soft);
+  color: var(--success-text);
+}
+
+.noticeToast.error {
+  border-color: var(--danger-text);
+  background: var(--danger-soft);
+  color: var(--danger-text);
+}
+
+@keyframes noticeToastIn {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 6px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
 }

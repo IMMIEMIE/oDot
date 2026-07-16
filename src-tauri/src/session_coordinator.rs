@@ -5,9 +5,11 @@ use std::{
 };
 
 type SessionLock = Arc<tokio::sync::Mutex<()>>;
+type InterruptSignal = tokio::sync::watch::Sender<u64>;
 
 static SESSION_LOCKS: OnceLock<Mutex<HashMap<String, SessionLock>>> = OnceLock::new();
 static INTERRUPT_SEQS: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+static INTERRUPT_SIGNALS: OnceLock<Mutex<HashMap<String, InterruptSignal>>> = OnceLock::new();
 static RUNNING_SESSIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static PENDING_WAKE_SEQS: OnceLock<Mutex<HashMap<String, Option<i64>>>> = OnceLock::new();
 
@@ -56,13 +58,20 @@ pub fn record_interrupt(session_id: &str, seq: Option<i64>) {
 }
 
 pub fn record_demand(session_id: &str, demand: RunDemand) {
-    let RunDemand::Interrupt { seq: Some(seq) } = demand else {
+    let RunDemand::Interrupt { seq } = demand else {
         return;
     };
-    let interrupts = INTERRUPT_SEQS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut interrupts = interrupts.lock().unwrap_or_else(|error| error.into_inner());
-    let entry = interrupts.entry(session_id.to_string()).or_insert(seq);
-    *entry = (*entry).max(seq);
+    if let Some(seq) = seq {
+        let interrupts = INTERRUPT_SEQS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut interrupts = interrupts.lock().unwrap_or_else(|error| error.into_inner());
+        let entry = interrupts.entry(session_id.to_string()).or_insert(seq);
+        *entry = (*entry).max(seq);
+    }
+    notify_interrupt(session_id);
+}
+
+pub fn subscribe_interrupt(session_id: &str) -> tokio::sync::watch::Receiver<u64> {
+    interrupt_signal(session_id).subscribe()
 }
 
 pub async fn await_idle(session_id: &str) -> RunActivityStatus {
@@ -122,6 +131,21 @@ fn session_lock(session_id: &str) -> SessionLock {
         .entry(session_id.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
+}
+
+fn interrupt_signal(session_id: &str) -> InterruptSignal {
+    let signals = INTERRUPT_SIGNALS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut signals = signals.lock().unwrap_or_else(|error| error.into_inner());
+    signals
+        .entry(session_id.to_string())
+        .or_insert_with(|| tokio::sync::watch::channel(0).0)
+        .clone()
+}
+
+fn notify_interrupt(session_id: &str) {
+    let signal = interrupt_signal(session_id);
+    let next = (*signal.borrow()).wrapping_add(1);
+    signal.send_replace(next);
 }
 
 fn set_running(session_id: &str, running: bool) {
@@ -326,6 +350,17 @@ mod tests {
             async { 2 },
         ));
         assert_eq!(fresh, Some(2));
+    }
+
+    #[test]
+    fn interrupt_notifies_active_subscribers() {
+        let session_id = "session-coordinator-interrupt-signal";
+        let mut interrupt = subscribe_interrupt(session_id);
+
+        record_interrupt(session_id, Some(1));
+
+        assert!(interrupt.has_changed().unwrap());
+        assert_eq!(*interrupt.borrow_and_update(), 1);
     }
 
     #[test]

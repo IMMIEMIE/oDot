@@ -37,6 +37,7 @@ where
     let mut last_executed_step = 0usize;
     let mut activity_status = "completed";
     let mut progress_guard = RepeatedTurnGuard::default();
+    let mut interrupt = session_coordinator::subscribe_interrupt(&session.id);
     storage::append_event(
         conn,
         &session.id,
@@ -223,6 +224,7 @@ where
                     &current_prompt,
                     &messages,
                     &skill_config.sources,
+                    &mut interrupt,
                 )
                 .await
             } else {
@@ -237,6 +239,7 @@ where
                     &current_prompt,
                     &messages,
                     &skill_config.sources,
+                    &mut interrupt,
                 )
                 .await
             };
@@ -277,6 +280,7 @@ where
                 &current_prompt,
                 &user_prompt,
                 &skill_config.sources,
+                &mut interrupt,
             )
             .await
             {

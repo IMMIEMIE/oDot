@@ -34,37 +34,72 @@ export type ODotRealtimeEvent = {
 };
 
 type SessionEventState = {
-  eventsResponse: SessionEventsResponse;
+  responsesBySessionId: Record<string, SessionEventsResponse>;
   setEventsResponse: (
+    sessionId: string,
     next:
       | SessionEventsResponse
       | ((current: SessionEventsResponse) => SessionEventsResponse)
   ) => void;
-  clearEvents: () => void;
-  mergeEventsResponse: (incoming: SessionEventsResponse) => void;
+  clearEvents: (sessionId?: string) => void;
+  mergeEventsResponse: (sessionId: string, incoming: SessionEventsResponse) => void;
   applyRealtimeEvent: (incoming: ODotRealtimeEvent) => void;
 };
 
 export const useSessionEventStore = create<SessionEventState>((set) => ({
-  eventsResponse: EMPTY_SESSION_EVENTS,
-  setEventsResponse: (next) =>
+  responsesBySessionId: {},
+  setEventsResponse: (sessionId, next) =>
     set((state) => ({
-      eventsResponse:
-        typeof next === "function" ? next(state.eventsResponse) : next
+      responsesBySessionId: {
+        ...state.responsesBySessionId,
+        [sessionId]:
+          typeof next === "function"
+            ? next(state.responsesBySessionId[sessionId] ?? EMPTY_SESSION_EVENTS)
+            : next
+      }
     })),
-  clearEvents: () => set({ eventsResponse: EMPTY_SESSION_EVENTS }),
-  mergeEventsResponse: (incoming) =>
+  clearEvents: (sessionId) =>
     set((state) => ({
-      eventsResponse: mergeSessionEvents(state.eventsResponse, incoming)
+      responsesBySessionId: sessionId
+        ? withoutSession(state.responsesBySessionId, sessionId)
+        : {}
+    })),
+  mergeEventsResponse: (sessionId, incoming) =>
+    set((state) => ({
+      responsesBySessionId: {
+        ...state.responsesBySessionId,
+        [sessionId]: mergeSessionEvents(
+          state.responsesBySessionId[sessionId] ?? EMPTY_SESSION_EVENTS,
+          incoming
+        )
+      }
     })),
   applyRealtimeEvent: (incoming) =>
     set((state) => ({
-      eventsResponse: mergeRealtimeEvent(state.eventsResponse, incoming)
+      responsesBySessionId: {
+        ...state.responsesBySessionId,
+        [incoming.sessionId]: mergeRealtimeEvent(
+          state.responsesBySessionId[incoming.sessionId] ?? EMPTY_SESSION_EVENTS,
+          incoming
+        )
+      }
     }))
 }));
 
-export function currentSessionEvents() {
-  return useSessionEventStore.getState().eventsResponse;
+export function currentSessionEvents(sessionId: string) {
+  return (
+    useSessionEventStore.getState().responsesBySessionId[sessionId] ??
+    EMPTY_SESSION_EVENTS
+  );
+}
+
+function withoutSession(
+  responses: Record<string, SessionEventsResponse>,
+  sessionId: string
+) {
+  const next = { ...responses };
+  delete next[sessionId];
+  return next;
 }
 
 export function mergeSessionEvents(

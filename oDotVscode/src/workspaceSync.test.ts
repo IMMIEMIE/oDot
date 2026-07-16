@@ -55,9 +55,11 @@ test("only missing discovery or refused connections trigger app wake", () => {
   assert.equal(shouldWakeODot({ code: "ETIMEDOUT" }), false);
 });
 
-test("manual shutdown blocks heartbeat and focus wakeups", () => {
+test("only explicit user actions can restart oDot", () => {
   assert.equal(canRestartAfterManualShutdown("heartbeat"), false);
   assert.equal(canRestartAfterManualShutdown("focus"), false);
-  assert.equal(canRestartAfterManualShutdown("folder-change"), true);
-  assert.equal(canRestartAfterManualShutdown("activation"), true);
+  assert.equal(canRestartAfterManualShutdown("folder-change"), false);
+  assert.equal(canRestartAfterManualShutdown("editor-change"), false);
+  assert.equal(canRestartAfterManualShutdown("activation"), false);
+  assert.equal(canRestartAfterManualShutdown("explicit"), true);
 });

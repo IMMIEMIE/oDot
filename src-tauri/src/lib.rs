@@ -649,6 +649,20 @@ fn reveal_project_path(app: AppHandle, input: RevealPathInput) -> Result<(), Str
     reveal_in_file_manager(&target_to_open)
 }
 
+#[tauri::command]
+fn reveal_provider_config(path: String) -> Result<(), String> {
+    let target = Path::new(&path);
+    let target_to_open = if target.exists() {
+        target
+    } else {
+        target
+            .parent()
+            .filter(|parent| parent.exists())
+            .ok_or_else(|| format!("Configuration path does not exist: {path}"))?
+    };
+    reveal_in_file_manager(target_to_open)
+}
+
 fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
@@ -860,6 +874,7 @@ pub fn run() {
             save_shell_policy,
             persist_plan_file,
             reveal_project_path,
+            reveal_provider_config,
             list_project_files,
             get_bridge_status,
             get_bridge_clients,

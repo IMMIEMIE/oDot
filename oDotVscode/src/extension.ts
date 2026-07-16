@@ -161,11 +161,8 @@ async function pollBridgeReachability() {
     } else if (!reachable) {
       bridgeReachable = false;
     }
-  } catch (error) {
+  } catch {
     bridgeReachable = false;
-    if (shouldWakeODot(error)) {
-      await wakeODot("heartbeat");
-    }
   }
 }
 
@@ -300,11 +297,8 @@ async function publishWorkspaceSessions(reason: WorkspaceReason, force = false) 
     }
     lastPublishedWorkspaceRoot = workspaceRoot;
     bridgeReachable = true;
-  } catch (error) {
+  } catch {
     bridgeReachable = false;
-    if (shouldWakeODot(error)) {
-      await wakeODot(reason);
-    }
   }
 }
 
@@ -323,7 +317,18 @@ async function runCommand(command: () => Promise<void>) {
   try {
     await command();
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    let commandError = error;
+    if (shouldWakeODot(error)) {
+      await wakeODot("explicit");
+      try {
+        await waitForBridgeReady();
+        await command();
+        return;
+      } catch (retryError) {
+        commandError = retryError;
+      }
+    }
+    const message = commandError instanceof Error ? commandError.message : String(commandError);
     vscode.window.showErrorMessage(`oDot: ${message}`);
   }
 }
@@ -617,6 +622,11 @@ function ensureProtocolResponse(response: { statusCode: number; body: string }) 
 }
 
 async function wakeODot(reason: WorkspaceReason | "heartbeat" | "explicit") {
+  // Heartbeats and workspace lifecycle events must never resurrect an app the
+  // user closed (including a force-kill, which cannot leave a shutdown marker).
+  if (!canRestartAfterManualShutdown(reason)) {
+    return;
+  }
   const now = Date.now();
   if (now - lastWakeAttempt < BRIDGE_WAKE_RETRY_MS) {
     return;
@@ -627,9 +637,6 @@ async function wakeODot(reason: WorkspaceReason | "heartbeat" | "explicit") {
     () => true,
     () => false
   );
-  if (manuallyStopped && !canRestartAfterManualShutdown(reason)) {
-    return;
-  }
   if (manuallyStopped) {
     await fs.unlink(shutdownMarker).catch(() => undefined);
   }
@@ -657,6 +664,26 @@ async function wakeODot(reason: WorkspaceReason | "heartbeat" | "explicit") {
     () => undefined,
     () => undefined
   );
+}
+
+async function waitForBridgeReady(timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown = new Error("oDot did not become ready in time.");
+  while (Date.now() < deadline) {
+    try {
+      const config = await bridgeConfig();
+      const response = await requestJson(config, "GET", "/v2/status");
+      ensureProtocolResponse(response);
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        return;
+      }
+      lastError = new Error(`Bridge responded with HTTP ${response.statusCode}: ${response.body}`);
+    } catch (error) {
+      lastError = error;
+    }
+    await delay(250);
+  }
+  throw lastError;
 }
 
 function byteLength(value: string) {

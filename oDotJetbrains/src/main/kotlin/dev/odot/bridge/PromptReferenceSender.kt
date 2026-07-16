@@ -35,7 +35,12 @@ object PromptReferenceSender {
                     )
                 }
             } catch (e: Exception) {
-                OdotNotifications.error(project, "oDot: ${e.message ?: e.toString()}")
+                if (WorkspaceModel.shouldWake(e)) {
+                    WakeService.wake("explicit")
+                    OdotNotifications.info(project, "oDot is starting. Run the send command again when it opens.")
+                } else {
+                    OdotNotifications.error(project, "oDot: ${e.message ?: e.toString()}")
+                }
             }
         }
     }

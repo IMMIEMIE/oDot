@@ -15,6 +15,7 @@ import {
   FolderOpen,
   History,
   KeyRound,
+  ListChecks,
   Loader2,
   Maximize2,
   MessageSquare,
@@ -32,7 +33,8 @@ import {
   Trash2,
   Upload,
   Wrench,
-  X
+  X,
+  Zap
 } from "lucide-react";
 import { OdodBotIcon } from "./OdodBotIcon";
 import { emit, listen } from "@tauri-apps/api/event";
@@ -86,6 +88,7 @@ import {
   pickSkillFile,
   promoteTask,
   quitApp,
+  revealProviderConfig,
   revealProjectPath,
   rejectToolCall,
   reportWorkspaceResolution,
@@ -203,8 +206,31 @@ type Notice = {
 
 type ThemeMode = "system" | "light" | "dark";
 type ResolvedTheme = "light" | "dark";
+type RightPanelTab = "plan" | "tasks" | "changes";
 
 type PromptAttachmentSummary = Omit<PromptAttachment, "id" | "content">;
+
+type SessionUiState = {
+  isLoading: boolean;
+  isRealtimeWorking: boolean;
+  isSubmitting: boolean;
+  isContinuing: boolean;
+  isStopping: boolean;
+  isMutating: boolean;
+  streamingEventId: string | null;
+  lastError: string | null;
+};
+
+const EMPTY_SESSION_UI: SessionUiState = {
+  isLoading: false,
+  isRealtimeWorking: false,
+  isSubmitting: false,
+  isContinuing: false,
+  isStopping: false,
+  isMutating: false,
+  streamingEventId: null,
+  lastError: null
+};
 
 const PROJECT_ROOT_STORAGE_KEY = "odot.projectRoot";
 const COLLAPSED_PROJECTS_STORAGE_KEY = "odot.collapsedProjects";
@@ -253,28 +279,46 @@ export function App() {
   const [shellPolicy, setShellPolicy] = useState<ShellPolicy>({
     autoAllowlist: []
   });
-  const eventsResponse = useSessionEventStore((state) => state.eventsResponse);
-  const setEventsResponse = useSessionEventStore(
+  const eventsResponse = useSessionEventStore(
+    (state) => state.responsesBySessionId[selectedSessionId] ?? EMPTY_EVENTS
+  );
+  const setSessionEventsResponse = useSessionEventStore(
     (state) => state.setEventsResponse
   );
+  const clearSessionEvents = useSessionEventStore((state) => state.clearEvents);
   const applyRealtimeEvent = useSessionEventStore(
     (state) => state.applyRealtimeEvent
   );
   const [dismissedJobIds, setDismissedJobIds] = useState<Set<string>>(new Set());
-  const [streamingEventId, setStreamingEventId] = useState<string | null>(null);
+  const [sessionUiById, setSessionUiById] = useState<Record<string, SessionUiState>>({});
   const [prompt, setPrompt] = useState(() => readPromptDraft()?.text ?? "");
-  const [lastError, setLastError] = useState<string | null>(null);
-  const [, setNotice] = useState<Notice>({
+  const [globalLastError, setGlobalLastError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<Notice>({
     tone: "info",
     text: i18n.t("notice.ready")
   });
+  const [isNoticeVisible, setIsNoticeVisible] = useState(false);
+  const noticeSeenRef = useRef(false);
+  // Surface notices as a transient toast. The notice state existed before but
+  // was never rendered anywhere, so success/error feedback was silently lost.
+  useEffect(() => {
+    if (!noticeSeenRef.current) {
+      noticeSeenRef.current = true;
+      return;
+    }
+    if (!notice.text) {
+      return;
+    }
+    setIsNoticeVisible(true);
+    const timer = window.setTimeout(
+      () => setIsNoticeVisible(false),
+      notice.tone === "error" ? 6000 : 3600
+    );
+    return () => window.clearTimeout(timer);
+  }, [notice]);
   const [, setIsBooting] = useState(true);
   const [isSavingConfig, setIsSavingConfig] = useState(false);
   const [isCreatingSession, setIsCreatingSession] = useState(false);
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [isContinuing, setIsContinuing] = useState(false);
-  const [isStopping, setIsStopping] = useState(false);
-  const [isMutating, setIsMutating] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [needsSetup, setNeedsSetup] = useState(false);
   const [setupError, setSetupError] = useState("");
@@ -294,20 +338,26 @@ export function App() {
   const promptInputRef = useRef<HTMLDivElement | null>(null);
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
   const modelMenuRef = useRef<HTMLDivElement | null>(null);
-  const shellModeMenuRef = useRef<HTMLDivElement | null>(null);
-  const realtimeTailTimerRef = useRef<number | undefined>(undefined);
+  const runConfigGroupRef = useRef<HTMLDivElement | null>(null);
+  const realtimeTailTimersRef = useRef(new Map<string, number>());
+  const eventLoadGenerationsRef = useRef(new Map<string, number>());
   const composerReasoningLoadSeq = useRef(0);
   const composerReasoningSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const composerReasoningSaveInFlight = useRef(false);
   const pendingComposerReasoningSave = useRef<string | null>(null);
-  const activeRunIdRef = useRef(0);
-  const stopBaselineSeqRef = useRef(0);
-  const rollbackInFlightRef = useRef(false);
+  const activeRunIdsRef = useRef(new Map<string, number>());
+  const stopBaselineSeqsRef = useRef(new Map<string, number>());
+  const realtimeWorkingSessionIdsRef = useRef(new Set<string>());
+  const sessionSwitchGenerationRef = useRef(0);
+  const selectedSessionIdRef = useRef("");
+  const promptSubmitGuardRef = useRef(false);
+  const rollbackInFlightSessionIdsRef = useRef(new Set<string>());
   const promptDraftHydratedRef = useRef(false);
   const promptDraftUpdatedAtRef = useRef(readPromptDraft()?.updatedAt ?? 0);
   const pendingExternalProjectRootRef = useRef<string | null>(null);
   const appearanceRestoredRef = useRef(false);
   const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
+  const [isRunModeMenuOpen, setIsRunModeMenuOpen] = useState(false);
   const [isShellModeMenuOpen, setIsShellModeMenuOpen] = useState(false);
   const [composerReasoningEfforts, setComposerReasoningEfforts] = useState<ReasoningEffort[]>([]);
   const [composerReasoningEffort, setComposerReasoningEffort] =
@@ -340,11 +390,105 @@ export function App() {
   }>({ open: false, query: "", start: 0, end: 0, activeIndex: 0 });
   const [leftWidth, setLeftWidth] = useState(() => {
     const stored = Number(localStorage.getItem("odot.leftWidth"));
-    return Number.isFinite(stored) && stored >= 300 ? stored : 420;
+    // Accept anything the resize handle can produce (min 260), otherwise the
+    // persisted width silently reset to the default on next launch.
+    return Number.isFinite(stored) && stored >= 260 ? stored : 420;
   });
-  const [isRightPaneCollapsed, setIsRightPaneCollapsed] = useState(true);
+  const [rightPanelTab, setRightPanelTab] = useState<RightPanelTab | null>(null);
+  const lastRightPanelTabRef = useRef<RightPanelTab>("plan");
   const [isMaximized, setIsMaximized] = useState(false);
-  const [isPlanDockDismissed, setIsPlanDockDismissed] = useState(false);
+
+  const selectedSessionUi = sessionUiById[selectedSessionId] ?? EMPTY_SESSION_UI;
+  const isSessionLoading = selectedSessionUi.isLoading;
+  const isSubmitting = selectedSessionUi.isSubmitting;
+  const isContinuing = selectedSessionUi.isContinuing;
+  const isStopping = selectedSessionUi.isStopping;
+  const isMutating = selectedSessionUi.isMutating;
+  const streamingEventId = selectedSessionUi.streamingEventId;
+  const lastError = selectedSessionId
+    ? selectedSessionUi.lastError
+    : globalLastError;
+
+  useLayoutEffect(() => {
+    selectedSessionIdRef.current = selectedSessionId;
+  }, [selectedSessionId]);
+
+  function updateSessionUi(sessionId: string, patch: Partial<SessionUiState>) {
+    if (!sessionId) {
+      return;
+    }
+    setSessionUiById((current) => ({
+      ...current,
+      [sessionId]: {
+        ...(current[sessionId] ?? EMPTY_SESSION_UI),
+        ...patch
+      }
+    }));
+  }
+
+  function sessionUi(sessionId: string) {
+    return sessionUiById[sessionId] ?? EMPTY_SESSION_UI;
+  }
+
+  function sessionIsWorkingById(sessionId: string) {
+    const ui = sessionUi(sessionId);
+    return (
+      ui.isSubmitting ||
+      ui.isContinuing ||
+      ui.isStopping ||
+      ui.isRealtimeWorking ||
+      sessionResponseIsWorking(currentSessionEvents(sessionId))
+    );
+  }
+
+  function sessionHasPendingApproval(sessionId: string) {
+    const response = currentSessionEvents(sessionId);
+    return (
+      hasUnresolvedPendingTools(response.events) ||
+      visiblePermissionRequests(response.permissions).length > 0
+    );
+  }
+
+  function syncSessionRealtimeWorking(
+    sessionId: string,
+    response: SessionEventsResponse
+  ) {
+    const working = sessionResponseIsWorking(response);
+    if (working) {
+      realtimeWorkingSessionIdsRef.current.add(sessionId);
+    } else {
+      realtimeWorkingSessionIdsRef.current.delete(sessionId);
+    }
+    updateSessionUi(sessionId, { isRealtimeWorking: working });
+  }
+
+  function sessionRunId(sessionId: string) {
+    return activeRunIdsRef.current.get(sessionId) ?? 0;
+  }
+
+  function beginSessionRun(sessionId: string) {
+    const runId = sessionRunId(sessionId) + 1;
+    activeRunIdsRef.current.set(sessionId, runId);
+    return runId;
+  }
+
+  function invalidateSessionRun(sessionId: string) {
+    activeRunIdsRef.current.set(sessionId, sessionRunId(sessionId) + 1);
+  }
+
+  function setSessionNotice(sessionId: string, notice: Notice) {
+    if (selectedSessionIdRef.current === sessionId) {
+      setNotice(notice);
+    }
+  }
+
+  function setLastError(value: string | null) {
+    if (selectedSessionId) {
+      updateSessionUi(selectedSessionId, { lastError: value });
+    } else {
+      setGlobalLastError(value);
+    }
+  }
 
   // Stable-identity handlers for the memoized timeline (see `useStableCallback`).
   const stableExecutePlan = useStableCallback((event: EventRecord) =>
@@ -367,9 +511,10 @@ export function App() {
   useEffect(() => {
     void bootstrap();
     return () => {
-      if (realtimeTailTimerRef.current) {
-        window.clearTimeout(realtimeTailTimerRef.current);
+      for (const timer of realtimeTailTimersRef.current.values()) {
+        window.clearTimeout(timer);
       }
+      realtimeTailTimersRef.current.clear();
       if (composerReasoningSaveTimer.current) {
         clearTimeout(composerReasoningSaveTimer.current);
       }
@@ -442,7 +587,7 @@ export function App() {
   useEffect(() => {
     function syncRightPaneByViewport() {
       if (window.innerWidth < 1000) {
-        setIsRightPaneCollapsed(true);
+        setRightPanelTab(null);
       }
       setLeftWidth((current) => {
         const maxLeftWidth = Math.max(260, Math.min(620, window.innerWidth - 360));
@@ -459,19 +604,41 @@ export function App() {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void listen<ODotRealtimeEvent>("odot:event", ({ payload }) => {
-      if (disposed || payload.sessionId !== selectedSessionId) {
+      if (disposed) {
         return;
       }
       applyRealtimeEvent(payload);
       if (payload.event) {
         scheduleRealtimeTailRefresh(payload.sessionId);
+        if (
+          sessionEventEndsWork(payload.event) &&
+          realtimeWorkingSessionIdsRef.current.delete(payload.sessionId)
+        ) {
+          updateSessionUi(payload.sessionId, { isRealtimeWorking: false });
+        } else if (
+          sessionEventShowsWork(payload.event) &&
+          !realtimeWorkingSessionIdsRef.current.has(payload.sessionId)
+        ) {
+          realtimeWorkingSessionIdsRef.current.add(payload.sessionId);
+          updateSessionUi(payload.sessionId, { isRealtimeWorking: true });
+        }
       }
       if (
         payload.event?.type === "agent.stopped" &&
-        payload.event.seq > stopBaselineSeqRef.current
+        payload.event.seq > (stopBaselineSeqsRef.current.get(payload.sessionId) ?? 0)
       ) {
-        setIsStopping(false);
-        setNotice({ tone: "success", text: i18n.t("notice.agentStopped") });
+        updateSessionUi(payload.sessionId, {
+          isSubmitting: false,
+          isContinuing: false,
+          isStopping: false,
+          isMutating: false,
+          isRealtimeWorking: false
+        });
+        realtimeWorkingSessionIdsRef.current.delete(payload.sessionId);
+        setSessionNotice(payload.sessionId, {
+          tone: "success",
+          text: i18n.t("notice.agentStopped")
+        });
       }
       if (
         payload.kind === "session.start" ||
@@ -494,13 +661,13 @@ export function App() {
       disposed = true;
       unlisten?.();
     };
-  }, [selectedSessionId, applyRealtimeEvent]);
+  }, [applyRealtimeEvent]);
 
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void listen<{ sessionId: string }>("odot:float-session-refresh", ({ payload }) => {
-      if (disposed || payload.sessionId !== selectedSessionId) {
+      if (disposed) {
         return;
       }
       scheduleRealtimeTailRefresh(payload.sessionId);
@@ -516,7 +683,7 @@ export function App() {
       disposed = true;
       unlisten?.();
     };
-  }, [selectedSessionId]);
+  }, []);
 
   const selectedProvider = useMemo(
     () => providers.find((provider) => provider.id === selectedProviderId),
@@ -634,16 +801,19 @@ export function App() {
     [eventsResponse.jobs]
   );
 
-  useEffect(() => {
-    if (
+  useLayoutEffect(() => {
+    const selectedSessionExists = Boolean(
       selectedSessionId &&
-      !availableSessions.some((session) => session.id === selectedSessionId)
-    ) {
-      setSelectedSessionId("");
-      setEventsResponse(EMPTY_EVENTS);
-      setStreamingEventId(null);
+      availableSessions.some((session) => session.id === selectedSessionId)
+    );
+    if (selectedSessionExists) {
+      return;
     }
-  }, [availableSessions, selectedSessionId]);
+    if (!selectedSessionId && eventsResponse === EMPTY_EVENTS) {
+      return;
+    }
+    clearSessionConversation(selectedSessionId);
+  }, [availableSessions, eventsResponse, selectedSessionId]);
 
   useEffect(() => {
     if (!providers.length) {
@@ -724,27 +894,42 @@ export function App() {
     () => visiblePermissionRequests(eventsResponse.permissions),
     [eventsResponse.permissions]
   );
+  const pendingApprovalCount = pendingToolEvents.length + visiblePermissions.length;
+  const sessionCodeChanges = useMemo(
+    () =>
+      mergeCodeChangesByPath(
+        eventsResponse.snapshots.map((snapshot, index) =>
+          codeChangeFromSnapshot(snapshot, index)
+        )
+      ),
+    [eventsResponse.snapshots]
+  );
+  const sessionChangeStats = useMemo(
+    () => codeChangeGroupStats(sessionCodeChanges),
+    [sessionCodeChanges]
+  );
+  const sessionRollbackAllIds = useMemo(
+    () =>
+      [...eventsResponse.snapshots]
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+        .map((snapshot) => snapshot.id),
+    [eventsResponse.snapshots]
+  );
+  const sessionTodoSummary = useMemo(
+    () => buildTodoExecutionSummary(eventsResponse.todos),
+    [eventsResponse.todos]
+  );
+  const planBadgeCount = Math.max(
+    0,
+    sessionTodoSummary.total - sessionTodoSummary.completed
+  );
+  const tasksBadgeCount =
+    visibleJobs.length + visibleQueuedInputs.length + activeChildSessions.length;
+  const changesBadgeCount = sessionCodeChanges.length;
 
-  // Auto-expand right pane when agent needs user approval
-  useEffect(() => {
-    if (
-      isRightPaneCollapsed &&
-      (pendingToolEvents.length > 0 ||
-        visiblePermissions.length > 0 ||
-        visibleJobs.length > 0 ||
-        visibleQueuedInputs.length > 0 ||
-        activityPause)
-    ) {
-      setIsRightPaneCollapsed(false);
-    }
-  }, [
-    activityPause,
-    pendingToolEvents,
-    visiblePermissions,
-    visibleJobs.length,
-    visibleQueuedInputs.length,
-    isRightPaneCollapsed,
-  ]);
+  // Blocking approvals now render inline in the conversation flow, so the side
+  // panel no longer force-opens for them (the old effect also made it
+  // impossible to collapse the pane while any background job was visible).
 
   const contextUsageFromEventsMemo = useMemo(
     () => contextUsageFromEvents(eventsResponse),
@@ -789,25 +974,23 @@ export function App() {
     [eventsResponse.events, eventsResponse.snapshots]
   );
 
-  const planRightPaneRef = useRef(isRightPaneCollapsed);
-  // Keep the "latest value" ref in sync via a layout effect (runs before the plan
-  // effect below reads it) instead of mutating it during render.
-  useLayoutEffect(() => {
-    planRightPaneRef.current = isRightPaneCollapsed;
-  });
-
+  const hasPlanActivity =
+    planExecutionEvents.length > 0 || eventsResponse.todos.length > 0 || Boolean(planArtifact);
+  const hadPlanActivityRef = useRef(false);
+  // Auto-open the plan tab once when plan activity starts; closing the panel
+  // afterwards is respected until a new plan run begins.
   useEffect(() => {
-    if (planExecutionEvents.length > 0 || eventsResponse.todos.length > 0 || planArtifact) {
-      setIsPlanDockDismissed(false);
-      if (planRightPaneRef.current) {
-        setIsRightPaneCollapsed(false);
-      }
+    if (hasPlanActivity && !hadPlanActivityRef.current && window.innerWidth >= 1000) {
+      setRightPanelTab((current) => {
+        if (current) {
+          return current;
+        }
+        lastRightPanelTabRef.current = "plan";
+        return "plan";
+      });
     }
-  }, [
-    eventsResponse.todos.length,
-    planArtifact,
-    planExecutionEvents.length
-  ]);
+    hadPlanActivityRef.current = hasPlanActivity;
+  }, [hasPlanActivity]);
 
   const latestEventId = eventsResponse.events.at(-1)?.id ?? "";
   const promptEventCount = useMemo(
@@ -818,9 +1001,27 @@ export function App() {
     () => sessionResponseIsWorking(eventsResponse),
     [eventsResponse]
   );
-  const isAgentWorking = isSubmitting || isContinuing || selectedSessionIsWorking;
-  const isPromptLocked = isAgentWorking || isStopping || pendingToolEvents.length > 0;
-  const workspaceSwitchBlocked = isPromptLocked || visiblePermissions.length > 0;
+  const isAgentWorking =
+    isSubmitting ||
+    isContinuing ||
+    selectedSessionUi.isRealtimeWorking ||
+    selectedSessionIsWorking;
+  const isPromptLocked =
+    isSessionLoading || isAgentWorking || isStopping || pendingToolEvents.length > 0;
+  const isPromptInputLocked = isSessionLoading || pendingToolEvents.length > 0;
+  const hasPromptContent = Boolean(
+    prompt.trim() ||
+      promptAttachments.length ||
+      externalPromptReferences.length ||
+      loadedSkills.length
+  );
+  const currentProjectHasBusySession = sessions.some(
+    (session) =>
+      normalizeProjectRootKey(session.projectRoot) === normalizeProjectRootKey(projectRoot) &&
+      (sessionIsWorkingById(session.id) || sessionHasPendingApproval(session.id))
+  );
+  const workspaceSwitchBlocked =
+    currentProjectHasBusySession || isPromptLocked || visiblePermissions.length > 0;
   const floatAgentStatus = useMemo(
     () =>
       deriveFloatAgentStatus({
@@ -920,8 +1121,8 @@ export function App() {
         if (disposed || !isVisible) {
           return;
         }
-        if (isPromptLocked) {
-          setNotice({ tone: "error", text: t("prompt.agentWorking") });
+        if (isPromptInputLocked) {
+          setNotice({ tone: "error", text: t("prompt.pendingCommands") });
           return;
         }
         const nextReferences = externalPromptReferencesFromPayload(payload);
@@ -949,7 +1150,7 @@ export function App() {
       disposed = true;
       unlisten?.();
     };
-  }, [isPromptLocked, t]);
+  }, [isPromptInputLocked, t]);
 
   useEffect(() => {
     const applyExternalProjectSessions = () => {
@@ -1023,7 +1224,9 @@ export function App() {
         }
         if (payload.sessions.length === 1) {
           dismissExternalProjectSessions();
-          await selectSession(payload.sessions[0]).catch(reportError);
+          await selectSession(payload.sessions[0]).catch((error) =>
+            reportError(error, payload.sessions[0].id)
+          );
           void reportWorkspaceResolution({
             action: "selected",
             workspaceRoot,
@@ -1154,7 +1357,7 @@ export function App() {
       const nextSessions = sessions.length ? sessions : await refreshSessions();
       const session = nextSessions.find((item) => item.id === payload.sessionId);
       if (session) {
-        await selectSession(session).catch(reportError);
+        await selectSession(session).catch((error) => reportError(error, session.id));
         void reportWorkspaceResolution({
           action: "selected",
           workspaceRoot: session.projectRoot,
@@ -1237,7 +1440,7 @@ export function App() {
     const nextHeight = Math.min(input.scrollHeight, maxHeight);
     input.style.height = `${nextHeight}px`;
     input.style.overflowY = input.scrollHeight > maxHeight ? "auto" : "hidden";
-  }, [prompt, isPromptLocked]);
+  }, [prompt, isPromptInputLocked]);
 
   useEffect(() => {
     if (!isModelMenuOpen) {
@@ -1265,18 +1468,20 @@ export function App() {
   }, [isModelMenuOpen]);
 
   useEffect(() => {
-    if (!isShellModeMenuOpen) {
+    if (!isRunModeMenuOpen && !isShellModeMenuOpen) {
       return;
     }
 
     function closeOnOutsidePointer(event: globalThis.PointerEvent) {
-      if (!shellModeMenuRef.current?.contains(event.target as Node)) {
+      if (!runConfigGroupRef.current?.contains(event.target as Node)) {
+        setIsRunModeMenuOpen(false);
         setIsShellModeMenuOpen(false);
       }
     }
 
     function closeOnEscape(event: KeyboardEvent) {
       if (event.key === "Escape") {
+        setIsRunModeMenuOpen(false);
         setIsShellModeMenuOpen(false);
       }
     }
@@ -1287,7 +1492,7 @@ export function App() {
       window.removeEventListener("pointerdown", closeOnOutsidePointer);
       window.removeEventListener("keydown", closeOnEscape);
     };
-  }, [isShellModeMenuOpen]);
+  }, [isRunModeMenuOpen, isShellModeMenuOpen]);
 
   useEffect(() => {
     if (isPromptLocked || selectedSessionId) {
@@ -1297,6 +1502,7 @@ export function App() {
 
   useEffect(() => {
     if (isPromptLocked) {
+      setIsRunModeMenuOpen(false);
       setIsShellModeMenuOpen(false);
     }
   }, [isPromptLocked]);
@@ -1341,9 +1547,8 @@ export function App() {
       if (restorableSession) {
         await selectSession(restorableSession);
       } else {
+        selectedSessionIdRef.current = "";
         setSelectedSessionId("");
-        setEventsResponse(EMPTY_EVENTS);
-        setStreamingEventId(null);
       }
       setNotice({ tone: "success", text: t("notice.workspaceLoaded") });
     } catch (error) {
@@ -1376,8 +1581,7 @@ export function App() {
         !config.providers.some((provider) => provider.id === selectedProviderId)
       ) {
         setSelectedProviderId(preferredProviderId);
-        setSelectedSessionId("");
-        setEventsResponse(EMPTY_EVENTS);
+        clearSessionConversation(selectedSessionId);
       }
       if (!options.keepOpen) {
         setIsSettingsOpen(false);
@@ -1462,9 +1666,8 @@ export function App() {
       ]);
       setSessions(nextSessions);
       setShellPolicy(policy);
+      selectedSessionIdRef.current = "";
       setSelectedSessionId("");
-      setEventsResponse(EMPTY_EVENTS);
-      setStreamingEventId(null);
       setNotice({ tone: "success", text: t("notice.configCreated") });
       const pendingRoot = pendingExternalProjectRootRef.current;
       if (pendingRoot) {
@@ -1480,37 +1683,43 @@ export function App() {
   }
 
   async function selectSession(session: SessionRecord) {
-    const sessionConfigPath =
-      session.configPath ||
-      selectedConfigPathForProject(session.projectRoot) ||
-      (session.projectRoot === projectRoot ? configPath : null);
-    const config = await loadProviderConfig(
-      session.projectRoot,
-      sessionConfigPath
-    );
-    setConfigPath(config.path);
-    rememberConfigPathForProject(session.projectRoot, config.path);
-    setConfigContent(config.content);
-    setProviders(config.providers);
-
+    const switchGeneration = ++sessionSwitchGenerationRef.current;
+    selectedSessionIdRef.current = session.id;
     setSelectedSessionId(session.id);
     rememberLastSessionId(session.id);
-    setProjectRoot(session.projectRoot);
-    setMode(session.mode);
-    setShellMode(session.shellMode);
-    setLoadedSkills([]);
-    const sessionProviderExists = config.providers.some(
-      (provider) => provider.id === session.providerId
-    );
-    setSelectedProviderId(
-      sessionProviderExists ? session.providerId : preferredConfigProviderId(config)
-    );
-    await Promise.all([
-      loadEvents(session.id),
-      refreshProjectCapabilities(session.projectRoot, config.path)
-    ]);
-    if (!sessionProviderExists) {
-      setNotice({ tone: "error", text: t("notice.sessionProviderMissing") });
+    updateSessionUi(session.id, { isLoading: true });
+    try {
+      const sessionConfigPath =
+        session.configPath ||
+        selectedConfigPathForProject(session.projectRoot) ||
+        (session.projectRoot === projectRoot ? configPath : null);
+      const [config, , capabilities] = await Promise.all([
+        loadProviderConfig(session.projectRoot, sessionConfigPath),
+        loadEvents(session.id),
+        listProjectCapabilities(session.projectRoot, sessionConfigPath)
+      ]);
+      if (switchGeneration !== sessionSwitchGenerationRef.current) {
+        return;
+      }
+      setConfigPath(config.path);
+      rememberConfigPathForProject(session.projectRoot, config.path);
+      setConfigContent(config.content);
+      setProviders(config.providers);
+      setProjectCapabilities(capabilities);
+      setProjectRoot(session.projectRoot);
+      setMode(session.mode);
+      setShellMode(session.shellMode);
+      const sessionProviderExists = config.providers.some(
+        (provider) => provider.id === session.providerId
+      );
+      setSelectedProviderId(
+        sessionProviderExists ? session.providerId : preferredConfigProviderId(config)
+      );
+      if (!sessionProviderExists) {
+        setNotice({ tone: "error", text: t("notice.sessionProviderMissing") });
+      }
+    } finally {
+      updateSessionUi(session.id, { isLoading: false });
     }
   }
 
@@ -1580,22 +1789,58 @@ export function App() {
     return nextSessions;
   }
 
+  function clearSessionConversation(sessionId = selectedSessionId) {
+    if (sessionId) {
+      clearLastSessionId(sessionId);
+      eventLoadGenerationsRef.current.set(
+        sessionId,
+        (eventLoadGenerationsRef.current.get(sessionId) ?? 0) + 1
+      );
+      invalidateSessionRun(sessionId);
+      const timer = realtimeTailTimersRef.current.get(sessionId);
+      if (timer) {
+        window.clearTimeout(timer);
+        realtimeTailTimersRef.current.delete(sessionId);
+      }
+      clearSessionEvents(sessionId);
+      realtimeWorkingSessionIdsRef.current.delete(sessionId);
+      setSessionUiById((current) => {
+        const next = { ...current };
+        delete next[sessionId];
+        return next;
+      });
+    }
+    if (!sessionId || selectedSessionIdRef.current === sessionId) {
+      sessionSwitchGenerationRef.current += 1;
+      selectedSessionIdRef.current = "";
+      setSelectedSessionId("");
+    }
+  }
+
   async function loadEvents(sessionId = selectedSessionId) {
     if (!sessionId) {
-      setEventsResponse(EMPTY_EVENTS);
-      setStreamingEventId(null);
       return EMPTY_EVENTS;
     }
+    const loadGeneration = (eventLoadGenerationsRef.current.get(sessionId) ?? 0) + 1;
+    eventLoadGenerationsRef.current.set(sessionId, loadGeneration);
     const response = await getSessionEvents(sessionId);
-    setEventsResponse(response);
-    setStreamingEventId(null);
+    if (loadGeneration !== eventLoadGenerationsRef.current.get(sessionId)) {
+      return response;
+    }
+    setSessionEventsResponse(sessionId, response);
+    syncSessionRealtimeWorking(sessionId, response);
+    updateSessionUi(sessionId, { streamingEventId: null });
     return response;
   }
 
   async function loadEventTail(sessionId: string) {
-    const afterSeq = currentSessionEvents().events.at(-1)?.seq ?? 0;
+    const loadGeneration = eventLoadGenerationsRef.current.get(sessionId) ?? 0;
+    const afterSeq = currentSessionEvents(sessionId).events.at(-1)?.seq ?? 0;
     const response = await tailSessionEvents({ sessionId, afterSeq });
-    setEventsResponse((current) => mergeSessionEvents(current, response));
+    if (loadGeneration !== (eventLoadGenerationsRef.current.get(sessionId) ?? 0)) {
+      return response;
+    }
+    setSessionEventsResponse(sessionId, (current) => mergeSessionEvents(current, response));
     return response;
   }
 
@@ -1610,13 +1855,15 @@ export function App() {
   }
 
   function scheduleRealtimeTailRefresh(sessionId: string) {
-    if (realtimeTailTimerRef.current) {
-      window.clearTimeout(realtimeTailTimerRef.current);
+    const existingTimer = realtimeTailTimersRef.current.get(sessionId);
+    if (existingTimer) {
+      window.clearTimeout(existingTimer);
     }
-    realtimeTailTimerRef.current = window.setTimeout(() => {
-      realtimeTailTimerRef.current = undefined;
+    const timer = window.setTimeout(() => {
+      realtimeTailTimersRef.current.delete(sessionId);
       void loadEventTail(sessionId).catch(() => undefined);
     }, 100);
+    realtimeTailTimersRef.current.set(sessionId, timer);
   }
 
   // Switch oDot's active project to a connected IDE window's workspace: reuse the
@@ -1700,8 +1947,8 @@ export function App() {
       return selectedSession;
     }
 
+    selectedSessionIdRef.current = "";
     setSelectedSessionId("");
-    setEventsResponse(EMPTY_EVENTS);
     return createCurrentSession();
   }
 
@@ -1718,6 +1965,7 @@ export function App() {
     if (!targetRoot) {
       throw new Error(t("error.selectProject"));
     }
+    const selectionGeneration = ++sessionSwitchGenerationRef.current;
     setIsCreatingSession(true);
     try {
       const config = await loadProviderConfig(
@@ -1728,14 +1976,6 @@ export function App() {
       if (!providerId) {
         throw new Error(t("error.providerMissing"));
       }
-      setProjectRoot(targetRoot);
-      setSelectedSessionId("");
-      setEventsResponse(EMPTY_EVENTS);
-      setConfigPath(config.path);
-      rememberConfigPathForProject(targetRoot, config.path);
-      setConfigContent(config.content);
-      setProviders(config.providers);
-      setSelectedProviderId(providerId);
       const session = await createSession({
         projectRoot: targetRoot,
         mode,
@@ -1743,12 +1983,24 @@ export function App() {
         shellMode,
         configPath: config.path || selectedConfigPathForProject(targetRoot) || null
       });
-      await refreshSessions();
-      setSelectedSessionId(session.id);
-      rememberLastSessionId(session.id);
-      setNotice({ tone: "success", text: t("notice.sessionCreated") });
-      setEventsResponse(EMPTY_EVENTS);
-      await refreshProjectCapabilities(targetRoot, config.path);
+      setSessionEventsResponse(session.id, EMPTY_EVENTS);
+      const [, capabilities] = await Promise.all([
+        refreshSessions(),
+        listProjectCapabilities(targetRoot, config.path)
+      ]);
+      if (selectionGeneration === sessionSwitchGenerationRef.current) {
+        setProjectRoot(targetRoot);
+        setConfigPath(config.path);
+        rememberConfigPathForProject(targetRoot, config.path);
+        setConfigContent(config.content);
+        setProviders(config.providers);
+        setSelectedProviderId(providerId);
+        setProjectCapabilities(capabilities);
+        selectedSessionIdRef.current = session.id;
+        setSelectedSessionId(session.id);
+        rememberLastSessionId(session.id);
+        setNotice({ tone: "success", text: t("notice.sessionCreated") });
+      }
       return session;
     } catch (error) {
       reportError(error);
@@ -1759,6 +2011,7 @@ export function App() {
   }
 
   async function createCurrentSession(root = projectRoot, targetConfigPath = configPath) {
+    const selectionGeneration = ++sessionSwitchGenerationRef.current;
     setIsCreatingSession(true);
     try {
       const session = await createSession({
@@ -1768,12 +2021,21 @@ export function App() {
       shellMode,
       configPath: targetConfigPath || selectedConfigPathForProject(root) || null
     });
-      await refreshSessions();
-      setSelectedSessionId(session.id);
-      rememberLastSessionId(session.id);
-      setNotice({ tone: "success", text: t("notice.sessionCreated") });
-      setEventsResponse(EMPTY_EVENTS);
-      await refreshProjectCapabilities(root, targetConfigPath || selectedConfigPathForProject(root));
+      setSessionEventsResponse(session.id, EMPTY_EVENTS);
+      const [, capabilities] = await Promise.all([
+        refreshSessions(),
+        listProjectCapabilities(
+          root,
+          targetConfigPath || selectedConfigPathForProject(root)
+        )
+      ]);
+      if (selectionGeneration === sessionSwitchGenerationRef.current) {
+        selectedSessionIdRef.current = session.id;
+        setSelectedSessionId(session.id);
+        rememberLastSessionId(session.id);
+        setProjectCapabilities(capabilities);
+        setNotice({ tone: "success", text: t("notice.sessionCreated") });
+      }
       return session;
     } catch (error) {
       reportError(error);
@@ -1815,7 +2077,7 @@ export function App() {
   }
 
   function handlePromptPaste(event: ReactClipboardEvent<HTMLDivElement>) {
-    if (isPromptLocked) {
+    if (isPromptInputLocked) {
       return;
     }
     const files = clipboardFiles(event.clipboardData);
@@ -2036,24 +2298,45 @@ export function App() {
     );
   }
 
+  function clearPromptComposer() {
+    setPrompt("");
+    clearPromptDraft("main");
+    promptDraftUpdatedAtRef.current = readPromptDraft()?.updatedAt ?? Date.now();
+    setPromptAttachments([]);
+    setExternalPromptReferences([]);
+    setPromptEditorText(promptInputRef.current, "", buildPromptInlineReferences([], []));
+    setLoadedSkills([]);
+    setSkillMenu((current) => ({ ...current, open: false }));
+  }
+
   async function handleSubmitPrompt() {
-    if (
-      (!prompt.trim() &&
-        !promptAttachments.length &&
-        !externalPromptReferences.length &&
-        !loadedSkills.length) ||
-      isPromptLocked
-    ) {
+    if (!hasPromptContent || isPromptInputLocked || promptSubmitGuardRef.current) {
       return;
     }
+    promptSubmitGuardRef.current = true;
+    let releasedSubmitGuard = false;
+    let targetSessionId = selectedSessionId;
+    let queueOnly = false;
+    let runId = 0;
     shouldStickToTimelineBottomRef.current = true;
-    const runId = activeRunIdRef.current + 1;
-    activeRunIdRef.current = runId;
-    setIsSubmitting(true);
-    setNotice({ tone: "info", text: t("notice.agentWorking") });
     try {
       const session = await ensureSession();
-      const previousMaxSeq = eventsResponse.events.at(-1)?.seq ?? 0;
+      targetSessionId = session.id;
+      const targetEvents = currentSessionEvents(targetSessionId);
+      const targetUi = sessionUi(targetSessionId);
+      queueOnly =
+        targetUi.isSubmitting ||
+        targetUi.isContinuing ||
+        sessionResponseIsWorking(targetEvents);
+      runId = queueOnly ? sessionRunId(targetSessionId) : beginSessionRun(targetSessionId);
+      if (!queueOnly) {
+        updateSessionUi(targetSessionId, { isSubmitting: true });
+      }
+      setSessionNotice(targetSessionId, {
+        tone: "info",
+        text: queueOnly ? t("notice.queueingPrompt") : t("notice.agentWorking")
+      });
+      const previousMaxSeq = targetEvents.events.at(-1)?.seq ?? 0;
       const externalReferenceText = formatExternalPromptReferences(externalPromptReferences);
       const editorPrompt = extractPromptEditorText(promptInputRef.current, {
         includeReferences: true
@@ -2063,15 +2346,30 @@ export function App() {
         promptText || t("prompt.continueFromAttachment"),
         [externalReferenceText]
       );
+      const submittedAttachments = promptAttachments.map(toPromptAttachmentInput);
+      const submittedSkills = [...loadedSkills];
+      clearPromptComposer();
+      promptSubmitGuardRef.current = false;
+      releasedSubmitGuard = true;
       const response = await promptSession({
         sessionId: session.id,
         prompt: finalPrompt,
-        attachments: promptAttachments.map(toPromptAttachmentInput),
-        loadedSkills,
+        attachments: submittedAttachments,
+        loadedSkills: submittedSkills,
         delivery: "queue",
         resume: true
       });
-      if (activeRunIdRef.current !== runId) {
+      if (queueOnly) {
+        setSessionEventsResponse(targetSessionId, (current) =>
+          mergeSessionEvents(current, response)
+        );
+        setSessionNotice(targetSessionId, {
+          tone: "success",
+          text: t("notice.promptQueued")
+        });
+        return;
+      }
+      if (sessionRunId(targetSessionId) !== runId) {
         return;
       }
       const latestAssistantEvent = [...response.events]
@@ -2080,34 +2378,32 @@ export function App() {
           (event) =>
             event.type === "assistant.message" && event.seq > previousMaxSeq
         );
-      setEventsResponse(response);
-      setStreamingEventId(latestAssistantEvent?.id ?? null);
+      setSessionEventsResponse(targetSessionId, response);
+      syncSessionRealtimeWorking(targetSessionId, response);
+      updateSessionUi(targetSessionId, {
+        streamingEventId: latestAssistantEvent?.id ?? null
+      });
       await refreshSessions();
-      setPrompt("");
-      clearPromptDraft("main");
-      promptDraftUpdatedAtRef.current = readPromptDraft()?.updatedAt ?? Date.now();
-      setPromptAttachments([]);
-      setExternalPromptReferences([]);
-      setPromptEditorText(promptInputRef.current, "", buildPromptInlineReferences([], []));
-      setLoadedSkills([]);
-      setSkillMenu((current) => ({ ...current, open: false }));
-      setNotice({
+      setSessionNotice(targetSessionId, {
         tone: "success",
         text: hasUnresolvedPendingTools(response.events)
           ? t("notice.waitingCommand")
           : t("notice.agentEnded")
       });
     } catch (error) {
-      if (activeRunIdRef.current !== runId) {
+      if (!releasedSubmitGuard) {
+        promptSubmitGuardRef.current = false;
+      }
+      if (!queueOnly && runId && sessionRunId(targetSessionId) !== runId) {
         return;
       }
-      reportError(error);
-      if (selectedSessionId) {
-        await loadEvents(selectedSessionId).catch(() => undefined);
+      reportError(error, targetSessionId);
+      if (targetSessionId) {
+        await loadEvents(targetSessionId).catch(() => undefined);
       }
     } finally {
-      if (activeRunIdRef.current === runId) {
-        setIsSubmitting(false);
+      if (!queueOnly && runId && sessionRunId(targetSessionId) === runId) {
+        updateSessionUi(targetSessionId, { isSubmitting: false });
       }
     }
   }
@@ -2124,10 +2420,10 @@ export function App() {
       return;
     }
 
-    const runId = activeRunIdRef.current + 1;
-    activeRunIdRef.current = runId;
-    setIsSubmitting(true);
-    setNotice({ tone: "info", text: t("notice.executingPlan") });
+    const sessionId = selectedSession.id;
+    const runId = beginSessionRun(sessionId);
+    updateSessionUi(sessionId, { isSubmitting: true });
+    setSessionNotice(sessionId, { tone: "info", text: t("notice.executingPlan") });
     try {
       const planPath = await persistPlanFile({
         sessionId: selectedSession.id,
@@ -2137,7 +2433,9 @@ export function App() {
         sessionId: selectedSession.id,
         mode: "agent"
       });
-      setMode("agent");
+      if (selectedSessionIdRef.current === sessionId) {
+        setMode("agent");
+      }
       setSessions((current) =>
         current.map((session) =>
           session.id === executionSession.id ? executionSession : session
@@ -2150,29 +2448,32 @@ export function App() {
         delivery: "queue",
         resume: true
       });
-      if (activeRunIdRef.current !== runId) {
+      if (sessionRunId(sessionId) !== runId) {
         return;
       }
       const latestAssistantEvent = [...response.events]
         .reverse()
         .find((event) => event.type === "assistant.message");
-      setEventsResponse(response);
-      setStreamingEventId(latestAssistantEvent?.id ?? null);
+      setSessionEventsResponse(sessionId, response);
+      syncSessionRealtimeWorking(sessionId, response);
+      updateSessionUi(sessionId, {
+        streamingEventId: latestAssistantEvent?.id ?? null
+      });
       await refreshSessions();
-      setNotice({
+      setSessionNotice(sessionId, {
         tone: "success",
         text: hasUnresolvedPendingTools(response.events)
           ? t("notice.waitingCommand")
           : t("notice.planExecutionEnded")
       });
     } catch (error) {
-      if (activeRunIdRef.current !== runId) {
+      if (sessionRunId(sessionId) !== runId) {
         return;
       }
-      reportError(error);
+      reportError(error, sessionId);
     } finally {
-      if (activeRunIdRef.current === runId) {
-        setIsSubmitting(false);
+      if (sessionRunId(sessionId) === runId) {
+        updateSessionUi(sessionId, { isSubmitting: false });
       }
     }
   }
@@ -2180,73 +2481,70 @@ export function App() {
   async function handleStopAgent() {
     const sessionId = selectedSessionId;
     const baselineSeq = eventsResponse.events.at(-1)?.seq ?? 0;
-    stopBaselineSeqRef.current = baselineSeq;
-    activeRunIdRef.current += 1;
-    setIsSubmitting(false);
-    setIsContinuing(false);
-    setIsStopping(true);
-    setNotice({ tone: "info", text: t("notice.stoppingAgent") });
     if (!sessionId) {
-      setIsStopping(false);
       return;
     }
+    stopBaselineSeqsRef.current.set(sessionId, baselineSeq);
+    invalidateSessionRun(sessionId);
+    updateSessionUi(sessionId, {
+      isSubmitting: false,
+      isContinuing: false,
+      isStopping: true
+    });
+    setSessionNotice(sessionId, { tone: "info", text: t("notice.stoppingAgent") });
     try {
       const event = await cancelSession(sessionId);
       applyEventRecord(event);
       if (
         event.type === "agent.stopped" &&
-        event.seq > stopBaselineSeqRef.current
+        event.seq > (stopBaselineSeqsRef.current.get(sessionId) ?? 0)
       ) {
-        setIsStopping(false);
-        setNotice({ tone: "success", text: i18n.t("notice.agentStopped") });
+        updateSessionUi(sessionId, { isStopping: false });
+        setSessionNotice(sessionId, {
+          tone: "success",
+          text: i18n.t("notice.agentStopped")
+        });
       }
     } catch (error) {
-      setIsStopping(false);
-      reportError(error);
+      updateSessionUi(sessionId, { isStopping: false });
+      reportError(error, sessionId);
     }
   }
 
-  async function handleApprove(eventId: string) {
+  async function handleApprove(event: EventRecord) {
     shouldStickToTimelineBottomRef.current = true;
-    const runId = activeRunIdRef.current + 1;
-    activeRunIdRef.current = runId;
-    setIsMutating(true);
-    setIsContinuing(true);
-    setNotice({ tone: "info", text: t("notice.agentContinuing") });
+    const sessionId = event.sessionId;
+    const runId = beginSessionRun(sessionId);
+    updateSessionUi(sessionId, { isMutating: true, isContinuing: true });
+    setSessionNotice(sessionId, { tone: "info", text: t("notice.agentContinuing") });
     try {
-      const sessionId = selectedSessionId;
-      const approvedEvent = await approveToolCall(eventId);
-      if (sessionId) {
-        const response = await continueSession(sessionId);
-        if (activeRunIdRef.current !== runId) {
-          return;
-        }
-        setEventsResponse(response);
-        const nextSessions = await refreshSessions();
-        const currentSession = nextSessions.find((session) => session.id === sessionId);
-        if (currentSession) {
-          setMode(currentSession.mode);
-          setShellMode(currentSession.shellMode);
-        }
-        setNotice({
-          tone: "success",
-          text: hasUnresolvedPendingTools(response.events)
-            ? t("notice.waitingCommand")
-            : t("notice.agentEnded")
-        });
-      } else {
-        applyEventRecord(approvedEvent);
-        setNotice({ tone: "success", text: t("notice.commandApproved") });
-      }
-    } catch (error) {
-      if (activeRunIdRef.current !== runId) {
+      await approveToolCall(event.id);
+      const response = await continueSession(sessionId);
+      if (sessionRunId(sessionId) !== runId) {
         return;
       }
-      reportError(error);
+      setSessionEventsResponse(sessionId, response);
+      syncSessionRealtimeWorking(sessionId, response);
+      const nextSessions = await refreshSessions();
+      const currentSession = nextSessions.find((session) => session.id === sessionId);
+      if (currentSession && selectedSessionIdRef.current === sessionId) {
+          setMode(currentSession.mode);
+          setShellMode(currentSession.shellMode);
+      }
+      setSessionNotice(sessionId, {
+        tone: "success",
+        text: hasUnresolvedPendingTools(response.events)
+          ? t("notice.waitingCommand")
+          : t("notice.agentEnded")
+      });
+    } catch (error) {
+      if (sessionRunId(sessionId) !== runId) {
+        return;
+      }
+      reportError(error, sessionId);
     } finally {
-      if (activeRunIdRef.current === runId) {
-        setIsContinuing(false);
-        setIsMutating(false);
+      if (sessionRunId(sessionId) === runId) {
+        updateSessionUi(sessionId, { isContinuing: false, isMutating: false });
       }
     }
   }
@@ -2258,7 +2556,8 @@ export function App() {
     }
     const allowlistPrefix = shellAllowlistPrefix(command);
 
-    setIsMutating(true);
+    const sessionId = event.sessionId;
+    updateSessionUi(sessionId, { isMutating: true });
     try {
       const nextPolicy = {
         autoAllowlist: Array.from(
@@ -2267,30 +2566,43 @@ export function App() {
       };
       const savedPolicy = await saveShellPolicy(nextPolicy);
       setShellPolicy(savedPolicy);
-      await handleApprove(event.id);
+      await handleApprove(event);
     } catch (error) {
-      reportError(error);
-      setIsMutating(false);
+      reportError(error, sessionId);
+      updateSessionUi(sessionId, { isMutating: false });
     }
   }
 
-  async function handleReject(eventId: string) {
-    setIsMutating(true);
+  async function handleReject(event: EventRecord) {
+    const sessionId = event.sessionId;
+    const runId = beginSessionRun(sessionId);
+    updateSessionUi(sessionId, { isMutating: true, isContinuing: true });
     try {
-      const event = await rejectToolCall(eventId);
-      applyEventRecord(event);
-      setNotice({ tone: "success", text: t("notice.commandRejected") });
+      await rejectToolCall(event.id);
+      const response = await continueSession(sessionId);
+      if (sessionRunId(sessionId) !== runId) {
+        return;
+      }
+      setSessionEventsResponse(sessionId, response);
+      syncSessionRealtimeWorking(sessionId, response);
+      await refreshSessions();
+      setSessionNotice(sessionId, { tone: "success", text: t("notice.commandRejected") });
     } catch (error) {
-      reportError(error);
+      if (sessionRunId(sessionId) === runId) {
+        reportError(error, sessionId);
+      }
     } finally {
-      setIsMutating(false);
+      if (sessionRunId(sessionId) === runId) {
+        updateSessionUi(sessionId, { isContinuing: false, isMutating: false });
+      }
     }
   }
 
-  async function handlePermissionReply(requestId: string, reply: PermissionReply) {
-    setIsMutating(true);
+  async function handlePermissionReply(request: PermissionRequestRecord, reply: PermissionReply) {
+    const sessionId = request.sessionId;
+    updateSessionUi(sessionId, { isMutating: true });
     try {
-      const permission = await replyPermission({ requestId, reply });
+      const permission = await replyPermission({ requestId: request.id, reply });
       applyRealtimeEvent({
         version: 1,
         kind: "permission.answered",
@@ -2298,28 +2610,32 @@ export function App() {
         seq: 0,
         permission
       });
-      setNotice({
+      setSessionNotice(sessionId, {
         tone: reply === "reject" ? "error" : "success",
         text: t("notice.permissionHandled")
       });
     } catch (error) {
-      reportError(error);
+      reportError(error, sessionId);
     } finally {
-      setIsMutating(false);
+      updateSessionUi(sessionId, { isMutating: false });
     }
   }
 
   async function handleCancelJob(jobId: string) {
+    const sessionId = selectedSessionId;
+    if (!sessionId) {
+      return;
+    }
     const job = eventsResponse.jobs.find((item) => item.id === jobId);
-    setIsMutating(true);
+    updateSessionUi(sessionId, { isMutating: true });
     setDismissedJobIds((current) => new Set(current).add(jobId));
-    setEventsResponse((current) => ({
+    setSessionEventsResponse(sessionId, (current) => ({
       ...current,
       jobs: current.jobs.filter((item) => item.id !== jobId)
     }));
     try {
       await cancelJob(jobId);
-      setNotice({ tone: "success", text: t("notice.jobStopped") });
+      setSessionNotice(sessionId, { tone: "success", text: t("notice.jobStopped") });
     } catch (error) {
       setDismissedJobIds((current) => {
         const next = new Set(current);
@@ -2327,46 +2643,56 @@ export function App() {
         return next;
       });
       if (job) {
-        setEventsResponse((current) => ({
+        setSessionEventsResponse(sessionId, (current) => ({
           ...current,
           jobs: current.jobs.some((item) => item.id === jobId)
             ? current.jobs
             : [job, ...current.jobs]
         }));
       }
-      reportError(error);
+      reportError(error, sessionId);
     } finally {
-      setIsMutating(false);
+      updateSessionUi(sessionId, { isMutating: false });
     }
   }
 
   async function handleDeleteQueuedInput(inputId: string) {
-    setIsMutating(true);
+    const sessionId = selectedSessionId;
+    if (!sessionId) {
+      return;
+    }
+    updateSessionUi(sessionId, { isMutating: true });
     try {
       const response = await deleteQueuedInput(inputId);
-      setEventsResponse(response);
-      setNotice({ tone: "success", text: t("notice.queueUpdated", { defaultValue: "Queue updated" }) });
+      setSessionEventsResponse(sessionId, response);
+      syncSessionRealtimeWorking(sessionId, response);
+      setSessionNotice(sessionId, { tone: "success", text: t("notice.queueUpdated", { defaultValue: "Queue updated" }) });
     } catch (error) {
-      reportError(error);
+      reportError(error, sessionId);
     } finally {
-      setIsMutating(false);
+      updateSessionUi(sessionId, { isMutating: false });
     }
   }
 
   async function handleRecoverBackgroundTask(jobId: string, action: "resumeChild" | "abandon") {
-    setIsMutating(true);
+    const sessionId = selectedSessionId;
+    if (!sessionId) {
+      return;
+    }
+    updateSessionUi(sessionId, { isMutating: true });
     try {
       const response = await recoverBackgroundTask({ jobId, action });
-      setEventsResponse(response);
+      setSessionEventsResponse(sessionId, response);
+      syncSessionRealtimeWorking(sessionId, response);
       await refreshSessions();
-      setNotice({
+      setSessionNotice(sessionId, {
         tone: action === "abandon" ? "info" : "success",
         text: t("notice.recoveryActionStarted", { defaultValue: "Recovery action started" })
       });
     } catch (error) {
-      reportError(error);
+      reportError(error, sessionId);
     } finally {
-      setIsMutating(false);
+      updateSessionUi(sessionId, { isMutating: false });
     }
   }
 
@@ -2374,18 +2700,19 @@ export function App() {
     if (!selectedSessionId) {
       return;
     }
-    setIsMutating(true);
+    const sessionId = selectedSessionId;
+    updateSessionUi(sessionId, { isMutating: true });
     try {
       const response = await promoteTask({
-        sessionId: selectedSessionId,
+        sessionId,
         taskSessionId
       });
-      setEventsResponse((current) => mergeSessionEvents(current, response));
-      setNotice({ tone: "success", text: t("notice.agentContinuing") });
+      setSessionEventsResponse(sessionId, (current) => mergeSessionEvents(current, response));
+      setSessionNotice(sessionId, { tone: "success", text: t("notice.agentContinuing") });
     } catch (error) {
-      reportError(error);
+      reportError(error, sessionId);
     } finally {
-      setIsMutating(false);
+      updateSessionUi(sessionId, { isMutating: false });
     }
   }
 
@@ -2394,28 +2721,27 @@ export function App() {
   }
 
   async function handleRollbackMany(snapshotIds: string[], successText: string) {
-    if (rollbackInFlightRef.current) {
+    const sessionId = selectedSessionId;
+    if (!sessionId || rollbackInFlightSessionIdsRef.current.has(sessionId)) {
       return;
     }
     if (!snapshotIds.length) {
       setNotice({ tone: "info", text: t("notice.noRollbackChanges") });
       return;
     }
-    rollbackInFlightRef.current = true;
-    setIsMutating(true);
+    rollbackInFlightSessionIdsRef.current.add(sessionId);
+    updateSessionUi(sessionId, { isMutating: true });
     try {
       for (const snapshotId of snapshotIds) {
         await rollbackSnapshot(snapshotId);
       }
-      if (selectedSessionId) {
-        scheduleRealtimeTailRefresh(selectedSessionId);
-      }
-      setNotice({ tone: "success", text: successText });
+      scheduleRealtimeTailRefresh(sessionId);
+      setSessionNotice(sessionId, { tone: "success", text: successText });
     } catch (error) {
-      reportError(error);
+      reportError(error, sessionId);
     } finally {
-      rollbackInFlightRef.current = false;
-      setIsMutating(false);
+      rollbackInFlightSessionIdsRef.current.delete(sessionId);
+      updateSessionUi(sessionId, { isMutating: false });
     }
   }
 
@@ -2423,9 +2749,10 @@ export function App() {
     if (!selectedSessionId) {
       return;
     }
-    setIsMutating(true);
+    const sessionId = selectedSessionId;
+    updateSessionUi(sessionId, { isMutating: true });
     try {
-      const summary = await compactSession(selectedSessionId);
+      const summary = await compactSession(sessionId);
       applyRealtimeEvent({
         version: 1,
         kind: "context.summary.created",
@@ -2433,12 +2760,12 @@ export function App() {
         seq: summary.recentEventSeq,
         summary
       });
-      scheduleRealtimeTailRefresh(selectedSessionId);
-      setNotice({ tone: "success", text: t("notice.contextCompacted") });
+      scheduleRealtimeTailRefresh(sessionId);
+      setSessionNotice(sessionId, { tone: "success", text: t("notice.contextCompacted") });
     } catch (error) {
-      reportError(error);
+      reportError(error, sessionId);
     } finally {
-      setIsMutating(false);
+      updateSessionUi(sessionId, { isMutating: false });
     }
   }
 
@@ -2451,12 +2778,11 @@ export function App() {
       return;
     }
     shouldStickToTimelineBottomRef.current = true;
-    const runId = activeRunIdRef.current + 1;
-    activeRunIdRef.current = runId;
-    setIsContinuing(true);
-    setIsMutating(true);
+    const sessionId = selectedSessionId;
+    const runId = beginSessionRun(sessionId);
+    updateSessionUi(sessionId, { isContinuing: true, isMutating: true });
     const checkpointId = checkpointIdFromAction(actionId);
-    setNotice({
+    setSessionNotice(sessionId, {
       tone: "info",
       text: checkpointId
         ? t("notice.recoveringCheckpoint")
@@ -2466,7 +2792,7 @@ export function App() {
     });
     try {
       if (actionId === "compact") {
-        const summary = await compactSession(selectedSessionId);
+        const summary = await compactSession(sessionId);
         applyRealtimeEvent({
           version: 1,
           kind: "context.summary.created",
@@ -2474,35 +2800,35 @@ export function App() {
           seq: summary.recentEventSeq,
           summary
         });
-        scheduleRealtimeTailRefresh(selectedSessionId);
+        scheduleRealtimeTailRefresh(sessionId);
       }
       const response = checkpointId
         ? await recoverSessionFromCheckpoint({
-            sessionId: selectedSessionId,
+            sessionId,
             checkpointId
           })
-        : await continueSession(selectedSessionId);
-      if (activeRunIdRef.current !== runId) {
+        : await continueSession(sessionId);
+      if (sessionRunId(sessionId) !== runId) {
         return;
       }
-      setEventsResponse(response);
+      setSessionEventsResponse(sessionId, response);
+      syncSessionRealtimeWorking(sessionId, response);
       await refreshSessions();
-      setNotice({
+      setSessionNotice(sessionId, {
         tone: "success",
         text: hasUnresolvedPendingTools(response.events)
           ? t("notice.waitingCommand")
           : t("notice.agentEnded")
       });
     } catch (error) {
-      if (activeRunIdRef.current !== runId) {
+      if (sessionRunId(sessionId) !== runId) {
         return;
       }
-      reportError(error);
-      await loadEvents(selectedSessionId).catch(() => undefined);
+      reportError(error, sessionId);
+      await loadEvents(sessionId).catch(() => undefined);
     } finally {
-      if (activeRunIdRef.current === runId) {
-        setIsContinuing(false);
-        setIsMutating(false);
+      if (sessionRunId(sessionId) === runId) {
+        updateSessionUi(sessionId, { isContinuing: false, isMutating: false });
       }
     }
   }
@@ -2558,7 +2884,7 @@ export function App() {
 
   function selectAgentMode(nextMode: AgentMode) {
     setMode(nextMode);
-    setIsShellModeMenuOpen(false);
+    setIsRunModeMenuOpen(false);
     if (selectedSessionId) {
       void updateSessionMode({ sessionId: selectedSessionId, mode: nextMode })
         .then((updated) =>
@@ -2752,28 +3078,30 @@ export function App() {
       return;
     }
 
-    setIsMutating(true);
+    updateSessionUi(sessionId, { isMutating: true });
     try {
       await deleteSession(sessionId);
       clearLastSessionId(sessionId);
       const nextSessions = await listSessions();
       setSessions(nextSessions);
-      if (selectedSessionId === sessionId) {
-        const nextSession = nextSessions.find((item) =>
-          providers.some((provider) => provider.id === item.providerId)
-        );
-        if (nextSession) {
-          await selectSession(nextSession);
-        } else {
-          setSelectedSessionId("");
-          setEventsResponse(EMPTY_EVENTS);
-        }
+      const nextAvailableSessions = nextSessions.filter((item) =>
+        providers.some((provider) => provider.id === item.providerId)
+      );
+      const selectedSessionStillExists = nextAvailableSessions.some(
+        (item) => item.id === selectedSessionId
+      );
+      if (!nextAvailableSessions.length) {
+        clearSessionConversation(selectedSessionId);
+      } else if (selectedSessionId && !selectedSessionStillExists) {
+        clearSessionConversation(selectedSessionId);
+        const nextSession = nextAvailableSessions[0];
+        await selectSession(nextSession);
       }
-      setNotice({ tone: "success", text: t("notice.sessionDeleted") });
+      setSessionNotice(sessionId, { tone: "success", text: t("notice.sessionDeleted") });
     } catch (error) {
-      reportError(error);
+      reportError(error, sessionId);
     } finally {
-      setIsMutating(false);
+      updateSessionUi(sessionId, { isMutating: false });
     }
   }
 
@@ -2794,23 +3122,28 @@ export function App() {
       return;
     }
 
-    setIsMutating(true);
+    updateSessionUi(sessionId, { isMutating: true });
     try {
       await updateSessionTitle({ sessionId, title });
       await refreshSessions();
       cancelEditingSession();
-      setNotice({ tone: "success", text: t("notice.sessionTitleUpdated") });
+      setSessionNotice(sessionId, { tone: "success", text: t("notice.sessionTitleUpdated") });
     } catch (error) {
-      reportError(error);
+      reportError(error, sessionId);
     } finally {
-      setIsMutating(false);
+      updateSessionUi(sessionId, { isMutating: false });
     }
   }
 
-  function reportError(error: unknown) {
+  function reportError(error: unknown, sessionId = selectedSessionId) {
     const fullError = errorMessage(error);
-    setLastError(fullError);
-    setNotice({ tone: "error", text: errorSummary(fullError) });
+    if (sessionId) {
+      updateSessionUi(sessionId, { lastError: fullError });
+      setSessionNotice(sessionId, { tone: "error", text: errorSummary(fullError) });
+    } else {
+      setGlobalLastError(fullError);
+      setNotice({ tone: "error", text: errorSummary(fullError) });
+    }
   }
 
   function startLeftResize(event: PointerEvent<HTMLDivElement>) {
@@ -2836,6 +3169,21 @@ export function App() {
     window.addEventListener("pointerup", onUp);
   }
 
+  function openRightPanelTab(tab: RightPanelTab) {
+    lastRightPanelTabRef.current = tab;
+    setRightPanelTab(tab);
+  }
+
+  function toggleRightPanelTab(tab: RightPanelTab) {
+    setRightPanelTab((current) => {
+      if (current === tab) {
+        return null;
+      }
+      lastRightPanelTabRef.current = tab;
+      return tab;
+    });
+  }
+
   function toggleProjectCollapsed(key: string) {
     setCollapsedProjectKeys((current) => {
       const next = new Set(current);
@@ -2849,6 +3197,11 @@ export function App() {
   }
 
   function renderSessionRow(session: SessionRecord) {
+    const rowUi = sessionUi(session.id);
+    const rowWorking = sessionIsWorkingById(session.id);
+    const switchingAcrossProject =
+      normalizeProjectRootKey(session.projectRoot) !== normalizeProjectRootKey(projectRoot);
+    const selectionDisabled = switchingAcrossProject && workspaceSwitchBlocked;
     return (
       <div
         key={session.id}
@@ -2856,7 +3209,13 @@ export function App() {
           session.id === selectedSessionId ? "active" : ""
         } ${session.parentSessionId ? "childSession" : ""}`}
       >
-        {session.parentSessionId ? <OdodBotIcon size={15} /> : <Clock3 size={15} />}
+        {rowWorking ? (
+          <Loader2 className="spin" size={15} aria-label={t("notice.agentWorking")} />
+        ) : session.parentSessionId ? (
+          <OdodBotIcon size={15} />
+        ) : (
+          <Clock3 size={15} />
+        )}
         {editingSessionId === session.id ? (
           <input
             className="sessionTitleInput"
@@ -2878,9 +3237,15 @@ export function App() {
           <button
             type="button"
             className="sessionSelectButton"
-            disabled={isAgentWorking}
-            onClick={() => void selectSession(session).catch(reportError)}
-            onDoubleClick={() => startEditingSession(session)}
+            disabled={selectionDisabled}
+            onClick={() =>
+              void selectSession(session).catch((error) => reportError(error, session.id))
+            }
+            onDoubleClick={() => {
+              if (!rowWorking && !rowUi.isMutating) {
+                startEditingSession(session);
+              }
+            }}
           >
             <strong>{session.title}</strong>
             <small>
@@ -2893,7 +3258,7 @@ export function App() {
           type="button"
           className="rowIconAction"
           aria-label={t("nav.renameSession", { title: session.title })}
-          disabled={editingSessionId === session.id || isMutating || isAgentWorking}
+          disabled={editingSessionId === session.id || rowUi.isMutating || rowWorking}
           onClick={() => startEditingSession(session)}
         >
           <Pencil size={14} />
@@ -2902,11 +3267,104 @@ export function App() {
           type="button"
           className="rowIconAction danger"
           aria-label={t("nav.deleteSession", { title: session.title })}
-          disabled={isMutating || isAgentWorking}
+          disabled={rowUi.isMutating || rowWorking}
           onClick={() => void handleDeleteSession(session.id)}
         >
           <Trash2 size={14} />
         </button>
+      </div>
+    );
+  }
+
+  function renderHomeView() {
+    const hour = new Date().getHours();
+    const greeting =
+      hour < 6
+        ? t("home.greetingNight")
+        : hour < 12
+          ? t("home.greetingMorning")
+          : hour < 18
+            ? t("home.greetingAfternoon")
+            : t("home.greetingEvening");
+    const recentSessions = availableSessions
+      .filter((session) => !session.parentSessionId)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+      .slice(0, 5);
+    const modeCards: { value: AgentMode; icon: ReactNode; description: string }[] = [
+      {
+        value: "ask",
+        icon: <MessageSquare size={18} />,
+        description: t("home.askDescription")
+      },
+      {
+        value: "plan",
+        icon: <ListChecks size={18} />,
+        description: t("home.planDescription")
+      },
+      {
+        value: "agent",
+        icon: <Zap size={18} />,
+        description: t("home.agentDescription")
+      }
+    ];
+    return (
+      <div className="homeView">
+        <div className="homeHello">
+          <h1>{greeting}</h1>
+          <p>{t("home.subtitle")}</p>
+        </div>
+        <div className="homeModeCards">
+          {modeCards.map((card) => (
+            <button
+              key={card.value}
+              type="button"
+              className={`homeModeCard ${mode === card.value ? "active" : ""}`}
+              onClick={() => selectAgentMode(card.value)}
+            >
+              <span className="homeModeIcon">{card.icon}</span>
+              <strong>{modeLabel(card.value)}</strong>
+              <span className="homeModeDescription">{card.description}</span>
+            </button>
+          ))}
+        </div>
+        {recentSessions.length > 0 && (
+          <div className="homeSection">
+            <h2>{t("home.recentSessions")}</h2>
+            {recentSessions.map((session) => {
+              const working = sessionIsWorkingById(session.id);
+              const pendingApproval = sessionHasPendingApproval(session.id);
+              const switchingAcrossProject =
+                normalizeProjectRootKey(session.projectRoot) !==
+                normalizeProjectRootKey(projectRoot);
+              return (
+                <button
+                  key={session.id}
+                  type="button"
+                  className="homeRecentRow"
+                  disabled={switchingAcrossProject && workspaceSwitchBlocked}
+                  onClick={() =>
+                    void selectSession(session).catch((error) =>
+                      reportError(error, session.id)
+                    )
+                  }
+                >
+                  <span className="homeRecentInfo">
+                    <strong>{session.title}</strong>
+                    <small>
+                      {projectDisplayName(session.projectRoot)} · {modeLabel(session.mode)}{" "}
+                      · {formatSessionUpdatedAt(session.updatedAt)}
+                    </small>
+                  </span>
+                  {working ? (
+                    <span className="homeBadge running">{t("home.running")}</span>
+                  ) : pendingApproval ? (
+                    <span className="homeBadge pending">{t("home.pendingApproval")}</span>
+                  ) : null}
+                </button>
+              );
+            })}
+          </div>
+        )}
       </div>
     );
   }
@@ -2921,7 +3379,7 @@ export function App() {
               className="iconButton ghost"
               aria-label={t("nav.newProject")}
               title={t("nav.newProject")}
-              disabled={isCreatingSession || isAgentWorking || !selectedProviderId}
+              disabled={isCreatingSession || workspaceSwitchBlocked || !selectedProviderId}
               onClick={() => void createCurrentSessionInDirectory().catch(() => undefined)}
             >
               {isCreatingSession ? <Loader2 className="spin" size={16} /> : <Plus size={16} />}
@@ -2948,7 +3406,7 @@ export function App() {
                     type="button"
                     className={`projectHeaderButton${ide && !ide.online ? " offline" : ""}`}
                     title={group.root}
-                    disabled={isAgentWorking}
+                    disabled={workspaceSwitchBlocked}
                     onClick={() => void switchToWorkspace(group.root)}
                   >
                     <span className="projectHeaderIcon">
@@ -2974,7 +3432,12 @@ export function App() {
                     className="rowIconAction"
                     aria-label={t("nav.newSessionInProject")}
                     title={t("nav.newSessionInProject")}
-                    disabled={isCreatingSession || isAgentWorking || !selectedProviderId}
+                    disabled={
+                      isCreatingSession ||
+                      (normalizeProjectRootKey(group.root) !==
+                        normalizeProjectRootKey(projectRoot) && workspaceSwitchBlocked) ||
+                      !selectedProviderId
+                    }
                     onClick={() =>
                       void createSessionForProjectRoot(group.root).catch(() => undefined)
                     }
@@ -3003,7 +3466,7 @@ export function App() {
     <div
       className="appShell"
       style={{
-        gridTemplateColumns: `${leftWidth}px 6px minmax(0, 1fr) ${isRightPaneCollapsed ? 0 : 344}px`
+        gridTemplateColumns: `${leftWidth}px 6px minmax(0, 1fr) auto`
       }}
     >
       <header className="windowChrome">
@@ -3041,14 +3504,35 @@ export function App() {
           role="group"
           aria-label="Window actions"
         >
+          {pendingApprovalCount > 0 && (
+            <button
+              className="pendingApprovalChip"
+              type="button"
+              title={t("approval.pendingChip", { count: pendingApprovalCount })}
+              onClick={() =>
+                timelineEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" })
+              }
+            >
+              <span className="pendingApprovalPulse" aria-hidden="true" />
+              {t("approval.pendingChip", { count: pendingApprovalCount })}
+            </button>
+          )}
           <button
             className="windowControlButton"
             type="button"
-            aria-label={isRightPaneCollapsed ? t("nav.expandRightPane") : t("nav.collapseRightPane")}
-            title={isRightPaneCollapsed ? t("nav.expandRightPane") : t("nav.collapseRightPane")}
-            onClick={() => setIsRightPaneCollapsed((current) => !current)}
+            aria-label={rightPanelTab ? t("nav.collapseRightPane") : t("nav.expandRightPane")}
+            title={rightPanelTab ? t("nav.collapseRightPane") : t("nav.expandRightPane")}
+            onClick={() =>
+              setRightPanelTab((current) => {
+                if (current) {
+                  lastRightPanelTabRef.current = current;
+                  return null;
+                }
+                return lastRightPanelTabRef.current;
+              })
+            }
           >
-            {isRightPaneCollapsed ? <ChevronLeft size={16} /> : <ChevronRight size={16} />}
+            {rightPanelTab ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
           </button>
           <button
             type="button"
@@ -3105,15 +3589,135 @@ export function App() {
               onRollbackSnapshots={stableRollbackSnapshots}
               onRecoverAgent={stableRecoverAgent}
             />
-            {!eventsResponse.events.length && (
-              <div className="emptyTimeline">
-                <BrainCircuit size={28} />
-                <span>{t("empty.startPrompt")}</span>
+            {pendingToolEvents.map((event) => (
+              <div className="inlineApprovalCard" key={event.id}>
+                <header className="inlineApprovalHeader">
+                  <Terminal size={14} />
+                  <strong>{t("approval.commandTitle")}</strong>
+                </header>
+                <div className="inlineApprovalBody">
+                  <code>{pendingCommand(event)}</code>
+                  <div className="inlineApprovalActions">
+                    <button
+                      type="button"
+                      className="inlineApprovalButton primary"
+                      disabled={isMutating}
+                      onClick={() => void handleApprove(event)}
+                    >
+                      <Check size={14} />
+                      {t("common.approve")}
+                    </button>
+                    {isShellPending(event) && (
+                      <button
+                        type="button"
+                        className="inlineApprovalButton"
+                        disabled={isMutating}
+                        onClick={() => void handleApproveAndAllow(event)}
+                      >
+                        <Save size={14} />
+                        {t("common.acceptAndAllowlist")}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="inlineApprovalButton danger"
+                      disabled={isMutating}
+                      onClick={() => void handleReject(event)}
+                    >
+                      <X size={14} />
+                      {t("common.reject")}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ))}
+            {visiblePermissions.map((request) => (
+              <div className="inlineApprovalCard" key={request.id}>
+                <header className="inlineApprovalHeader">
+                  <KeyRound size={14} />
+                  <strong>{t("approval.permissionTitle")}</strong>
+                </header>
+                <div className="inlineApprovalBody">
+                  <code>
+                    {request.action}: {request.resources.join(", ")}
+                  </code>
+                  <div className="inlineApprovalActions">
+                    <button
+                      type="button"
+                      className="inlineApprovalButton primary"
+                      disabled={isMutating}
+                      onClick={() => void handlePermissionReply(request, "once")}
+                    >
+                      <Check size={14} />
+                      {t("common.allowOnce")}
+                    </button>
+                    <button
+                      type="button"
+                      className="inlineApprovalButton"
+                      disabled={isMutating}
+                      onClick={() => void handlePermissionReply(request, "always")}
+                    >
+                      <Save size={14} />
+                      {t("common.allowAlways")}
+                    </button>
+                    <button
+                      type="button"
+                      className="inlineApprovalButton danger"
+                      disabled={isMutating}
+                      onClick={() => void handlePermissionReply(request, "reject")}
+                    >
+                      <X size={14} />
+                      {t("common.reject")}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ))}
+            {activityPause && (
+              <div className="inlineApprovalCard warning">
+                <header className="inlineApprovalHeader">
+                  <AlertTriangle size={14} />
+                  <strong>
+                    {activityPause.event.type === "run.activity.limit_reached"
+                      ? t("activity.limitReached", { defaultValue: "Step limit reached" })
+                      : t("activity.earlyStop", { defaultValue: "Repeated action stopped" })}
+                  </strong>
+                </header>
+                <div className="inlineApprovalBody">
+                  <span>{activityPauseDescription(activityPause.event)}</span>
+                  <div className="inlineApprovalActions">
+                    <button
+                      type="button"
+                      className="inlineApprovalButton primary"
+                      disabled={!selectedSessionId || isMutating || isPromptLocked}
+                      onClick={() => void handleRecoverAgent("continue")}
+                    >
+                      <Play size={14} />
+                      {t("common.continue")}
+                    </button>
+                  </div>
+                </div>
               </div>
             )}
+            {!eventsResponse.events.length && renderHomeView()}
             <div ref={timelineEndRef} />
           </div>
 
+          {lastError && (
+            <div className="errorBanner" role="alert">
+              <AlertTriangle size={15} />
+              <pre className="errorDetails">{lastError}</pre>
+              <button
+                type="button"
+                className="iconButton ghost"
+                aria-label={t("common.clear")}
+                title={t("common.clear")}
+                onClick={() => setLastError(null)}
+              >
+                <X size={15} />
+              </button>
+            </div>
+          )}
           <div className="promptBar">
             <div className="promptComposer">
               <input
@@ -3134,7 +3738,7 @@ export function App() {
                         <button
                           type="button"
                           aria-label={t("skills.removeLoaded", { name: skill.name })}
-                          disabled={isPromptLocked}
+                          disabled={isPromptInputLocked}
                           onClick={() => removeLoadedSkill(skill.path)}
                         >
                           <X size={11} />
@@ -3150,17 +3754,17 @@ export function App() {
                   }`}
                   role="textbox"
                   aria-multiline="true"
-                  aria-disabled={isPromptLocked}
-                  contentEditable={!isPromptLocked}
+                  aria-disabled={isPromptInputLocked}
+                  contentEditable={!isPromptInputLocked}
                   suppressContentEditableWarning
                   onInput={handlePromptInput}
                   onPaste={handlePromptPaste}
                   onClick={handlePromptEditorClick}
                   data-placeholder={
-                    isAgentWorking
-                      ? t("prompt.agentWorking")
-                      : isStopping
-                        ? t("prompt.agentStopping")
+                    isStopping
+                      ? t("prompt.agentStopping")
+                      : isAgentWorking
+                        ? t("prompt.queueFollowUp")
                         : pendingToolEvents.length
                           ? t("prompt.pendingCommands")
                           : t("prompt.followUp")
@@ -3209,7 +3813,7 @@ export function App() {
                   }}
                 />
               </div>
-              {skillMenu.open && !isPromptLocked && (
+              {skillMenu.open && !isPromptInputLocked && (
                 <div className="skillSlashOverlay">
                   <div className="skillSlashMenu" role="listbox" aria-label={t("skills.menuLabel")}>
                     {skillOptions.length ? (
@@ -3245,7 +3849,7 @@ export function App() {
                         : t("session.selectModelFirst")
                     }
                     aria-label={t("nav.uploadAttachment")}
-                    disabled={isPromptLocked || !selectedProviderId || !canUploadAttachments}
+                    disabled={isPromptInputLocked || !selectedProviderId || !canUploadAttachments}
                     onClick={() => attachmentInputRef.current?.click()}
                   >
                     <Plus size={18} />
@@ -3364,33 +3968,41 @@ export function App() {
                       </div>
                     )}
                   </div>
+                  <ContextUsageChip
+                    usage={contextUsage}
+                    compactDisabled={!selectedSessionId || isMutating}
+                    onCompact={() => void handleCompact()}
+                  />
                   </div>
-                <div
-                  ref={shellModeMenuRef}
-                  className="composerRunConfigSelect"
-                  title={`${modeLabel(mode)} / ${shellModeLabel(shellMode)}`}
-                >
-                  <button
-                    type="button"
-                    className="composerRunConfigButton"
-                    disabled={isPromptLocked}
-                    aria-haspopup="listbox"
-                    aria-expanded={isShellModeMenuOpen}
-                    aria-label={`${modeLabel(mode)} / ${shellModeLabel(shellMode)}`}
-                    onClick={() => setIsShellModeMenuOpen((open) => !open)}
+                <div ref={runConfigGroupRef} className="composerRunConfigGroup">
+                  <div
+                    className="composerRunConfigSelect composerRunConfigSelect--mode"
+                    title={`${t("nav.runMode")}: ${modeLabel(mode)}`}
                   >
-                    <span>{modeLabel(mode)}</span>
-                    <small>{t(`shellMode.${shellMode}`)}</small>
-                    <ChevronDown size={14} />
-                  </button>
-                  {isShellModeMenuOpen && !isPromptLocked && (
-                    <div
-                      className="composerRunConfigMenu"
-                      role="listbox"
-                      aria-label={`${modeLabel(mode)} / ${shellModeLabel(shellMode)}`}
+                    <button
+                      type="button"
+                      className="composerRunConfigButton composerRunConfigButton--mode"
+                      disabled={isPromptLocked}
+                      aria-haspopup="listbox"
+                      aria-expanded={isRunModeMenuOpen}
+                      aria-label={`${t("nav.runMode")}: ${modeLabel(mode)}`}
+                      onClick={() => {
+                        setIsShellModeMenuOpen(false);
+                        setIsRunModeMenuOpen((open) => !open);
+                      }}
                     >
-                      <div className="composerRunConfigColumn">
-                        <strong>{t("nav.runMode")}</strong>
+                      <span className="composerRunConfigButtonCopy">
+                        <strong>{modeLabel(mode)}</strong>
+                      </span>
+                      <ChevronDown size={14} />
+                    </button>
+                    {isRunModeMenuOpen && !isPromptLocked && (
+                      <div
+                        className="composerRunConfigMenu composerRunConfigMenu--mode"
+                        role="listbox"
+                        aria-label={t("nav.runMode")}
+                      >
+                        <strong className="composerRunConfigMenuTitle">{t("nav.runMode")}</strong>
                         {(["ask", "plan", "agent"] as AgentMode[]).map((item) => {
                           const isSelected = item === mode;
                           return (
@@ -3408,8 +4020,38 @@ export function App() {
                           );
                         })}
                       </div>
-                      <div className="composerRunConfigColumn">
-                        <strong>{t("nav.commandApproval")}</strong>
+                    )}
+                  </div>
+                  <div
+                    className="composerRunConfigSelect composerRunConfigSelect--approval"
+                    title={`${t("nav.commandApproval")}: ${shellModeLabel(shellMode)}`}
+                  >
+                    <button
+                      type="button"
+                      className="composerRunConfigButton composerRunConfigButton--approval"
+                      disabled={isPromptLocked}
+                      aria-haspopup="listbox"
+                      aria-expanded={isShellModeMenuOpen}
+                      aria-label={`${t("nav.commandApproval")}: ${shellModeLabel(shellMode)}`}
+                      onClick={() => {
+                        setIsRunModeMenuOpen(false);
+                        setIsShellModeMenuOpen((open) => !open);
+                      }}
+                    >
+                      <span className="composerRunConfigButtonCopy">
+                        <strong>{shellModeLabel(shellMode)}</strong>
+                      </span>
+                      <ChevronDown size={14} />
+                    </button>
+                    {isShellModeMenuOpen && !isPromptLocked && (
+                      <div
+                        className="composerRunConfigMenu composerRunConfigMenu--approval"
+                        role="listbox"
+                        aria-label={t("nav.commandApproval")}
+                      >
+                        <strong className="composerRunConfigMenuTitle">
+                          {t("nav.commandApproval")}
+                        </strong>
                         {(["manual", "auto"] as ShellMode[]).map((item) => {
                           const isSelected = item === shellMode;
                           return (
@@ -3421,16 +4063,16 @@ export function App() {
                               aria-selected={isSelected}
                               onClick={() => selectShellMode(item)}
                             >
-                              <span>{t(`shellMode.${item}`)}</span>
+                              <span>{shellModeLabel(item)}</span>
                               {isSelected && <Check size={14} />}
                             </button>
                           );
                         })}
                       </div>
-                    </div>
-                  )}
+                    )}
+                  </div>
                 </div>
-                <div className={`composerSubmitCapsule ${isAgentWorking ? "stop" : ""}`}>
+                <div className={`composerSubmitCapsule ${isAgentWorking ? "working" : ""}`}>
                   <div className="promptNavGroup">
                     <button
                       type="button"
@@ -3453,27 +4095,27 @@ export function App() {
                       <ChevronDown size={15} />
                     </button>
                   </div>
+                  {isAgentWorking && (
+                    <button
+                      type="button"
+                      className="composerStopButton"
+                      aria-label={t("nav.stopAgent")}
+                      title={t("nav.stopAgent")}
+                      disabled={isStopping}
+                      onClick={() => void handleStopAgent()}
+                    >
+                      <span className="stopIconSolid" aria-hidden="true" />
+                    </button>
+                  )}
                   <button
                     type="button"
                     className="composerSendButton"
-                    aria-label={isAgentWorking ? t("nav.stopAgent") : t("nav.sendPrompt")}
-                    disabled={
-                      isAgentWorking
-                        ? false
-                        : (!prompt.trim() &&
-                            !promptAttachments.length &&
-                            !externalPromptReferences.length &&
-                            !loadedSkills.length) ||
-                          isPromptLocked ||
-                          !selectedProviderId
-                    }
-                    onClick={() =>
-                      isAgentWorking
-                        ? void handleStopAgent()
-                        : void handleSubmitPrompt()
-                    }
+                    aria-label={isAgentWorking ? t("nav.queuePrompt") : t("nav.sendPrompt")}
+                    title={isAgentWorking ? t("nav.queuePrompt") : t("nav.sendPrompt")}
+                    disabled={!hasPromptContent || isPromptInputLocked || !selectedProviderId}
+                    onClick={() => void handleSubmitPrompt()}
                   >
-                    {isAgentWorking ? <span className="stopIconSolid" aria-hidden="true" /> : <ArrowUp size={18} />}
+                    <ArrowUp size={18} />
                   </button>
                 </div>
               </div>
@@ -3482,252 +4124,232 @@ export function App() {
         </section>
       </main>
 
-      <aside className={`rightPane ${isRightPaneCollapsed ? "collapsed" : ""}`}>
-
-        {!isRightPaneCollapsed && (
-          <>
-            {!isPlanDockDismissed && (planExecutionEvents.length > 0 || eventsResponse.todos.length > 0 || planArtifact) && (
-              <PlanExecutionDock
-                events={planExecutionEvents}
-                onDismiss={() => setIsPlanDockDismissed(true)}
-                plan={planArtifact}
-                sessionId={selectedSessionId}
-                snapshots={eventsResponse.snapshots}
-                todos={eventsResponse.todos}
-              />
-            )}
-
-            <section className="rightSection">
-              <SectionTitle icon={<Database size={16} />} title={t("nav.contextInfo")} />
-              <ContextUsageMeter usage={contextUsage} />
-              <strong>{selectedSession?.title ?? t("empty.noActiveSession")}</strong>
-              <small>
-                {selectedProvider ? selectedModelLabel : t("session.noServiceSelected")}
-              </small>
-              {selectedChildSessions.length > 0 && (
-                <small className="subagentStatus">
-                  {t("session.subAgentStatus", {
-                    total: selectedChildSessions.length,
-                    active: activeChildSessions.length
-                  })}
-                </small>
-              )}
-              {activeChildSessions.length > 0 && (
-                <div className="stackList compact">
-                  {activeChildSessions.map((session) => {
-                    const isBackground = backgroundTaskSessionIds.has(session.id);
-                    return (
-                      <div className="approvalRow" key={session.id}>
-                        <code>{session.title}</code>
-                        <button
-                          className="iconButton"
-                          disabled={isMutating || isBackground}
-                          onClick={() => void handlePromoteTask(session.id)}
-                          title={t("nav.backgroundJobs")}
-                        >
-                          <Clock3 size={16} />
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-              <button
-                className="iconTextButton"
-                disabled={!selectedSessionId || isMutating}
-                onClick={() => void handleCompact()}
-              >
-                <Database size={16} />
-                {t("nav.compactContext")}
-              </button>
-            </section>
-
-            {lastError && (
-              <section className="rightSection errorSection">
-                <SectionTitle icon={<AlertTriangle size={16} />} title={t("nav.errorDetails")} />
-                <pre className="errorDetails">{lastError}</pre>
-                <button className="iconTextButton" onClick={() => setLastError(null)}>
-                  <X size={16} />
-                  {t("common.clear")}
+      <aside className="rightDock">
+        {rightPanelTab && (
+          <div className="rightPanel">
+            <div className="rightPanelTabs" role="tablist" aria-label={t("dock.panelLabel")}>
+              {(["plan", "tasks", "changes"] as RightPanelTab[]).map((tab) => (
+                <button
+                  key={tab}
+                  type="button"
+                  role="tab"
+                  aria-selected={rightPanelTab === tab}
+                  className={`rightPanelTab ${rightPanelTab === tab ? "active" : ""}`}
+                  onClick={() => openRightPanelTab(tab)}
+                >
+                  {t(`dock.${tab}`)}
                 </button>
-              </section>
-            )}
-
-            {pendingToolEvents.length > 0 && (
-              <section className="rightSection">
-                <SectionTitle icon={<Terminal size={16} />} title={t("nav.commandApproval")} />
-                <div className="stackList">
-                  {pendingToolEvents.map((event) => (
-                    <div className="approvalRow" key={event.id}>
-                      <code>{pendingCommand(event)}</code>
-                      <div>
-                        <button
-                          className="iconButton success"
-                          disabled={isMutating}
-                          onClick={() => void handleApprove(event.id)}
-                          title={t("common.accept")}
-                        >
-                          <Check size={16} />
-                        </button>
-                        {isShellPending(event) && (
-                          <button
-                            className="iconButton trust"
-                            disabled={isMutating}
-                            onClick={() => void handleApproveAndAllow(event)}
-                            title={t("common.acceptAndAllowlist")}
-                          >
-                            <Save size={16} />
-                          </button>
-                        )}
-                        <button
-                          className="iconButton danger"
-                          disabled={isMutating}
-                          onClick={() => void handleReject(event.id)}
-                          title={t("common.reject")}
-                        >
-                          <X size={16} />
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </section>
-            )}
-
-            {visiblePermissions.length > 0 && (
-              <section className="rightSection">
-                <SectionTitle icon={<KeyRound size={16} />} title={t("nav.permissionRequests")} />
-                <div className="stackList">
-                  {visiblePermissions.map((request) => (
-                    <div className="approvalRow" key={request.id}>
-                      <code>{request.action}: {request.resources.join(", ")}</code>
-                      <div>
-                        <button
-                          className="iconButton success"
-                          disabled={isMutating}
-                          onClick={() => void handlePermissionReply(request.id, "once")}
-                          title={t("common.allowOnce")}
-                        >
-                          <Check size={16} />
-                        </button>
-                        <button
-                          className="iconButton trust"
-                          disabled={isMutating}
-                          onClick={() => void handlePermissionReply(request.id, "always")}
-                          title={t("common.allowAlways")}
-                        >
-                          <Save size={16} />
-                        </button>
-                        <button
-                          className="iconButton danger"
-                          disabled={isMutating}
-                          onClick={() => void handlePermissionReply(request.id, "reject")}
-                          title={t("common.reject")}
-                        >
-                          <X size={16} />
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </section>
-            )}
-
-            {activityPause && (
-              <section className="rightSection">
-                <SectionTitle
-                  icon={<AlertTriangle size={16} />}
-                  title={t("nav.activityPaused", { defaultValue: "Activity paused" })}
-                />
-                <div className="activityPauseBox">
-                  <strong>
-                    {activityPause.event.type === "run.activity.limit_reached"
-                      ? t("activity.limitReached", { defaultValue: "Step limit reached" })
-                      : t("activity.earlyStop", { defaultValue: "Repeated action stopped" })}
-                  </strong>
-                  <span>{activityPauseDescription(activityPause.event)}</span>
-                  <button
-                    className="iconTextButton compact"
-                    disabled={!selectedSessionId || isMutating || isPromptLocked}
-                    onClick={() => void handleRecoverAgent("continue")}
-                  >
-                    <Play size={16} />
-                    <span>{t("common.continue")}</span>
-                  </button>
-                </div>
-              </section>
-            )}
-
-            {visibleQueuedInputs.length > 0 && (
-              <section className="rightSection">
-                <SectionTitle
-                  icon={<MessageSquare size={16} />}
-                  title={`${t("nav.queuedInputs", { defaultValue: "Queued inputs" })} (${visibleQueuedInputs.length})`}
-                />
-                <div className="stackList">
-                  {visibleQueuedInputs.map((input) => (
-                    <div className="approvalRow" key={input.id}>
-                      <code>{formatQueuedInput(input)}</code>
-                      <button
-                        className="iconButton danger"
-                        disabled={isMutating}
-                        onClick={() => void handleDeleteQueuedInput(input.id)}
-                        title={t("common.delete", { defaultValue: "Delete" })}
-                      >
-                        <Trash2 size={16} />
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              </section>
-            )}
-
-            {visibleJobs.length > 0 && (
-              <section className="rightSection">
-                <SectionTitle icon={<Clock3 size={16} />} title={t("nav.backgroundJobs")} />
-                <div className="stackList">
-                  {visibleJobs.map((job) => (
-                    <div className="approvalRow" key={job.id}>
-                      <code>{formatBackgroundJob(job)}</code>
-                      <div className="inlineActions">
-                        {isRecoverableBackgroundJob(job) && (
-                          <>
+              ))}
+              <button
+                type="button"
+                className="rightPanelClose"
+                aria-label={t("nav.collapseRightPane")}
+                title={t("nav.collapseRightPane")}
+                onClick={() => setRightPanelTab(null)}
+              >
+                <X size={14} />
+              </button>
+            </div>
+            <div className="rightPanelBody">
+              {rightPanelTab === "plan" &&
+                (hasPlanActivity ? (
+                  <PlanExecutionDock
+                    events={planExecutionEvents}
+                    plan={planArtifact}
+                    sessionId={selectedSessionId}
+                    snapshots={eventsResponse.snapshots}
+                    todos={eventsResponse.todos}
+                  />
+                ) : (
+                  <EmptyLine text={t("dock.noPlanActivity")} />
+                ))}
+              {rightPanelTab === "tasks" && (
+                <>
+                  {selectedChildSessions.length > 0 && (
+                    <section className="rightSection">
+                      <SectionTitle
+                        icon={<Network size={16} />}
+                        title={t("dock.subAgents")}
+                      />
+                      <small className="subagentStatus">
+                        {t("session.subAgentStatus", {
+                          total: selectedChildSessions.length,
+                          active: activeChildSessions.length
+                        })}
+                      </small>
+                      {activeChildSessions.length > 0 && (
+                        <div className="stackList compact">
+                          {activeChildSessions.map((session) => {
+                            const isBackground = backgroundTaskSessionIds.has(session.id);
+                            return (
+                              <div className="approvalRow" key={session.id}>
+                                <code>{session.title}</code>
+                                <button
+                                  className="iconButton"
+                                  disabled={isMutating || isBackground}
+                                  onClick={() => void handlePromoteTask(session.id)}
+                                  title={t("nav.backgroundJobs")}
+                                >
+                                  <Clock3 size={16} />
+                                </button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </section>
+                  )}
+                  {visibleQueuedInputs.length > 0 && (
+                    <section className="rightSection">
+                      <SectionTitle
+                        icon={<MessageSquare size={16} />}
+                        title={`${t("nav.queuedInputs", { defaultValue: "Queued inputs" })} (${visibleQueuedInputs.length})`}
+                      />
+                      <div className="stackList">
+                        {visibleQueuedInputs.map((input) => (
+                          <div className="approvalRow" key={input.id}>
+                            <code>{formatQueuedInput(input)}</code>
                             <button
-                              className="iconButton success"
+                              className="iconButton danger"
                               disabled={isMutating}
-                              onClick={() => void handleRecoverBackgroundTask(job.id, "resumeChild")}
-                              title={t("recovery.resumeChild", { defaultValue: "Resume child session" })}
+                              onClick={() => void handleDeleteQueuedInput(input.id)}
+                              title={t("common.delete", { defaultValue: "Delete" })}
                             >
-                              <Play size={16} />
+                              <Trash2 size={16} />
                             </button>
-                            <button
-                              className="iconButton ghost"
-                              disabled={isMutating}
-                              onClick={() => void handleRecoverBackgroundTask(job.id, "abandon")}
-                              title={t("recovery.abandon", { defaultValue: "Abandon task" })}
-                            >
-                              <X size={16} />
-                            </button>
-                          </>
-                        )}
-                        <button
-                          className="iconButton danger"
-                          disabled={isMutating || job.status !== "running"}
-                          onClick={() => void handleCancelJob(job.id)}
-                          title={t("nav.stopJob")}
-                        >
-                          <X size={16} />
-                        </button>
+                          </div>
+                        ))}
                       </div>
-                    </div>
-                  ))}
-                </div>
-              </section>
-            )}
+                    </section>
+                  )}
 
-          </>
+                  {visibleJobs.length > 0 && (
+                    <section className="rightSection">
+                      <SectionTitle icon={<Clock3 size={16} />} title={t("nav.backgroundJobs")} />
+                      <div className="stackList">
+                        {visibleJobs.map((job) => (
+                          <div className="approvalRow" key={job.id}>
+                            <code>{formatBackgroundJob(job)}</code>
+                            <div className="inlineActions">
+                              {isRecoverableBackgroundJob(job) && (
+                                <>
+                                  <button
+                                    className="iconButton success"
+                                    disabled={isMutating}
+                                    onClick={() => void handleRecoverBackgroundTask(job.id, "resumeChild")}
+                                    title={t("recovery.resumeChild", { defaultValue: "Resume child session" })}
+                                  >
+                                    <Play size={16} />
+                                  </button>
+                                  <button
+                                    className="iconButton ghost"
+                                    disabled={isMutating}
+                                    onClick={() => void handleRecoverBackgroundTask(job.id, "abandon")}
+                                    title={t("recovery.abandon", { defaultValue: "Abandon task" })}
+                                  >
+                                    <X size={16} />
+                                  </button>
+                                </>
+                              )}
+                              <button
+                                className="iconButton danger"
+                                disabled={isMutating || job.status !== "running"}
+                                onClick={() => void handleCancelJob(job.id)}
+                                title={t("nav.stopJob")}
+                              >
+                                <X size={16} />
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </section>
+                  )}
+                  {tasksBadgeCount === 0 && <EmptyLine text={t("dock.noTasks")} />}
+                </>
+              )}
+              {rightPanelTab === "changes" &&
+                (sessionCodeChanges.length ? (
+                  <section className="rightSection changesSection">
+                    <div className="changesSummaryRow">
+                      <SectionTitle
+                        icon={<FileCode2 size={16} />}
+                        title={t("dock.changesSummary", {
+                          count: sessionChangeStats.files
+                        })}
+                      />
+                      <span className="changesStats">
+                        <b className="patchStat add">+{sessionChangeStats.added}</b>
+                        <b className="patchStat del">-{sessionChangeStats.deleted}</b>
+                      </span>
+                    </div>
+                    <CodeChangeList
+                      changes={sessionCodeChanges}
+                      rollbackDisabled={isMutating}
+                      onRollbackSnapshot={stableRollbackSnapshot}
+                      onRollbackSnapshots={stableRollbackSnapshots}
+                    />
+                    <button
+                      className="iconTextButton"
+                      disabled={isMutating || !sessionRollbackAllIds.length}
+                      onClick={() =>
+                        void handleRollbackMany(
+                          sessionRollbackAllIds,
+                          t("dock.rolledBackAll")
+                        )
+                      }
+                    >
+                      <RotateCcw size={16} />
+                      {t("dock.rollbackAll")}
+                    </button>
+                  </section>
+                ) : (
+                  <EmptyLine text={t("dock.noChanges")} />
+                ))}
+            </div>
+          </div>
         )}
+        <nav className="rightRail" aria-label={t("dock.panelLabel")}>
+          <button
+            type="button"
+            className={`railButton ${rightPanelTab === "plan" ? "active" : ""}`}
+            title={t("dock.plan")}
+            aria-label={t("dock.plan")}
+            onClick={() => toggleRightPanelTab("plan")}
+          >
+            <ListChecks size={17} />
+            {planBadgeCount > 0 && <span className="railBadge">{planBadgeCount}</span>}
+          </button>
+          <button
+            type="button"
+            className={`railButton ${rightPanelTab === "tasks" ? "active" : ""}`}
+            title={t("dock.tasks")}
+            aria-label={t("dock.tasks")}
+            onClick={() => toggleRightPanelTab("tasks")}
+          >
+            <Clock3 size={17} />
+            {tasksBadgeCount > 0 && <span className="railBadge">{tasksBadgeCount}</span>}
+          </button>
+          <button
+            type="button"
+            className={`railButton ${rightPanelTab === "changes" ? "active" : ""}`}
+            title={t("dock.changes")}
+            aria-label={t("dock.changes")}
+            onClick={() => toggleRightPanelTab("changes")}
+          >
+            <FileCode2 size={17} />
+            {changesBadgeCount > 0 && (
+              <span className="railBadge">{changesBadgeCount}</span>
+            )}
+          </button>
+        </nav>
       </aside>
+
+      {isNoticeVisible && (
+        <div className={`noticeToast ${notice.tone}`} role="status" aria-live="polite">
+          {notice.text}
+        </div>
+      )}
 
       {needsSetup && (
         <SetupDialog
@@ -3824,7 +4446,6 @@ function SettingsModal({
   const [allowlistText, setAllowlistText] = useState(
     shellPolicy.autoAllowlist.join("\n")
   );
-  const [showAdvanced, setShowAdvanced] = useState(false);
   const [error, setError] = useState("");
   const [activeTab, setActiveTab] = useState<"ai" | "mcp" | "skills">("ai");
 
@@ -3941,64 +4562,16 @@ function SettingsModal({
     setReasoningEffort(parsed.reasoningEffort);
   }
 
-  function handleAddProvider() {
+  async function handleRevealConfigFile() {
     setError("");
     try {
-      const draft = flushCurrentProviderDraft();
-      const config = JSON.parse(draft) as Record<string, unknown>;
-      const providers = ensureRecord(config, "provider");
-      let newId = "new-provider";
-      let counter = 1;
-      while (providers[newId]) {
-        counter += 1;
-        newId = `new-provider-${counter}`;
-      }
-      const newModelId = "default";
-      providers[newId] = {
-        name: newId,
-        npm: "@ai-sdk/openai-compatible",
-        options: { baseURL: "https://api.openai.com/v1", apiKey: "" },
-        models: { [newModelId]: { name: newModelId } }
-      };
-      if (!valueAsString(config.model)) {
-        config.model = `${newId}/${newModelId}`;
-      }
-      const next = `${JSON.stringify(config, null, 2)}\n`;
-      setJsonText(next);
-      syncFromParsed(next, `${newId}/${newModelId}`);
-    } catch (addError) {
-      setError(errorMessage(addError));
-    }
-  }
-
-  function handleDeleteProvider() {
-    setError("");
-    try {
-      const draft = flushCurrentProviderDraft();
-      const config = JSON.parse(draft) as Record<string, unknown>;
-      const providers = asRecord(config.provider);
-      const keys = Object.keys(providers);
-      if (keys.length <= 1) {
-        setError(t("settings.cannotDeleteLastProvider"));
+      if (!selectedConfigPath.trim()) {
+        setError(t("settings.configNotLoaded"));
         return;
       }
-      const currentId = providerId;
-      if (currentId && providers[currentId] !== undefined) {
-        delete providers[currentId];
-      }
-      const nextId = keys.find((key) => key !== currentId) ?? "";
-      const nextProvider = asRecord(providers[nextId]);
-      const nextModels = asRecord(nextProvider.models);
-      const nextModelId = Object.keys(nextModels)[0] ?? "default";
-      const modelStr = valueAsString(config.model);
-      if (modelStr && (modelStr === currentId || modelStr.startsWith(`${currentId}/`))) {
-        config.model = `${nextId}/${nextModelId}`;
-      }
-      const next = `${JSON.stringify(config, null, 2)}\n`;
-      setJsonText(next);
-      syncFromParsed(next, `${nextId}/${nextModelId}`);
-    } catch (deleteError) {
-      setError(errorMessage(deleteError));
+      await revealProviderConfig(selectedConfigPath);
+    } catch (revealError) {
+      setError(errorMessage(revealError));
     }
   }
 
@@ -4388,44 +4961,14 @@ function SettingsModal({
             </label>
           </div>
 
-          <div className="providerActions">
-            <button className="presetButton" type="button" onClick={handleAddProvider}>
-              <Plus size={14} />
-              {t("settings.addProvider")}
-            </button>
-            <button className="presetButton" type="button" onClick={handleDeleteProvider}>
-              <Trash2 size={14} />
-              {t("settings.deleteProvider")}
-            </button>
-          </div>
-
           <button
             className="advancedToggle"
             type="button"
-            onClick={() => setShowAdvanced(!showAdvanced)}
+            onClick={() => void handleRevealConfigFile()}
           >
-            {showAdvanced ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
-            {t("settings.advancedJson")}
+            <FolderOpen size={15} />
+            {t("settings.openConfigLocation")}
           </button>
-          {showAdvanced && (
-            <textarea
-              className="settingsJsonEditor"
-              value={jsonText}
-              onChange={(event) => {
-                setJsonText(event.target.value);
-                const parsed = parseProviderSettings(event.target.value, `${providerId}/${modelId}`);
-                setProviderId(parsed.providerId);
-                setModelId(parsed.modelId);
-                setName(parsed.name);
-                setBaseUrl(parsed.baseUrl);
-                setApiKey(parsed.apiKey);
-                setSupportsResponses(parsed.supportsResponses);
-                setResponsesSource(parsed.responsesSource);
-                setReasoningEffort(parsed.reasoningEffort);
-              }}
-              spellCheck={false}
-            />
-          )}
           </>)}
 
           {activeTab === "mcp" && (
@@ -4890,24 +5433,53 @@ type TimelineItem = {
   rollbackSnapshotIds?: string[];
 };
 
-function ContextUsageMeter({ usage }: { usage: ContextUsage }) {
+function ContextUsageChip({
+  usage,
+  onCompact,
+  compactDisabled
+}: {
+  usage: ContextUsage;
+  onCompact: () => void;
+  compactDisabled: boolean;
+}) {
   const { t } = useTranslation();
   const tooltipId = "context-usage-details";
+  const radius = 7;
+  const circumference = 2 * Math.PI * radius;
+  const dash =
+    (Math.min(100, Math.max(0, usage.barPercent)) / 100) * circumference;
   return (
     <div
-      className={`contextUsage ${usage.severity}`}
+      className={`contextUsageChip ${usage.severity}`}
       tabIndex={0}
       aria-describedby={tooltipId}
+      aria-label={t("context.usage", {
+        percent: usage.percent,
+        source: usage.source === "provider" ? t("context.actual") : t("context.estimate")
+      })}
     >
-      <span>
-        {t("context.usage", {
-          percent: usage.percent,
-          source: usage.source === "provider" ? t("context.actual") : t("context.estimate")
-        })}
-      </span>
-      <div className="contextTrack" aria-hidden="true">
-        <i style={{ width: `${usage.barPercent}%` }} />
-      </div>
+      <svg className="contextRing" viewBox="0 0 18 18" aria-hidden="true">
+        <circle
+          className="contextRingTrack"
+          cx="9"
+          cy="9"
+          r={radius}
+          fill="none"
+          strokeWidth="2.5"
+        />
+        <circle
+          className="contextRingFill"
+          cx="9"
+          cy="9"
+          r={radius}
+          fill="none"
+          strokeWidth="2.5"
+          strokeDasharray={`${dash} ${circumference}`}
+          strokeLinecap="round"
+          transform="rotate(-90 9 9)"
+        />
+      </svg>
+      <span className="contextChipPercent">{usage.percent}%</span>
       <div className="contextUsagePopover" id={tooltipId} role="tooltip">
         <header>
           <strong>{formatInteger(usage.usedTokens)} tokens</strong>
@@ -4950,6 +5522,15 @@ function ContextUsageMeter({ usage }: { usage: ContextUsage }) {
             {note}
           </p>
         ))}
+        <button
+          type="button"
+          className="iconTextButton compact contextCompactButton"
+          disabled={compactDisabled}
+          onClick={onCompact}
+        >
+          <Database size={14} />
+          {t("nav.compactContext")}
+        </button>
       </div>
     </div>
   );

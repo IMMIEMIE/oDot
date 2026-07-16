@@ -84,6 +84,7 @@
     "nextPrompt": "下一条提示词",
     "stopAgent": "停止 Agent",
     "sendPrompt": "发送提示词",
+    "queuePrompt": "加入提示词队列",
     "uploadedAttachments": "已上传附件",
     "removeAttachment": "移除附件 {{name}}",
     "renameSession": "重命名会话 {{title}}",
@@ -123,18 +124,19 @@
     "selectModelFirst": "请先选择模型"
   },
   "externalProjectSessions": {
-    "title": "VS Code \u9879\u76ee\u4f1a\u8bdd",
-    "dismiss": "\u5173\u95ed VS Code \u9879\u76ee\u4f1a\u8bdd",
-    "create": "\u4ee5\u5f53\u524d\u76ee\u5f55\u65b0\u5efa\u4f1a\u8bdd",
-    "createInstead": "\u4e3a\u8be5\u76ee\u5f55\u518d\u65b0\u5efa\u4e00\u4e2a\u4f1a\u8bdd",
-    "autoCreating": "\u672a\u627e\u5230\u5339\u914d\u4f1a\u8bdd\uff0c\u6b63\u5728\u81ea\u52a8\u65b0\u5efa",
-    "selected": "\u5df2\u5207\u6362\u5230 VS Code \u9879\u76ee\u4f1a\u8bdd",
-    "notFound": "\u8be5 VS Code \u9879\u76ee\u4f1a\u8bdd\u5df2\u4e0d\u5b58\u5728",
-    "busyReason": "\u5f53\u524d\u4f1a\u8bdd\u6b63\u5728\u8fd0\u884c\u6216\u7b49\u5f85\u5ba1\u6279\u3002\u539f\u4efb\u52a1\u4f1a\u7ee7\u7eed\uff1b\u8bf7\u9009\u62e9\u4f1a\u8bdd\u6216\u65b0\u5efa\u4f1a\u8bdd\u4ee5\u786e\u8ba4\u5207\u6362\u3002"
+    "title": "VS Code 项目会话",
+    "dismiss": "关闭 VS Code 项目会话",
+    "create": "以当前目录新建会话",
+    "createInstead": "为该目录再新建一个会话",
+    "autoCreating": "未找到匹配会话，正在自动新建",
+    "selected": "已切换到 VS Code 项目会话",
+    "notFound": "该 VS Code 项目会话已不存在",
+    "busyReason": "当前会话正在运行或等待审批。原任务会继续；请选择会话或新建会话以确认切换。"
   },
   "prompt": {
-    "agentWorking": "Agent 正在工作，结束后才能继续发送。",
-    "agentStopping": "Agent 正在停止，确认截断后才能继续发送。",
+    "agentWorking": "Agent 正在工作。",
+    "agentStopping": "Agent 正在停止，可以准备下一条提示词。",
+    "queueFollowUp": "输入后续提示词，按 Enter 加入队列",
     "pendingCommands": "请先处理待确认命令。",
     "followUp": "这里输入",
     "placeholder": "输入 prompt，Enter 发送",
@@ -154,7 +156,7 @@
     "configNotLoaded": "配置文件尚未加载",
     "close": "关闭设置",
     "autoAllowlist": "自动命令白名单",
-    "advancedJson": "高级 JSON",
+    "openConfigLocation": "打开配置文件所在位置",
     "provider": "Provider",
     "model": "Model",
     "name": "Name",
@@ -174,9 +176,6 @@
     "reasoningLoading": "正在加载思考强度...",
     "reasoningSaving": "正在保存...",
     "reasoningUnavailable": "仅默认",
-    "addProvider": "新增服务",
-    "deleteProvider": "删除服务",
-    "cannotDeleteLastProvider": "至少需保留一个服务，无法删除",
     "configFile": "配置文件",
     "switchConfigFile": "切换 JSON",
     "discardConfigDraft": "放弃当前未保存的设置修改，并切换到另一个 JSON 文件？",
@@ -277,6 +276,9 @@
     "commandRejected": "命令已拒绝",
     "permissionHandled": "权限已处理",
     "jobStopped": "后台任务已停止",
+    "queueUpdated": "队列已更新",
+    "queueingPrompt": "正在加入提示词队列",
+    "promptQueued": "提示词已加入队列",
     "snapshotRolledBack": "快照已回滚",
     "noRollbackChanges": "没有可回滚的代码变更",
     "contextCompacted": "上下文已压缩",
@@ -509,5 +511,36 @@
     "settingsDesc": "检查 API Key、模型和服务端点配置。",
     "compact": "压缩上下文",
     "compactDesc": "压缩较早历史后再继续。"
+  },
+  "approval": {
+    "commandTitle": "等待审批 · 命令执行",
+    "permissionTitle": "等待审批 · 权限请求",
+    "pendingChip": "{{count}} 项待审批"
+  },
+  "dock": {
+    "panelLabel": "侧边面板",
+    "plan": "计划",
+    "tasks": "任务",
+    "changes": "变更",
+    "subAgents": "子 Agent",
+    "noPlanActivity": "当前会话暂无计划进度",
+    "noTasks": "暂无后台任务或排队输入",
+    "noChanges": "本次会话暂无文件变更",
+    "changesSummary": "已修改 {{count}} 个文件",
+    "rollbackAll": "回滚全部变更",
+    "rolledBackAll": "已回滚本次会话的全部变更"
+  },
+  "home": {
+    "greetingNight": "夜深了",
+    "greetingMorning": "早上好",
+    "greetingAfternoon": "下午好",
+    "greetingEvening": "晚上好",
+    "subtitle": "选择一种模式开始，或继续最近的会话。",
+    "askDescription": "快速问答，不修改任何文件，适合理解代码。",
+    "planDescription": "先产出可审阅的执行计划，确认后再动手。",
+    "agentDescription": "自主执行任务，每次改动自动快照、可回滚。",
+    "recentSessions": "最近会话",
+    "running": "运行中",
+    "pendingApproval": "待审批"
   }
 }

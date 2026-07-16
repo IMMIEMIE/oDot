@@ -1,5 +1,5 @@
 use crate::{
-    config_file, mcp, mutation, skills, storage, task_registry,
+    config_file, mcp, mutation, session_coordinator, skills, storage, task_registry,
     types::{
         AgentMode, EventRecord, PromptAttachment, SessionInputDelivery, SessionRecord, ShellMode,
         ShellPolicy, TodoRecord, ToolCallRequest,
@@ -190,7 +190,7 @@ pub async fn approve_tool_call(
     let result = if options.background {
         run_shell_command_background(conn, &session, &cwd, command)?
     } else {
-        run_shell_command(&cwd, command, options.timeout_seconds)?
+        run_shell_command_for_session(conn, &session.id, &cwd, command, options.timeout_seconds)?
     };
     let event_type = if result.get("exitCode").and_then(Value::as_i64).unwrap_or(1) == 0 {
         "tool.success"
@@ -528,7 +528,13 @@ async fn execute_tool_inner(
             let result = if options.background {
                 run_shell_command_background(conn, session, &cwd, &command)?
             } else {
-                run_shell_command(&cwd, &command, options.timeout_seconds)?
+                run_shell_command_for_session(
+                    conn,
+                    &session.id,
+                    &cwd,
+                    &command,
+                    options.timeout_seconds,
+                )?
             };
             if shell_exit_code(&result) == 0 {
                 Ok(ToolRun::Success(result))
@@ -563,11 +569,22 @@ async fn execute_mcp_tool_if_matched(
     let Some(app) = app else {
         return Err("MCP tool execution requires app handle".to_string());
     };
+    let mut interrupt = session_coordinator::subscribe_interrupt(&session.id);
+    if storage::is_session_cancel_requested(conn, &session.id)? {
+        return Err("MCP tool interrupted by user.".to_string());
+    }
     let config_path = session_provider_config_path(conn, session);
     let servers =
         config_file::load_mcp_server_configs(app, &session.project_root, config_path.as_deref())?;
     for server in servers.iter().filter(|server| server.enabled) {
-        let tools = match mcp::list_server_tools(&session.project_root, server).await {
+        let list_tools = mcp::list_server_tools(&session.project_root, server);
+        let tools = match tokio::select! {
+            result = list_tools => result,
+            changed = interrupt.changed() => {
+                let _ = changed;
+                return Err("MCP tool interrupted by user.".to_string());
+            }
+        } {
             Ok(value) => value,
             Err(error) => {
                 return Ok(Some(ToolRun::Failure(json!({
@@ -596,13 +613,19 @@ async fn execute_mcp_tool_if_matched(
                 "reason": "MCP tool requires approval"
             }))));
         }
-        let result = mcp::call_tool(
+        let call_tool = mcp::call_tool(
             &session.project_root,
             server,
             &tool.name,
             call.input.clone(),
-        )
-        .await;
+        );
+        let result = tokio::select! {
+            result = call_tool => result,
+            changed = interrupt.changed() => {
+                let _ = changed;
+                return Err("MCP tool interrupted by user.".to_string());
+            }
+        };
         return Ok(Some(match result {
             Ok(value) => ToolRun::Success(json!({
                 "serverId": server.id,
@@ -887,7 +910,32 @@ fn shell_workdir(session: &SessionRecord, options: &ShellRunOptions) -> Result<S
     Ok(dir.to_string_lossy().to_string())
 }
 
+fn run_shell_command_for_session(
+    conn: &Connection,
+    session_id: &str,
+    root: &str,
+    command: &str,
+    timeout_seconds: u64,
+) -> Result<Value, String> {
+    run_shell_command_until(root, command, timeout_seconds, || {
+        storage::is_session_cancel_requested(conn, session_id).unwrap_or(false)
+    })
+}
+
+#[cfg(test)]
 fn run_shell_command(root: &str, command: &str, timeout_seconds: u64) -> Result<Value, String> {
+    run_shell_command_until(root, command, timeout_seconds, || false)
+}
+
+fn run_shell_command_until<F>(
+    root: &str,
+    command: &str,
+    timeout_seconds: u64,
+    mut should_cancel: F,
+) -> Result<Value, String>
+where
+    F: FnMut() -> bool,
+{
     let root = PathBuf::from(root);
     let mut child = shell_command(&root, command)
         .stdout(Stdio::piped())
@@ -907,12 +955,18 @@ fn run_shell_command(root: &str, command: &str, timeout_seconds: u64) -> Result<
     let started_at = Instant::now();
     let timeout = Duration::from_secs(timeout_seconds);
     let mut timed_out = false;
+    let mut cancelled = false;
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
             break status;
         }
         if started_at.elapsed() >= timeout {
             timed_out = true;
+            terminate_process_tree(&mut child);
+            break child.wait().map_err(|error| error.to_string())?;
+        }
+        if should_cancel() {
+            cancelled = true;
             terminate_process_tree(&mut child);
             break child.wait().map_err(|error| error.to_string())?;
         }
@@ -929,6 +983,7 @@ fn run_shell_command(root: &str, command: &str, timeout_seconds: u64) -> Result<
         "command": command,
         "exitCode": status.code().unwrap_or(-1),
         "timedOut": timed_out,
+        "cancelled": cancelled,
         "timeoutSeconds": timeout_seconds,
         "stdout": truncate(&decode_process_output(&stdout), 30_000),
         "stderr": truncate(&decode_process_output(&stderr), 30_000)
@@ -1322,6 +1377,14 @@ mod tests {
         let result = run_shell_command(".", slow_command(), 1).unwrap();
 
         assert_eq!(result["timedOut"], true);
+        assert_ne!(shell_exit_code(&result), 0);
+    }
+
+    #[test]
+    fn shell_command_can_be_cancelled() {
+        let result = run_shell_command_until(".", slow_command(), 10, || true).unwrap();
+
+        assert_eq!(result["cancelled"], true);
         assert_ne!(shell_exit_code(&result), 0);
     }
 

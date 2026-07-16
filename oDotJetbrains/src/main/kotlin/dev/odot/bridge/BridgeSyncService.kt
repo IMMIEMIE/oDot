@@ -11,8 +11,8 @@ import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** Per-project bridge sync: 4s heartbeat, debounced workspace-activate, wake-on-unreachable,
- *  and disconnect on close. Mirrors the background behavior of the VS Code extension. */
+/** Per-project bridge sync: 4s heartbeat, debounced workspace-activate, and disconnect
+ *  on close. An unreachable bridge is observed only; background sync never launches oDot. */
 @Service(Service.Level.PROJECT)
 class BridgeSyncService(private val project: Project) : Disposable {
     private val heartbeatIntervalMs = 4_000L
@@ -61,9 +61,8 @@ class BridgeSyncService(private val project: Project) : Disposable {
             } else if (!reachable) {
                 bridgeReachable = false
             }
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             bridgeReachable = false
-            if (WorkspaceModel.shouldWake(e)) WakeService.wake("heartbeat")
         }
     }
 
@@ -96,9 +95,8 @@ class BridgeSyncService(private val project: Project) : Disposable {
                 lastPublishedRoot = WorkspaceModel.normalizeWorkspaceRoot(root!!)
                 bridgeReachable = true
             }
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             bridgeReachable = false
-            if (WorkspaceModel.shouldWake(e)) WakeService.wake(reason)
         }
     }
 

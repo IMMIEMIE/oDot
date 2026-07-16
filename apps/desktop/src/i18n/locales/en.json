@@ -87,6 +87,7 @@
     "nextPrompt": "Next prompt",
     "stopAgent": "Stop agent",
     "sendPrompt": "Send prompt",
+    "queuePrompt": "Queue prompt",
     "uploadedAttachments": "Uploaded attachments",
     "removeAttachment": "Remove attachment {{name}}",
     "renameSession": "Rename session {{title}}",
@@ -136,8 +137,9 @@
     "busyReason": "The current session is running or awaiting approval. It will continue; choose or create a session to confirm the switch."
   },
   "prompt": {
-    "agentWorking": "Agent is working. Send again after it finishes.",
-    "agentStopping": "Agent is stopping. Send again after truncation is confirmed.",
+    "agentWorking": "Agent is working.",
+    "agentStopping": "Agent is stopping. You can prepare the next prompt.",
+    "queueFollowUp": "Type a follow-up and press Enter to queue it",
     "pendingCommands": "Resolve pending commands first.",
     "followUp": "Request follow-up changes",
     "placeholder": "Enter prompt, press Enter to send",
@@ -157,7 +159,7 @@
     "configNotLoaded": "Config file not loaded",
     "close": "Close settings",
     "autoAllowlist": "Auto command allowlist",
-    "advancedJson": "Advanced JSON",
+    "openConfigLocation": "Show config file",
     "provider": "Provider",
     "model": "Model",
     "name": "Name",
@@ -177,9 +179,6 @@
     "reasoningLoading": "Loading thinking levels...",
     "reasoningSaving": "Saving...",
     "reasoningUnavailable": "Default only",
-    "addProvider": "Add provider",
-    "deleteProvider": "Delete provider",
-    "cannotDeleteLastProvider": "At least one provider must remain; cannot delete",
     "configFile": "Config file",
     "switchConfigFile": "Switch JSON",
     "discardConfigDraft": "Discard unsaved settings edits and switch to another JSON file?",
@@ -281,6 +280,8 @@
     "permissionHandled": "Permission handled",
     "jobStopped": "Background job stopped",
     "queueUpdated": "Queue updated",
+    "queueingPrompt": "Adding prompt to queue",
+    "promptQueued": "Prompt queued",
     "recoveryActionStarted": "Recovery action started",
     "snapshotRolledBack": "Snapshot rolled back",
     "noRollbackChanges": "No code changes to roll back",
@@ -522,5 +523,38 @@
     "settingsDesc": "Review API key, model, and endpoint configuration.",
     "compact": "Compact context",
     "compactDesc": "Compact earlier history before continuing."
+  },
+  "approval": {
+    "commandTitle": "Awaiting approval · Shell command",
+    "permissionTitle": "Awaiting approval · Permission request",
+    "pendingChip_one": "{{count}} pending approval",
+    "pendingChip_other": "{{count}} pending approvals"
+  },
+  "dock": {
+    "panelLabel": "Side panel",
+    "plan": "Plan",
+    "tasks": "Tasks",
+    "changes": "Changes",
+    "subAgents": "Sub-agents",
+    "noPlanActivity": "No plan progress in this session yet",
+    "noTasks": "No background jobs or queued inputs",
+    "noChanges": "No file changes in this session yet",
+    "changesSummary_one": "{{count}} file changed",
+    "changesSummary_other": "{{count}} files changed",
+    "rollbackAll": "Roll back all changes",
+    "rolledBackAll": "Rolled back all changes in this session"
+  },
+  "home": {
+    "greetingNight": "Up late",
+    "greetingMorning": "Good morning",
+    "greetingAfternoon": "Good afternoon",
+    "greetingEvening": "Good evening",
+    "subtitle": "Pick a mode to start, or resume a recent session.",
+    "askDescription": "Quick Q&A that never touches your files — great for understanding code.",
+    "planDescription": "Produce a reviewable execution plan first, act only after you confirm.",
+    "agentDescription": "Execute autonomously; every change is snapshotted and can be rolled back.",
+    "recentSessions": "Recent sessions",
+    "running": "Running",
+    "pendingApproval": "Pending approval"
   }
 }

@@ -16,7 +16,7 @@ object WorkspaceModel {
     }
 
     fun canRestartAfterManualShutdown(reason: String): Boolean =
-        reason == "activation" || reason == "folder-change" || reason == "editor-change" || reason == "explicit"
+        reason == "explicit"
 
     fun shouldWake(error: Throwable): Boolean = when (error) {
         is BridgeUnreachableException -> error.wakeable

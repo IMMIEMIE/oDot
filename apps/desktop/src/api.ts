@@ -359,6 +359,11 @@ export async function saveProviderConfig(
   });
 }
 
+export async function revealProviderConfig(path: string): Promise<void> {
+  assertTauri();
+  return invoke<void>("reveal_provider_config", { path });
+}
+
 export async function getModelReasoningEfforts(
   content: string,
   providerId: string,
