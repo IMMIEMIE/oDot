@@ -25,7 +25,11 @@ export function readExternalProjectSessions(): ExternalProjectSessionsDraftRecor
         requestId: value.payload.requestId ?? `legacy-${value.updatedAt ?? 0}`,
         action: value.payload.action ?? "choose",
         workspaceRoot: value.payload.workspaceRoot ?? "",
+        clientId: value.payload.clientId ?? null,
         source: value.payload.source ?? null,
+        displayName: value.payload.displayName ?? null,
+        installationId: value.payload.installationId ?? null,
+        instanceId: value.payload.instanceId ?? null,
         busyReason: value.payload.busyReason ?? null,
         activeSessionId: value.payload.activeSessionId ?? null,
         sessions: value.payload.sessions
@@ -61,7 +65,11 @@ export function clearExternalProjectSessions(source: PromptDraftSource) {
         requestId: `clear-${Date.now()}`,
         action: "ignored",
         workspaceRoot: "",
+        clientId: null,
         source: null,
+        displayName: null,
+        installationId: null,
+        instanceId: null,
         busyReason: null,
         activeSessionId: null,
         sessions: []

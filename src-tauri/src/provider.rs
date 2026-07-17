@@ -1424,6 +1424,8 @@ fn normalize_tool_name(name: &str) -> String {
         "bash" => "shell".to_string(),
         "grep" => "search".to_string(),
         "todowrite" => "todo_write".to_string(),
+        "planexit" => "plan_exit".to_string(),
+        "requestmode" => "request_mode".to_string(),
         other => other.to_string(),
     }
 }
@@ -1525,10 +1527,41 @@ fn native_tool_definitions() -> Value {
             "type": "function",
             "function": {
                 "name": "question",
-                "description": "Ask the user a blocking question when user input is required.",
+                "description": "Ask the user 1-3 blocking, structured questions when an important choice cannot be inferred. Use the user's language.",
                 "parameters": object_schema(
-                    json!({ "question": { "type": "string", "description": "Question to ask." } }),
-                    &["question"]
+                    json!({
+                        "questions": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 3,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string", "description": "Stable snake_case identifier." },
+                                    "header": { "type": "string", "description": "Short title, at most 24 characters." },
+                                    "question": { "type": "string", "description": "One clear question." },
+                                    "multiple": { "type": "boolean", "description": "Whether multiple options may be selected." },
+                                    "options": {
+                                        "type": "array",
+                                        "minItems": 2,
+                                        "maxItems": 4,
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "label": { "type": "string" },
+                                                "description": { "type": "string" }
+                                            },
+                                            "required": ["label", "description"],
+                                            "additionalProperties": false
+                                        }
+                                    }
+                                },
+                                "required": ["id", "header", "question", "multiple", "options"],
+                                "additionalProperties": false
+                            }
+                        }
+                    }),
+                    &["questions"]
                 )
             }
         },
@@ -1593,6 +1626,20 @@ fn native_tool_definitions() -> Value {
                         "name": { "type": "string", "description": "Skill name or .odot/skills/.../SKILL.md path." }
                     }),
                     &["name"]
+                )
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "request_mode",
+                "description": "Request user confirmation before switching this session to ask, plan, or agent mode. Use only when the new mode is necessary to continue correctly.",
+                "parameters": object_schema(
+                    json!({
+                        "targetMode": { "type": "string", "enum": ["ask", "plan", "agent"] },
+                        "reason": { "type": "string", "description": "Concise reason the mode change is needed." }
+                    }),
+                    &["targetMode", "reason"]
                 )
             }
         },
@@ -2066,6 +2113,7 @@ mod tests {
         assert!(names.contains(&"shell"));
         assert!(names.contains(&"todo_write"));
         assert!(names.contains(&"plan_exit"));
+        assert!(names.contains(&"request_mode"));
         assert!(!names.contains(&"bash"));
 
         let shell = tools
@@ -2082,6 +2130,14 @@ mod tests {
         assert!(task
             .pointer("/function/parameters/properties/task_id")
             .is_some());
+        let question = tools
+            .iter()
+            .find(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some("question"))
+            .expect("question tool");
+        assert_eq!(
+            question.pointer("/function/parameters/properties/questions/maxItems"),
+            Some(&json!(3))
+        );
         assert!(task
             .pointer("/function/parameters/properties/background")
             .is_some());

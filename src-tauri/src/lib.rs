@@ -27,13 +27,13 @@ use std::{
 };
 use tauri::{AppHandle, Emitter};
 use types::{
-    ContextSummaryRecord, CreateSessionInput, EventRecord, McpConfigFileResponse, McpServerConfig,
-    McpToolDefinition, ModelReasoningEffortsResponse, PersistPlanInput, ProjectCapabilities,
-    ProjectCapabilityError, ProjectFile, PromptSessionInput, ProviderConfigFileResponse,
-    ProviderInput, ProviderRecord, RecoverBackgroundTaskInput, RecoverSessionInput,
-    ReplyPermissionInput, RevealPathInput, SessionEventsResponse, SessionRecord, ShellPolicy,
-    SkillRecord, SnapshotRecord, SubmitPromptInput, TailSessionEventsInput, UpdateSessionModeInput,
-    UpdateSessionTitleInput,
+    AnswerToolQuestionInput, ContextSummaryRecord, CreateSessionInput, EventRecord,
+    McpConfigFileResponse, McpServerConfig, McpToolDefinition, ModelReasoningEffortsResponse,
+    PersistPlanInput, ProjectCapabilities, ProjectCapabilityError, ProjectFile, PromptSessionInput,
+    ProviderConfigFileResponse, ProviderInput, ProviderRecord, RecoverBackgroundTaskInput,
+    RecoverSessionInput, ReplyPermissionInput, ResolveModeChangeInput, RevealPathInput,
+    SessionEventsResponse, SessionRecord, ShellPolicy, SkillRecord, SnapshotRecord,
+    SubmitPromptInput, TailSessionEventsInput, UpdateSessionModeInput, UpdateSessionTitleInput,
 };
 
 const FLOAT_WINDOW_LABEL: &str = "float";
@@ -513,6 +513,24 @@ fn reject_tool_call(app: AppHandle, event_id: String) -> Result<EventRecord, Str
 }
 
 #[tauri::command]
+fn answer_tool_question(
+    app: AppHandle,
+    input: AnswerToolQuestionInput,
+) -> Result<EventRecord, String> {
+    let conn = storage::open_db(&app)?;
+    tools::answer_tool_question(&conn, &input.event_id, &input.answers)
+}
+
+#[tauri::command]
+fn resolve_mode_change(
+    app: AppHandle,
+    input: ResolveModeChangeInput,
+) -> Result<EventRecord, String> {
+    let conn = storage::open_db(&app)?;
+    tools::resolve_mode_change(&conn, &input.event_id, input.approved)
+}
+
+#[tauri::command]
 fn delete_queued_input(app: AppHandle, input_id: String) -> Result<SessionEventsResponse, String> {
     let conn = storage::open_db(&app)?;
     runner::delete_queued_input(&conn, &input_id)
@@ -766,12 +784,23 @@ fn set_bridge_port(app: AppHandle, port: u16) -> Result<external_bridge::BridgeS
 
 #[tauri::command]
 fn report_workspace_resolution(
+    app: AppHandle,
     action: String,
     workspace_root: String,
+    request_id: Option<String>,
+    client_id: Option<String>,
     active_session_id: Option<String>,
     busy_reason: Option<String>,
 ) -> Result<external_bridge::WorkspaceResolutionState, String> {
-    external_bridge::update_resolution(action, workspace_root, active_session_id, busy_reason)
+    external_bridge::update_resolution(
+        &app,
+        action,
+        workspace_root,
+        request_id,
+        client_id,
+        active_session_id,
+        busy_reason,
+    )
 }
 
 #[tauri::command]
@@ -864,6 +893,8 @@ pub fn run() {
             promote_task,
             approve_tool_call,
             reject_tool_call,
+            answer_tool_question,
+            resolve_mode_change,
             reply_permission,
             wait_job,
             cancel_job,

@@ -1,8 +1,8 @@
 use crate::{
     config_file, mcp, mutation, session_coordinator, skills, storage, task_registry,
     types::{
-        AgentMode, EventRecord, PromptAttachment, SessionInputDelivery, SessionRecord, ShellMode,
-        ShellPolicy, TodoRecord, ToolCallRequest,
+        AgentMode, EventRecord, PromptAttachment, QuestionAnswerInput, SessionInputDelivery,
+        SessionRecord, ShellMode, ShellPolicy, TodoRecord, ToolCallRequest,
     },
     util::{
         hide_console, ignored_directories, normalize_project_path, plan_file_path,
@@ -148,10 +148,7 @@ pub async fn approve_tool_call(
     conn: &Connection,
     event_id: &str,
 ) -> Result<EventRecord, String> {
-    let event = storage::get_event(conn, event_id)?;
-    if event.event_type != "tool.pending" {
-        return Err("只能批准等待确认的工具事件。".to_string());
-    }
+    let event = unresolved_pending_event(conn, event_id)?;
 
     let session = storage::get_session(conn, &event.session_id)?;
     let name = event
@@ -160,8 +157,8 @@ pub async fn approve_tool_call(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let tool_name = normalize_tool_name(name);
-    if tool_name == "plan_exit" {
-        return approve_plan_exit(conn, &session, &event);
+    if tool_name == "plan_exit" || tool_name == "request_mode" {
+        return resolve_mode_change(conn, event_id, true);
     }
     if tool_name.starts_with("mcp__") {
         return approve_mcp_tool_call(app, conn, &session, &event).await;
@@ -210,29 +207,174 @@ pub async fn approve_tool_call(
     )
 }
 
-fn approve_plan_exit(
+pub fn answer_tool_question(
     conn: &Connection,
-    session: &SessionRecord,
-    event: &EventRecord,
+    event_id: &str,
+    answers: &[QuestionAnswerInput],
 ) -> Result<EventRecord, String> {
-    let plan_path = event
+    let event = unresolved_pending_event(conn, event_id)?;
+    let tool_name = normalize_tool_name(
+        event
+            .data
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    );
+    if tool_name != "question"
+        && event.data.pointer("/pending/kind").and_then(Value::as_str) != Some("question")
+    {
+        return Err("该待处理事件不是问题集。".to_string());
+    }
+
+    let questions = event
         .data
-        .pointer("/pending/planPath")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| plan_file_path(&session.created_at, &session.title));
+        .pointer("/pending/questions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "待处理问题缺少 questions。".to_string())?;
+    if answers.len() != questions.len() {
+        return Err("请回答问题集中的每一个问题。".to_string());
+    }
+
+    let mut normalized_answers = Vec::with_capacity(questions.len());
+    let mut summary_lines = Vec::with_capacity(questions.len());
+    for question in questions {
+        let id = question
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let prompt = question
+            .get("question")
+            .and_then(Value::as_str)
+            .unwrap_or(id);
+        let multiple = question
+            .get("multiple")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let allowed = question
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|options| {
+                options
+                    .iter()
+                    .filter_map(|option| option.get("label").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let answer = answers
+            .iter()
+            .find(|answer| answer.id.trim() == id)
+            .ok_or_else(|| format!("问题 {id} 缺少答案。"))?;
+        let mut selected = Vec::new();
+        for option in &answer.selected_options {
+            let option = option.trim();
+            if option.is_empty() || !allowed.iter().any(|allowed| *allowed == option) {
+                return Err(format!("问题 {id} 包含未知选项：{option}"));
+            }
+            if !selected.iter().any(|current: &String| current == option) {
+                selected.push(option.to_string());
+            }
+        }
+        if !multiple && selected.len() > 1 {
+            return Err(format!("问题 {id} 只能选择一个选项。"));
+        }
+        let custom_text = answer
+            .custom_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if selected.is_empty() && custom_text.is_none() {
+            return Err(format!("问题 {id} 必须选择选项或填写补充内容。"));
+        }
+        let mut display = selected.join("、");
+        if let Some(text) = &custom_text {
+            if !display.is_empty() {
+                display.push_str("；补充：");
+            }
+            display.push_str(text);
+        }
+        summary_lines.push(format!("{prompt}: {display}"));
+        normalized_answers.push(json!({
+            "id": id,
+            "question": prompt,
+            "selectedOptions": selected,
+            "customText": custom_text
+        }));
+    }
+
     storage::append_event(
         conn,
-        &session.id,
-        "tool.approved",
+        &event.session_id,
+        "tool.success",
         json!({
             "pendingEventId": event.id,
-            "name": "plan_exit",
-            "planPath": plan_path.clone()
+            "name": event.data.get("name").cloned().unwrap_or_else(|| json!("question")),
+            "result": {
+                "version": 1,
+                "kind": "question",
+                "answers": normalized_answers,
+                "summary": summary_lines.join("\n")
+            }
         }),
-    )?;
-    storage::update_session_mode(conn, &session.id, Some(AgentMode::Agent), None, None)?;
-    let prompt = build_plan_exit_execution_prompt(&plan_path);
+    )
+}
+
+pub fn resolve_mode_change(
+    conn: &Connection,
+    event_id: &str,
+    approved: bool,
+) -> Result<EventRecord, String> {
+    let event = unresolved_pending_event(conn, event_id)?;
+    let session = storage::get_session(conn, &event.session_id)?;
+    let name = event
+        .data
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("request_mode");
+    let tool_name = normalize_tool_name(name);
+    let kind = event
+        .data
+        .pointer("/pending/kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if tool_name != "request_mode" && tool_name != "plan_exit" && kind != "mode_change" {
+        return Err("该待处理事件不是模式切换请求。".to_string());
+    }
+    let target_mode_name = event
+        .data
+        .pointer("/pending/targetMode")
+        .and_then(Value::as_str)
+        .unwrap_or("agent");
+    let target_mode = AgentMode::from_str(target_mode_name)?;
+    let from_mode = session.mode.as_str().to_string();
+    let reason = event
+        .data
+        .pointer("/pending/reason")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    if !approved {
+        return storage::append_event(
+            conn,
+            &session.id,
+            "tool.rejected",
+            json!({
+                "pendingEventId": event.id,
+                "name": name,
+                "result": {
+                    "version": 1,
+                    "kind": "mode_change",
+                    "approved": false,
+                    "fromMode": from_mode,
+                    "targetMode": target_mode_name,
+                    "reason": "User rejected the requested mode change. Continue in the current mode."
+                }
+            }),
+        );
+    }
+
+    storage::update_session_mode(conn, &session.id, Some(target_mode.clone()), None, None)?;
+    let prompt = build_mode_change_prompt(&session, &target_mode, &event);
     let admitted = storage::admit_session_input(
         conn,
         None,
@@ -256,13 +398,29 @@ fn approve_plan_exit(
     storage::append_event(
         conn,
         &session.id,
+        "tool.approved",
+        json!({
+            "pendingEventId": event.id,
+            "name": name,
+            "fromMode": from_mode,
+            "targetMode": target_mode_name
+        }),
+    )?;
+    storage::append_event(
+        conn,
+        &session.id,
         "tool.success",
         json!({
             "pendingEventId": event.id,
-            "name": "plan_exit",
+            "name": name,
             "result": {
-                "planPath": plan_path.clone(),
-                "message": "User approved switching to agent mode. Execute the approved plan."
+                "version": 1,
+                "kind": "mode_change",
+                "approved": true,
+                "fromMode": from_mode,
+                "targetMode": target_mode_name,
+                "reason": reason,
+                "message": format!("User approved switching to {target_mode_name} mode. Continue the original task in the new mode.")
             }
         }),
     )
@@ -331,9 +489,15 @@ async fn approve_mcp_tool_call(
 }
 
 pub fn reject_tool_call(conn: &Connection, event_id: &str) -> Result<EventRecord, String> {
-    let event = storage::get_event(conn, event_id)?;
-    if event.event_type != "tool.pending" {
-        return Err("只能拒绝等待确认的工具事件。".to_string());
+    let event = unresolved_pending_event(conn, event_id)?;
+    let name = event
+        .data
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let tool_name = normalize_tool_name(name);
+    if tool_name == "request_mode" || tool_name == "plan_exit" {
+        return resolve_mode_change(conn, event_id, false);
     }
 
     storage::append_event(
@@ -342,7 +506,10 @@ pub fn reject_tool_call(conn: &Connection, event_id: &str) -> Result<EventRecord
         "tool.rejected",
         json!({
             "pendingEventId": event.id,
-            "name": event.data.get("name").cloned().unwrap_or(Value::Null)
+            "name": event.data.get("name").cloned().unwrap_or(Value::Null),
+            "result": {
+                "message": "User declined this interaction. Continue the task and adapt to the rejection."
+            }
         }),
     )
 }
@@ -464,14 +631,7 @@ async fn execute_tool_inner(
                 "patch": snapshot.patch
             })))
         }
-        "question" => {
-            let question = required_string_any(&call.input, &["question", "text"])?;
-            Ok(ToolRun::Pending(json!({
-                "kind": "question",
-                "question": question,
-                "reason": "Agent 请求用户回答。"
-            })))
-        }
+        "question" => Ok(ToolRun::Pending(normalize_question_request(&call.input)?)),
         "todo_write" => {
             let todos = parse_todos(call.input.get("todos").unwrap_or(&Value::Null))?;
             let saved = storage::replace_todos(conn, &session.id, todos)?;
@@ -496,10 +656,32 @@ async fn execute_tool_inner(
             }
             let plan_path = plan_file_path(&session.created_at, &session.title);
             Ok(ToolRun::Pending(json!({
-                "kind": "plan_exit",
+                "version": 1,
+                "kind": "mode_change",
                 "command": format!("计划文件 {plan_path} 已完成，是否切换到执行模式并开始实现？"),
+                "fromMode": session.mode.as_str(),
+                "targetMode": "agent",
                 "planPath": plan_path,
                 "reason": "计划已完成，等待用户确认是否开始执行。"
+            })))
+        }
+        "request_mode" => {
+            let target_mode_name =
+                required_string_any(&call.input, &["targetMode", "target_mode"])?;
+            let target_mode = AgentMode::from_str(&target_mode_name)?;
+            if target_mode.as_str() == session.mode.as_str() {
+                return Ok(ToolRun::Failure(json!({
+                    "blocked": true,
+                    "reason": format!("Session is already in {} mode.", target_mode.as_str())
+                })));
+            }
+            let reason = required_string(&call.input, "reason")?;
+            Ok(ToolRun::Pending(json!({
+                "version": 1,
+                "kind": "mode_change",
+                "fromMode": session.mode.as_str(),
+                "targetMode": target_mode.as_str(),
+                "reason": reason
             })))
         }
         "shell" | "bash" => {
@@ -680,6 +862,7 @@ fn normalize_tool_name(name: &str) -> String {
         "grep" => "search".to_string(),
         "todowrite" => "todo_write".to_string(),
         "planexit" => "plan_exit".to_string(),
+        "requestmode" => "request_mode".to_string(),
         other => other.to_string(),
     }
 }
@@ -690,9 +873,127 @@ fn is_plan_file_path(path: &str) -> bool {
     normalized.starts_with(".odot/plans/") && normalized.ends_with(".md")
 }
 
-fn build_plan_exit_execution_prompt(plan_path: &str) -> String {
+fn unresolved_pending_event(conn: &Connection, event_id: &str) -> Result<EventRecord, String> {
+    let event = storage::get_event(conn, event_id)?;
+    if event.event_type != "tool.pending" {
+        return Err("只能处理等待用户输入的工具事件。".to_string());
+    }
+    let already_resolved = storage::list_events(conn, &event.session_id)?
+        .iter()
+        .any(|candidate| {
+            candidate.data.get("pendingEventId").and_then(Value::as_str) == Some(event_id)
+        });
+    if already_resolved {
+        return Err("该交互已经处理，请刷新会话查看最新结果。".to_string());
+    }
+    Ok(event)
+}
+
+fn normalize_question_request(input: &Value) -> Result<Value, String> {
+    if let Some(questions) = input.get("questions") {
+        let questions = questions
+            .as_array()
+            .ok_or_else(|| "question.questions 必须是数组。".to_string())?;
+        if questions.is_empty() || questions.len() > 3 {
+            return Err("question.questions 必须包含 1 到 3 个问题。".to_string());
+        }
+        let mut ids = Vec::with_capacity(questions.len());
+        let mut normalized = Vec::with_capacity(questions.len());
+        for question in questions {
+            let id = required_string(question, "id")?;
+            if ids.iter().any(|current| current == &id) {
+                return Err(format!("问题 id 重复：{id}"));
+            }
+            ids.push(id.clone());
+            let header = required_string(question, "header")?;
+            if header.chars().count() > 24 {
+                return Err(format!("问题 {id} 的 header 不能超过 24 个字符。"));
+            }
+            let prompt = required_string(question, "question")?;
+            let multiple = question
+                .get("multiple")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let options = question
+                .get("options")
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("问题 {id} 缺少 options 数组。"))?;
+            if options.len() < 2 || options.len() > 4 {
+                return Err(format!("问题 {id} 必须提供 2 到 4 个选项。"));
+            }
+            let mut labels = Vec::with_capacity(options.len());
+            let mut normalized_options = Vec::with_capacity(options.len());
+            for option in options {
+                let label = required_string(option, "label")?;
+                if labels.iter().any(|current| current == &label) {
+                    return Err(format!("问题 {id} 的选项重复：{label}"));
+                }
+                labels.push(label.clone());
+                normalized_options.push(json!({
+                    "label": label,
+                    "description": required_string(option, "description")?
+                }));
+            }
+            normalized.push(json!({
+                "id": id,
+                "header": header,
+                "question": prompt,
+                "multiple": multiple,
+                "options": normalized_options,
+                "allowCustom": true
+            }));
+        }
+        return Ok(json!({
+            "version": 1,
+            "kind": "question",
+            "questions": normalized,
+            "reason": "Agent requires user input before continuing."
+        }));
+    }
+
+    let question = required_string_any(input, &["question", "text"])?;
+    Ok(json!({
+        "version": 1,
+        "kind": "question",
+        "legacy": true,
+        "questions": [{
+            "id": "question_1",
+            "header": "",
+            "question": question,
+            "multiple": false,
+            "options": [],
+            "allowCustom": true
+        }],
+        "reason": "Agent requires user input before continuing."
+    }))
+}
+
+fn build_mode_change_prompt(
+    session: &SessionRecord,
+    target_mode: &AgentMode,
+    event: &EventRecord,
+) -> String {
+    let target = target_mode.as_str();
+    let capability = match target_mode {
+        AgentMode::Agent => "You may edit files, run commands, and use all available tools.",
+        AgentMode::Plan => "You are now read-only except for the session plan file. Research and produce a decision-complete plan; do not modify project files.",
+        AgentMode::Ask => "You are now read-only. Inspect as needed and answer the user without modifying project files.",
+    };
+    let plan_path = event
+        .data
+        .pointer("/pending/planPath")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| plan_file_path(&session.created_at, &session.title));
+    let plan_note = if matches!(target_mode, AgentMode::Agent)
+        && event.data.pointer("/pending/planPath").is_some()
+    {
+        format!("\nThe approved plan is at {plan_path}; read it before implementing and track its steps with todo_write.")
+    } else {
+        String::new()
+    };
     format!(
-        "[odot-plan-execution]\n\n<system-reminder>\nYour operational mode has changed from plan to agent.\nYou are no longer in read-only mode.\nYou are permitted to edit files, run commands, and use tools as needed.\nA plan file exists at {plan_path}; read it when you need the authoritative implementation plan.\nBefore making code changes, call todo_write with the plan steps, keep exactly one item in_progress, and update the list after each completed step.\n</system-reminder>\n\nThe plan at {plan_path} has been approved. Execute the plan now."
+        "[odot-mode-change]\n\n<system-reminder>\nYour operational mode has changed to {target}.\n{capability}{plan_note}\nContinue the original task under the new mode constraints.\n</system-reminder>"
     )
 }
 
@@ -1300,7 +1601,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::AgentMode;
+    use crate::types::{AgentMode, ProviderInput, ProviderKind};
 
     fn policy(items: &[&str]) -> ShellPolicy {
         ShellPolicy {
@@ -1611,6 +1912,130 @@ mod tests {
             }
             other => panic!("invalid tool should return failure, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn structured_question_normalizes_and_validates_schema() {
+        let pending = normalize_question_request(&json!({
+            "questions": [{
+                "id": "direction",
+                "header": "Direction",
+                "question": "Which direction?",
+                "multiple": false,
+                "options": [
+                    { "label": "A", "description": "First" },
+                    { "label": "B", "description": "Second" }
+                ]
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(pending["kind"], "question");
+        assert_eq!(pending["questions"][0]["allowCustom"], true);
+        assert!(normalize_question_request(&json!({ "questions": [] })).is_err());
+        assert!(normalize_question_request(&json!({
+            "questions": [{
+                "id": "bad",
+                "header": "Bad",
+                "question": "Bad?",
+                "multiple": false,
+                "options": [{ "label": "Only", "description": "One" }]
+            }]
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn question_answers_are_structured_and_only_resolve_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        storage::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO session (id, project_root, mode, provider_id, title, status, shell_mode, created_at, updated_at) VALUES ('s1', '.', 'ask', 'p1', 'test', 'active', 'manual', 'now', 'now')",
+            [],
+        )
+        .unwrap();
+        let pending = storage::append_event(
+            &conn,
+            "s1",
+            "tool.pending",
+            json!({
+                "name": "question",
+                "pending": normalize_question_request(&json!({
+                    "questions": [{
+                        "id": "direction",
+                        "header": "Direction",
+                        "question": "Which direction?",
+                        "multiple": false,
+                        "options": [
+                            { "label": "A", "description": "First" },
+                            { "label": "B", "description": "Second" }
+                        ]
+                    }]
+                })).unwrap()
+            }),
+        )
+        .unwrap();
+        let answers = vec![QuestionAnswerInput {
+            id: "direction".to_string(),
+            selected_options: vec!["A".to_string()],
+            custom_text: Some("Prefer the simpler path".to_string()),
+        }];
+
+        let result = answer_tool_question(&conn, &pending.id, &answers).unwrap();
+        assert_eq!(result.event_type, "tool.success");
+        assert_eq!(
+            result.data["result"]["answers"][0]["selectedOptions"][0],
+            "A"
+        );
+        assert!(answer_tool_question(&conn, &pending.id, &answers).is_err());
+    }
+
+    #[test]
+    fn mode_change_approval_updates_mode_and_reject_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        storage::init_db(&conn).unwrap();
+        storage::save_provider(
+            &conn,
+            ProviderInput {
+                id: Some("p1".to_string()),
+                kind: ProviderKind::OpenAiCompatible,
+                name: "Test".to_string(),
+                base_url: Some("https://example.com/v1".to_string()),
+                model: "test".to_string(),
+                api_key: None,
+                config_path: None,
+            },
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, project_root, mode, provider_id, title, status, shell_mode, created_at, updated_at) VALUES ('s1', '.', 'plan', 'p1', 'test', 'active', 'manual', 'now', 'now')",
+            [],
+        )
+        .unwrap();
+        let pending = storage::append_event(
+            &conn,
+            "s1",
+            "tool.pending",
+            json!({
+                "name": "request_mode",
+                "pending": {
+                    "version": 1,
+                    "kind": "mode_change",
+                    "fromMode": "plan",
+                    "targetMode": "agent",
+                    "reason": "Implementation is required"
+                }
+            }),
+        )
+        .unwrap();
+
+        let result = resolve_mode_change(&conn, &pending.id, true).unwrap();
+        assert_eq!(result.event_type, "tool.success");
+        assert_eq!(
+            storage::get_session(&conn, "s1").unwrap().mode.as_str(),
+            "agent"
+        );
+        assert!(resolve_mode_change(&conn, &pending.id, false).is_err());
     }
 
     #[test]

@@ -597,6 +597,12 @@ button:focus-visible {
   white-space: nowrap;
 }
 
+.sessionSelectButton small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .sessionTitleInput {
   min-width: 0;
   height: 28px;
@@ -1187,7 +1193,7 @@ button:focus-visible {
 .timelinePane {
   min-height: 0;
   display: grid;
-  grid-template-rows: minmax(0, 1fr) auto auto;
+  grid-template-rows: minmax(0, 1fr) auto auto auto;
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.42), transparent 36%),
     linear-gradient(90deg, transparent, rgba(211, 73, 71, 0.04), transparent),
@@ -1751,6 +1757,91 @@ pre {
   min-width: 0;
   display: grid;
   gap: 9px;
+}
+
+.subAgentCard {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+  border: 1px solid var(--border-soft, rgba(127, 127, 127, 0.25));
+  border-radius: 10px;
+  background: var(--surface-strong, rgba(127, 127, 127, 0.06));
+}
+
+.subAgentHeader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+}
+
+.subAgentHeader:hover {
+  background: var(--surface-hover, rgba(127, 127, 127, 0.1));
+  border-radius: 10px;
+}
+
+.subAgentTitle {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 700;
+}
+
+.subAgentType {
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.subAgentStatusChip {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  box-shadow: var(--inset-line);
+  color: var(--text-soft);
+  background: var(--surface-strong);
+}
+
+.subAgentStatusChip.running {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.subAgentStatusChip.failed {
+  color: var(--danger, #d9534f);
+  background: var(--danger-soft, rgba(217, 83, 79, 0.14));
+}
+
+.subAgentBody {
+  display: grid;
+  gap: 8px;
+  padding: 0 10px 10px 22px;
+  border-left: 2px solid var(--border-soft, rgba(127, 127, 127, 0.25));
+  margin-left: 16px;
+}
+
+.inlineApprovalSubAgentTag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent);
+  background: var(--accent-soft);
 }
 
 .mcpToolMeta {
@@ -2572,9 +2663,46 @@ pre {
 .composerControls {
   min-width: 0;
   display: grid;
-  grid-template-columns: 32px minmax(0, 1fr);
+  grid-template-columns: 34px minmax(0, 1fr) auto;
   align-items: center;
   gap: clamp(6px, 1vw, 10px);
+}
+
+.composerModelCompactIcon {
+  display: none;
+  flex: 0 0 auto;
+}
+
+.promptComposer--compact .promptActionRow,
+.promptComposer--minimal .promptActionRow {
+  grid-template-columns: minmax(0, 1fr) 40px auto;
+}
+
+.promptComposer--minimal .composerControls {
+  grid-template-columns: 34px 34px auto;
+}
+
+.promptComposer--minimal .composerModelSelect,
+.promptComposer--minimal .composerModelButton {
+  width: 34px;
+}
+
+.promptComposer--minimal .composerModelButton {
+  padding: 0;
+  justify-content: center;
+}
+
+.promptComposer--minimal .composerModelButton > span,
+.promptComposer--minimal .composerModelButton > svg:last-child {
+  display: none;
+}
+
+.promptComposer--minimal .composerModelCompactIcon {
+  display: block;
+}
+
+.promptComposer--minimal .composerModelMenu {
+  left: -40px;
 }
 
 .composerAttachButton {
@@ -2948,6 +3076,19 @@ pre {
   width: 156px;
 }
 
+.composerRunConfigButton--collapsed {
+  width: 40px;
+  min-width: 40px;
+  padding: 0;
+}
+
+.composerRunConfigButton--collapsed svg {
+  position: absolute;
+  top: 0;
+  left: 11px;
+  transform: none;
+}
+
 .composerRunConfigButtonCopy {
   width: 100%;
   min-width: 0;
@@ -2981,6 +3122,10 @@ pre {
   transform: translateY(-50%) rotate(180deg);
 }
 
+.composerRunConfigButton--collapsed[aria-expanded="true"] svg {
+  transform: none;
+}
+
 .composerRunConfigButton:hover:not(:disabled),
 .composerRunConfigButton[aria-expanded="true"] {
   border-color: var(--accent-border);
@@ -3010,6 +3155,22 @@ pre {
   right: auto;
   left: 0;
   width: min(184px, calc(100vw - 48px));
+}
+
+.composerRunConfigMenu--collapsed {
+  right: 0;
+  width: min(230px, calc(100vw - 32px));
+  gap: 8px;
+}
+
+.composerRunConfigMenuSection {
+  display: grid;
+  gap: 4px;
+}
+
+.composerRunConfigMenuSection + .composerRunConfigMenuSection {
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
 }
 
 .composerRunConfigMenuTitle {
@@ -6451,6 +6612,30 @@ body.float-window-body {
   overflow: hidden;
 }
 
+.pendingApprovalPanel {
+  min-height: 0;
+  max-height: min(360px, 42vh);
+  display: grid;
+  grid-auto-rows: max-content;
+  gap: 10px;
+  padding: 12px clamp(12px, 2vw, 20px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  border-top: 1px solid var(--accent-border);
+  background:
+    linear-gradient(180deg, var(--warning-soft), var(--surface) 48px),
+    var(--surface);
+  box-shadow: 0 -10px 30px rgba(20, 35, 31, 0.08);
+}
+
+.pendingApprovalPanel > .inlineApprovalCard {
+  min-height: 0;
+  width: 100%;
+  max-width: none;
+  box-sizing: border-box;
+}
+
 .inlineApprovalHeader {
   display: flex;
   align-items: center;
@@ -6478,10 +6663,276 @@ body.float-window-body {
   white-space: pre-wrap;
 }
 
+.approvalCommandPreviewFrame {
+  min-width: 0;
+  display: grid;
+  gap: 7px;
+}
+
+.approvalCommandClip {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+  border-radius: 8px;
+}
+
+.approvalCommandClip.isLong {
+  max-height: calc(9em + 16px);
+}
+
+.approvalCommandClip.isLong::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 34px;
+  pointer-events: none;
+  background: linear-gradient(transparent, var(--surface-strong));
+}
+
+.approvalCommandPreview {
+  line-height: 1.5;
+}
+
+.approvalCommandDetailButton {
+  width: fit-content;
+  min-height: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text-soft);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.approvalCommandDetailButton:hover {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.approvalCommandModalBackdrop {
+  z-index: 80;
+}
+
+.approvalCommandModal {
+  width: min(920px, calc(100vw - 44px));
+  max-height: calc(100vh - 44px);
+  outline: none;
+}
+
+.approvalCommandModalBody {
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding: 14px;
+  background: var(--surface-soft);
+}
+
+.approvalCommandModalBody pre {
+  min-height: 100%;
+  margin: 0;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-strong);
+  color: var(--ink);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.approvalCommandModalBody code {
+  font: inherit;
+}
+
+.approvalCommandModalFooter .inlineApprovalActions {
+  width: 100%;
+  justify-content: flex-end;
+}
+
+@media (max-width: 680px) {
+  .approvalCommandModal {
+    width: calc(100vw - 24px);
+    max-height: calc(100vh - 24px);
+  }
+
+  .approvalCommandModalFooter .inlineApprovalActions {
+    justify-content: stretch;
+  }
+
+  .approvalCommandModalFooter .inlineApprovalButton {
+    flex: 1 1 auto;
+    justify-content: center;
+  }
+}
+
 .inlineApprovalActions {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.questionInteractionCard,
+.modeChangeCard {
+  max-width: 760px;
+}
+
+.questionSet {
+  display: grid;
+  gap: 12px;
+  padding: 13px;
+}
+
+.questionItem {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.questionItem legend {
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 3px 10px;
+  margin-bottom: 8px;
+  color: var(--ink);
+}
+
+.questionItem legend > span {
+  grid-column: 1 / -1;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.questionItem legend > strong {
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.questionItem legend > small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.questionOptions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.questionOption {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-strong);
+  cursor: pointer;
+}
+
+.questionOption.selected {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+
+.questionOption input {
+  margin-top: 2px;
+  accent-color: var(--accent);
+}
+
+.questionOption > span {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.questionOption strong {
+  font-size: 12.5px;
+}
+
+.questionOption small {
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+
+.questionCustomInput {
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 8px;
+  padding: 8px 10px;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+}
+
+.questionCustomInput:focus {
+  outline: 2px solid var(--accent-soft);
+  border-color: var(--accent-border);
+}
+
+.questionActions {
+  padding: 0 13px 13px;
+}
+
+.modeChangeCard .inlineApprovalBody p {
+  margin: 0;
+}
+
+.modeChangeRoute {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 13px;
+}
+
+.modeChangeRoute span,
+.modeChangeRoute strong {
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: var(--surface-strong);
+}
+
+.modeChangeRoute strong {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.interactionReason {
+  color: var(--ink);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.interactionCapabilityHint {
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+@media (max-width: 680px) {
+  .questionOptions {
+    grid-template-columns: 1fr;
+  }
 }
 
 .inlineApprovalButton {
@@ -6772,6 +7223,12 @@ body.float-window-body {
 
 .timeline > .inlineApprovalCard {
   margin-left: 40px;
+  /* The card's own overflow: hidden (for rounded corners) zeroes its
+     automatic min-size as a grid item, so its auto row in .timeline
+     collapses to the border (~2px) and clips the content into a thin line.
+     Restore a content-based height so the row sizes to the card. */
+  align-self: start;
+  min-height: max-content;
 }
 
 /* ── Transient notice toast ────────────────────────────────────────────── */

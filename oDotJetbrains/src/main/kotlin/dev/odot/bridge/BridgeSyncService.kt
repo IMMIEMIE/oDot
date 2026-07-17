@@ -2,6 +2,7 @@ package dev.odot.bridge
 
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ReadAction
+import com.intellij.openapi.application.ApplicationNamesInfo
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.service
 import com.intellij.openapi.project.Project
@@ -24,7 +25,12 @@ class BridgeSyncService(private val project: Project) : Disposable {
     @Volatile private var bridgeReachable = false
     @Volatile private var windowFocused = true
 
-    private val clientId: String by lazy { ClientIdentity.clientId(project) }
+    private val installationId: String by lazy { ClientIdentity.installationId() }
+    private val instanceId: String = ClientIdentity.newInstanceId()
+    private val clientId: String = ClientIdentity.clientId(instanceId)
+    private val displayName: String by lazy {
+        ApplicationNamesInfo.getInstance().fullProductName
+    }
 
     fun start() {
         if (!started.compareAndSet(false, true)) return
@@ -107,6 +113,9 @@ class BridgeSyncService(private val project: Project) : Disposable {
         focused = windowFocused,
         workspaceRoot = currentRoot(),
         source = BridgeProtocol.SOURCE,
+        displayName = displayName,
+        installationId = installationId,
+        instanceId = instanceId,
         sentAt = System.currentTimeMillis(),
     )
 
@@ -117,6 +126,9 @@ class BridgeSyncService(private val project: Project) : Disposable {
         focused = windowFocused,
         workspaceRoot = root,
         source = BridgeProtocol.SOURCE,
+        displayName = displayName,
+        installationId = installationId,
+        instanceId = instanceId,
         reason = reason,
         sentAt = System.currentTimeMillis(),
     )
@@ -140,6 +152,9 @@ class BridgeSyncService(private val project: Project) : Disposable {
         focused = false,
         workspaceRoot = null,
         source = BridgeProtocol.SOURCE,
+        displayName = displayName,
+        installationId = installationId,
+        instanceId = instanceId,
         sentAt = System.currentTimeMillis(),
     )
 

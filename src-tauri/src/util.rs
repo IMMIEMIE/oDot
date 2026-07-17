@@ -39,6 +39,66 @@ pub fn ensure_directory(root: &str) -> Result<PathBuf, String> {
     Ok(root)
 }
 
+/// Windows canonical paths may carry a verbatim `\\?\` prefix. It is useful for
+/// Win32 APIs but must not participate in persisted workspace identity.
+pub fn clean_windows_verbatim_path(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with(r"\\?\unc\") {
+        return format!(r"\\{}", &value[r"\\?\UNC\".len()..]);
+    }
+    if lower.starts_with(r"\\?\") {
+        return value[r"\\?\".len()..].to_string();
+    }
+    if lower.starts_with("//?/unc/") {
+        return format!("//{}", &value["//?/UNC/".len()..]);
+    }
+    if lower.starts_with("//?/") {
+        return value["//?/".len()..].to_string();
+    }
+    value.to_string()
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::{clean_windows_verbatim_path, resolve_writable_inside};
+    use std::{fs, time::SystemTime};
+
+    #[test]
+    fn strips_windows_verbatim_drive_and_unc_prefixes() {
+        assert_eq!(
+            clean_windows_verbatim_path(r"\\?\E:\项目\demo"),
+            r"E:\项目\demo"
+        );
+        assert_eq!(
+            clean_windows_verbatim_path(r"\\?\UNC\server\share\demo"),
+            r"\\server\share\demo"
+        );
+        assert_eq!(
+            clean_windows_verbatim_path("//?/E:/项目/demo"),
+            "E:/项目/demo"
+        );
+    }
+
+    #[test]
+    fn writable_paths_use_the_same_canonical_root_representation() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("odot-path-test-{unique}"));
+        fs::create_dir_all(root.join("src")).unwrap();
+
+        let existing_parent = resolve_writable_inside(&root, "src/file.txt").unwrap();
+        let new_parent = resolve_writable_inside(&root, "generated/nested/file.txt").unwrap();
+
+        assert!(existing_parent.starts_with(fs::canonicalize(&root).unwrap()));
+        assert!(new_parent.starts_with(fs::canonicalize(&root).unwrap()));
+        assert!(resolve_writable_inside(&root, "../outside.txt").is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 pub fn normalize_project_path(value: &str) -> String {
     value.replace('\\', "/").trim_start_matches('/').to_string()
 }
@@ -83,7 +143,12 @@ pub fn resolve_writable_inside(root: &Path, relative_path: &str) -> Result<PathB
         return Err("路径不能为空。".to_string());
     }
 
-    let mut target = root.to_path_buf();
+    // On Windows `canonicalize` returns verbatim paths (`\\?\C:\...`). Comparing
+    // that value with the non-verbatim project root makes every valid existing
+    // file look as if it escaped the workspace. Canonicalize the root first and
+    // build the target from that same representation.
+    let canonical_root = fs::canonicalize(root).map_err(|error| error.to_string())?;
+    let mut target = canonical_root.clone();
     for component in Path::new(&normalized).components() {
         match component {
             Component::Normal(part) => target.push(part),
@@ -92,16 +157,20 @@ pub fn resolve_writable_inside(root: &Path, relative_path: &str) -> Result<PathB
         }
     }
 
-    let parent = target
+    let mut existing_ancestor = target
         .parent()
         .ok_or_else(|| format!("路径没有父目录: {relative_path}"))?;
-    let parent = if parent.exists() {
-        fs::canonicalize(parent).map_err(|error| error.to_string())?
-    } else {
-        root.to_path_buf()
-    };
+    while !existing_ancestor.exists() {
+        existing_ancestor = existing_ancestor
+            .parent()
+            .ok_or_else(|| format!("路径越过了项目根目录: {relative_path}"))?;
+    }
+    let canonical_ancestor =
+        fs::canonicalize(existing_ancestor).map_err(|error| error.to_string())?;
 
-    if !parent.starts_with(root) {
+    // Checking the nearest existing ancestor also prevents a not-yet-created
+    // child path from escaping through a symlink inside the project.
+    if !canonical_ancestor.starts_with(&canonical_root) {
         return Err(format!("路径越过了项目根目录: {relative_path}"));
     }
 

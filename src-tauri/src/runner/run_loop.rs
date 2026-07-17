@@ -34,6 +34,11 @@ where
     let mut current_prompt = current_prompt.to_string();
     let prior_step_count = current_prompt_step_count(conn, &session.id)?;
     let mut step_index = 1;
+    // Start of the current bounded-activity window. The per-activity step budget
+    // is a soft checkpoint that auto-continues (see ActivityLimitReached below),
+    // so this rolls forward each time we cross MAX_ACTIVITY_STEPS instead of
+    // pausing the run.
+    let mut activity_base = 0usize;
     let mut last_executed_step = 0usize;
     let mut activity_status = "completed";
     let mut progress_guard = RepeatedTurnGuard::default();
@@ -49,43 +54,31 @@ where
         }),
     )?;
     loop {
-        match activity_budget_decision(prior_step_count, step_index) {
+        match activity_budget_decision(prior_step_count, step_index, activity_base) {
             ActivityBudgetDecision::Continue => {}
             ActivityBudgetDecision::ActivityLimitReached {
                 completed_step,
                 total_steps,
             } => {
-                activity_status = "paused";
+                // The per-activity step budget is a soft checkpoint, not a hard
+                // stop. Emit a non-blocking notice, roll the activity window
+                // forward, and keep running. The hard MAX_TOTAL_STEPS ceiling and
+                // the repeated-action guard still bound the run.
                 storage::append_event(
                     conn,
                     &session.id,
-                    "run.activity.limit_reached",
+                    "run.activity.auto_continued",
                     json!({
                         "step": completed_step,
                         "totalSteps": total_steps,
                         "limit": MAX_ACTIVITY_STEPS,
                         "maxTotalSteps": MAX_TOTAL_STEPS,
                         "canContinue": true,
-                        "autoQueued": false,
-                        "continueCommand": "continue_session",
-                        "message": "Reached the per-activity step limit. Continue the session to start the next bounded activity."
+                        "autoQueued": true,
+                        "message": "Auto-continued into the next bounded activity."
                     }),
                 )?;
-                storage::save_session_checkpoint(
-                    conn,
-                    &session.id,
-                    run_id,
-                    "activity.limit_reached",
-                    Some(completed_step as i64),
-                    "ready",
-                    json!({
-                        "step": completed_step,
-                        "totalSteps": total_steps,
-                        "limit": MAX_ACTIVITY_STEPS,
-                        "canContinue": true
-                    }),
-                )?;
-                break;
+                activity_base = completed_step;
             }
             ActivityBudgetDecision::TotalLimitExceeded {
                 attempted_total_step,
@@ -591,18 +584,22 @@ enum ActivityBudgetDecision {
 
 fn activity_budget_decision(
     prior_step_count: usize,
-    activity_step: usize,
+    step_index: usize,
+    activity_base: usize,
 ) -> ActivityBudgetDecision {
-    let attempted_total_step = prior_step_count.saturating_add(activity_step);
+    let attempted_total_step = prior_step_count.saturating_add(step_index);
     if attempted_total_step > MAX_TOTAL_STEPS {
         return ActivityBudgetDecision::TotalLimitExceeded {
             attempted_total_step,
         };
     }
+    // Steps taken within the current bounded-activity window. `activity_base`
+    // rolls forward on each auto-continue so this resets without stopping the run.
+    let activity_step = step_index.saturating_sub(activity_base);
     if activity_step > MAX_ACTIVITY_STEPS {
         return ActivityBudgetDecision::ActivityLimitReached {
-            completed_step: activity_step - 1,
-            total_steps: prior_step_count + activity_step - 1,
+            completed_step: step_index - 1,
+            total_steps: prior_step_count + step_index - 1,
         };
     }
     ActivityBudgetDecision::Continue
@@ -774,28 +771,46 @@ mod tests {
     }
 
     #[test]
-    fn activity_budget_pauses_after_single_activity_limit() {
+    fn activity_budget_auto_continues_after_single_activity_limit() {
         assert_eq!(
-            activity_budget_decision(0, MAX_ACTIVITY_STEPS),
+            activity_budget_decision(0, MAX_ACTIVITY_STEPS, 0),
             ActivityBudgetDecision::Continue
         );
         assert_eq!(
-            activity_budget_decision(0, MAX_ACTIVITY_STEPS + 1),
+            activity_budget_decision(0, MAX_ACTIVITY_STEPS + 1, 0),
             ActivityBudgetDecision::ActivityLimitReached {
                 completed_step: MAX_ACTIVITY_STEPS,
                 total_steps: MAX_ACTIVITY_STEPS
             }
+        );
+        // Once the activity window rolls forward (activity_base), the same run
+        // keeps going instead of pausing.
+        assert_eq!(
+            activity_budget_decision(0, MAX_ACTIVITY_STEPS + 1, MAX_ACTIVITY_STEPS),
+            ActivityBudgetDecision::Continue
         );
     }
 
     #[test]
     fn activity_budget_keeps_hard_total_across_continued_activities() {
         assert_eq!(
-            activity_budget_decision(MAX_TOTAL_STEPS - MAX_ACTIVITY_STEPS, MAX_ACTIVITY_STEPS),
+            activity_budget_decision(MAX_TOTAL_STEPS - MAX_ACTIVITY_STEPS, MAX_ACTIVITY_STEPS, 0),
             ActivityBudgetDecision::Continue
         );
         assert_eq!(
-            activity_budget_decision(MAX_TOTAL_STEPS - MAX_ACTIVITY_STEPS, MAX_ACTIVITY_STEPS + 1),
+            activity_budget_decision(
+                MAX_TOTAL_STEPS - MAX_ACTIVITY_STEPS,
+                MAX_ACTIVITY_STEPS + 1,
+                0
+            ),
+            ActivityBudgetDecision::TotalLimitExceeded {
+                attempted_total_step: MAX_TOTAL_STEPS + 1
+            }
+        );
+        // The hard total ceiling still fires even after the activity window has
+        // been rolled forward many times.
+        assert_eq!(
+            activity_budget_decision(0, MAX_TOTAL_STEPS + 1, MAX_TOTAL_STEPS),
             ActivityBudgetDecision::TotalLimitExceeded {
                 attempted_total_step: MAX_TOTAL_STEPS + 1
             }

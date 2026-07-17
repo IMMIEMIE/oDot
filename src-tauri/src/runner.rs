@@ -559,15 +559,16 @@ async fn resume_session_inner(
         session.config_path.as_deref(),
     )
     .ok();
-    if let Err(error) =
-        maybe_generate_session_title(conn, &session, &prompt, request_config.as_ref()).await
-    {
-        let _ = storage::append_event(
-            conn,
-            &session.id,
-            "session.title.generation_failed",
-            json!({ "error": error }),
-        );
+    if should_generate_session_title(conn, &session, &prompt).unwrap_or(false) {
+        if let Some(request_config) = request_config.as_ref() {
+            let title_config = build_title_request_config(app, &session, request_config);
+            spawn_session_title_generation(
+                app.clone(),
+                session.clone(),
+                prompt.clone(),
+                title_config,
+            );
+        }
     }
     session = storage::get_session(conn, &session.id)?;
     let context_limit = request_config
@@ -585,23 +586,82 @@ async fn resume_session_inner(
     run_session_steps(app, conn, &session, &prompt, run_id).await
 }
 
-async fn maybe_generate_session_title(
+/// Whether the session should get an auto-generated title now: only on the very first
+/// user prompt of a top-level (non-subagent) session that still carries a default title.
+fn should_generate_session_title(
     conn: &Connection,
     session: &crate::types::SessionRecord,
     prompt: &str,
-    request_config: Option<&ProviderRequestConfig>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
+    if session.parent_session_id.is_some() || prompt.trim().is_empty() {
+        return Ok(false);
+    }
+    if !is_auto_session_title(session) {
+        return Ok(false);
+    }
     let prompt_count = storage::list_events(conn, &session.id)?
         .iter()
         .filter(|event| event.event_type == "prompt.submitted")
         .count();
-    if prompt_count != 1 || !is_auto_session_title(session) || prompt.trim().is_empty() {
-        return Ok(());
+    Ok(prompt_count == 1)
+}
+
+/// Pick the request config for title generation: a cheap `small_model` when one is
+/// configured/derivable, otherwise the session's own model. Mirrors opencode's
+/// small-model resolution for the hidden `title` agent.
+fn build_title_request_config(
+    app: &AppHandle,
+    session: &crate::types::SessionRecord,
+    fallback: &ProviderRequestConfig,
+) -> ProviderRequestConfig {
+    if let Some(record_id) = config_file::resolve_small_model_record_id(
+        app,
+        &session.project_root,
+        &session.provider_id,
+        session.config_path.as_deref(),
+    ) {
+        if record_id != session.provider_id {
+            if let Ok(config) = config_file::load_provider_request_config_for_session(
+                app,
+                &session.project_root,
+                &record_id,
+                session.config_path.as_deref(),
+            ) {
+                return config;
+            }
+        }
     }
-    let Some(request_config) = request_config else {
-        return Ok(());
-    };
-    let mut title_config = request_config.clone();
+    fallback.clone()
+}
+
+/// Generate the session title off the main turn. opencode forks title generation into the
+/// run scope instead of blocking, so the first answer never waits on a title round-trip.
+fn spawn_session_title_generation(
+    app: AppHandle,
+    session: crate::types::SessionRecord,
+    prompt: String,
+    title_config: ProviderRequestConfig,
+) {
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = generate_session_title(&app, &session, &prompt, title_config).await {
+            if let Ok(conn) = storage::open_db(&app) {
+                let _ = storage::append_event(
+                    &conn,
+                    &session.id,
+                    "session.title.generation_failed",
+                    json!({ "error": error }),
+                );
+            }
+        }
+    });
+}
+
+async fn generate_session_title(
+    app: &AppHandle,
+    session: &crate::types::SessionRecord,
+    prompt: &str,
+    mut title_config: ProviderRequestConfig,
+) -> Result<(), String> {
     title_config.tool_mode = ToolMode::Json;
     title_config.output_token_limit = Some(title_config.output_token_limit.unwrap_or(80).min(80));
     let user_prompt = format!(
@@ -609,8 +669,11 @@ async fn maybe_generate_session_title(
         truncate(prompt, 2_000)
     );
     let mut interrupt = session_coordinator::subscribe_interrupt(&session.id);
-    if storage::is_session_cancel_requested(conn, &session.id)? {
-        return Ok(());
+    {
+        let conn = storage::open_db(app)?;
+        if storage::is_session_cancel_requested(&conn, &session.id)? {
+            return Ok(());
+        }
     }
     let completion = tokio::select! {
         result = provider::complete(&title_config, TITLE_SYSTEM_PROMPT, &user_prompt) => result?,
@@ -620,12 +683,19 @@ async fn maybe_generate_session_title(
         }
     };
     let title = clean_generated_title(&completion.raw_response);
-    if title.is_empty() || title == session.title {
+    if title.is_empty() {
         return Ok(());
     }
-    storage::update_session_title(conn, &session.id, &title)?;
+    let conn = storage::open_db(app)?;
+    // Re-check under the fresh connection: the user may have renamed the session while the
+    // title model was streaming — never clobber a manual title.
+    let latest = storage::get_session(&conn, &session.id)?;
+    if !is_auto_session_title(&latest) || title == latest.title {
+        return Ok(());
+    }
+    storage::update_session_title(&conn, &session.id, &title)?;
     storage::append_event(
-        conn,
+        &conn,
         &session.id,
         "session.title.generated",
         json!({ "title": title }),
@@ -1090,12 +1160,13 @@ Tool guidance:
 - write: create a new file or intentionally replace a whole small file. Avoid full-file rewrites for existing large files unless necessary.
 - delete: delete a file.
 - shell: run verification commands. Foreground commands time out by default; use background=true for long-running dev servers such as npm run dev.
-- question: ask the user when blocked on an important choice.
+- question: ask 1-3 structured questions only when blocked on important choices. Use the user's language; every question needs 2-4 clear options and also permits supplemental text.
 - todo_write: create and maintain a structured task list for visible progress. Use content, status (pending|in_progress|completed|cancelled), and priority (high|medium|low).
 - task: launch an isolated subagent session for focused work. Use multiple task calls in one turn for independent parallel subtasks. Use task_id to continue an existing subagent. Use background=true only for independent long-running work; the result will be injected when ready.
 - skill_list / skill_read: list and read project skills from .odot/skills.
 - mcp__server__tool: call a project-configured MCP tool when available.
 - plan_exit: in plan mode, request user approval to switch from planning to execution after the plan file is complete.
+- request_mode: request user confirmation before switching between ask, plan, and agent modes. Never claim the mode changed until the tool succeeds.
 Use read for file contents and search for project text. Do not read project files with shell commands such as Get-Content, more, cat, grep, or sed when read/search can do it.
 
 {mcp_guidance}
@@ -1120,7 +1191,7 @@ JSON schema:
   "message": "user-facing response or progress note",
   "toolCalls": [
     {{
-      "name": "read|search|grep|edit|write|delete|shell|question|todo_write|task|skill_list|skill_read|mcp__server__tool|plan_exit",
+      "name": "read|search|grep|edit|write|delete|shell|question|todo_write|task|skill_list|skill_read|mcp__server__tool|request_mode|plan_exit",
       "input": {{}}
     }}
   ],
@@ -1134,13 +1205,14 @@ Tool inputs:
 - write: {{"path":"relative/path","content":"complete file content","expectedHash":"optional sha256"}}. Prefer edit for existing large files; use write for new files or intentional full replacement.
 - delete: {{"path":"relative/path"}}
 - shell: {{"command":"test/lint/build command","workdir":"optional/path","timeoutSeconds":60,"background":false,"description":"short purpose"}}. Use background=true for long-running dev servers such as npm run dev.
-- question: {{"question":"short question"}}
+- question: {{"questions":[{{"id":"snake_case_id","header":"short title","question":"clear question","multiple":false,"options":[{{"label":"choice","description":"impact or tradeoff"}},{{"label":"choice","description":"impact or tradeoff"}}]}}]}}. Ask at most 3 questions and use the user's language.
 - todo_write: {{"todos":[{{"content":"task","status":"pending|in_progress|completed|cancelled","priority":"high|medium|low"}}]}}
 - task: {{"description":"short label","prompt":"detailed subtask","subagent_type":"general","task_id":"optional existing task session id","background":false}}
 - skill_list: {{}}
 - skill_read: {{"name":"skill name or .odot/skills/.../SKILL.md path"}}
 - mcp__server__tool: use the exposed MCP tool name exactly and pass the tool's JSON arguments as input.
 - plan_exit: {{}}
+- request_mode: {{"targetMode":"ask|plan|agent","reason":"why the new mode is needed"}}
 Use read for file contents and search for project text. Do not read project files with shell commands such as Get-Content, more, cat, grep, or sed when read/search can do it.
 
 {mcp_guidance}
@@ -1708,7 +1780,12 @@ fn assistant_tool_call_message(
 
 fn tool_result_content(event: &EventRecord) -> String {
     match event.event_type.as_str() {
-        "tool.rejected" => "Tool call rejected by user.".to_string(),
+        "tool.rejected" => event
+            .data
+            .get("result")
+            .map(json_text)
+            .filter(|value| value != "null")
+            .unwrap_or_else(|| "Tool call rejected by user.".to_string()),
         "tool.failed" => {
             let error = event
                 .data
@@ -2523,7 +2600,7 @@ mod tests {
         assert!(!native.contains("bash/shell"));
         assert!(native.contains("Use read for file contents and search for project text."));
         assert!(json.contains(
-            "\"name\": \"read|search|grep|edit|write|delete|shell|question|todo_write|task|skill_list|skill_read|mcp__server__tool|plan_exit\""
+            "\"name\": \"read|search|grep|edit|write|delete|shell|question|todo_write|task|skill_list|skill_read|mcp__server__tool|request_mode|plan_exit\""
         ));
         assert!(json.contains("\"background\":false"));
         assert!(json.contains("\"task_id\":\"optional existing task session id\""));

@@ -19,6 +19,10 @@ use tauri::{AppHandle, Manager};
 #[derive(Debug, Deserialize)]
 struct ODotConfig {
     model: Option<String>,
+    /// Cheap/fast model (`provider/model`) used for side tasks like session-title
+    /// generation. OpenCode-compatible field. See [`resolve_small_model_record_id`].
+    #[serde(default, alias = "smallModel")]
+    small_model: Option<String>,
     #[serde(default)]
     provider: HashMap<String, ConfigProvider>,
     #[serde(default)]
@@ -263,6 +267,83 @@ pub fn load_provider_request_config_for_session(
         provider_config_path(app, project_root, provider_record_id)?
     };
     load_provider_request_config_from_path(&path, provider_record_id)
+}
+
+/// Cheap-model name fragments, highest priority first. Mirrors opencode's
+/// `getSmallModel` default priority list (kept current with Haiku/flash/nano tiers).
+const SMALL_MODEL_PRIORITY: &[&str] = &[
+    "claude-haiku-4-5",
+    "claude-haiku-4.5",
+    "3-5-haiku",
+    "3.5-haiku",
+    "gemini-3-flash",
+    "gemini-2.5-flash",
+    "gpt-5-nano",
+    "gpt-5-mini",
+    "gpt-4o-mini",
+    "o4-mini",
+];
+
+/// Resolve the provider record id (`provider/model`) to use for cheap side tasks such as
+/// session-title generation, mirroring opencode's `small_model` / `getSmallModel`:
+/// 1. explicit top-level `small_model` in the config, else
+/// 2. the first configured model of the session's provider whose key/id matches a known
+///    cheap model (and differs from the session's own model).
+///
+/// Returns `None` when nothing suitable is configured; the caller then falls back to the
+/// session's own model.
+pub fn resolve_small_model_record_id(
+    app: &AppHandle,
+    project_root: &str,
+    session_provider_record_id: &str,
+    config_path: Option<&str>,
+) -> Option<String> {
+    let path = if config_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        resolve_config_path_from_input(app, Some(project_root), config_path).ok()?
+    } else {
+        provider_config_path(app, project_root, session_provider_record_id).ok()?
+    };
+    let content = fs::read_to_string(&path).ok()?;
+    select_small_model_record_id(&content, session_provider_record_id)
+}
+
+/// Pure core of [`resolve_small_model_record_id`]: pick the small-model record id from the
+/// raw config content (no filesystem/env access), so it can be unit-tested directly.
+fn select_small_model_record_id(content: &str, session_provider_record_id: &str) -> Option<String> {
+    let config = parse_config(content).ok()?;
+
+    if let Some(explicit) = config
+        .small_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(explicit.to_string());
+    }
+
+    let (provider_id, session_model_key) = split_provider_record_id(session_provider_record_id)?;
+    let provider = config.provider.get(provider_id)?;
+    for needle in SMALL_MODEL_PRIORITY {
+        for (key, model) in &provider.models {
+            if key == session_model_key {
+                continue;
+            }
+            let key_match = key.to_ascii_lowercase().contains(needle);
+            let id_match = model
+                .id
+                .as_deref()
+                .map(|id| id.to_ascii_lowercase().contains(needle))
+                .unwrap_or(false);
+            if key_match || id_match {
+                return Some(format!("{provider_id}/{key}"));
+            }
+        }
+    }
+    None
 }
 
 fn load_provider_request_config_from_path(
@@ -1437,6 +1518,45 @@ mod tests {
         );
         assert_eq!(provider.model, "ark-code-latest");
         assert!(provider.api_key.is_none());
+    }
+
+    #[test]
+    fn small_model_prefers_explicit_config() {
+        let config = r#"{
+  "small_model": "anthropic/claude-haiku-4-5",
+  "provider": {
+    "anthropic": { "models": { "claude-opus-4-8": {}, "claude-haiku-4-5": {} } }
+  }
+}"#;
+        assert_eq!(
+            select_small_model_record_id(config, "anthropic/claude-opus-4-8").as_deref(),
+            Some("anthropic/claude-haiku-4-5"),
+        );
+    }
+
+    #[test]
+    fn small_model_falls_back_to_cheap_sibling_model() {
+        // No explicit small_model: pick the cheapest matching sibling in the same provider.
+        let config = r#"{
+  "provider": {
+    "anthropic": { "models": { "claude-opus-4-8": {}, "my-haiku": { "id": "claude-haiku-4-5" } } }
+  }
+}"#;
+        assert_eq!(
+            select_small_model_record_id(config, "anthropic/claude-opus-4-8").as_deref(),
+            Some("anthropic/my-haiku"),
+        );
+    }
+
+    #[test]
+    fn small_model_none_when_only_expensive_models() {
+        let config = r#"{
+  "provider": { "anthropic": { "models": { "claude-opus-4-8": {} } } }
+}"#;
+        assert_eq!(
+            select_small_model_record_id(config, "anthropic/claude-opus-4-8"),
+            None,
+        );
     }
 
     #[test]

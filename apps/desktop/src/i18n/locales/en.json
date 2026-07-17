@@ -133,6 +133,7 @@
     "createInstead": "Create another session for this directory",
     "autoCreating": "No matched session; creating one now",
     "selected": "Switched to the VS Code project session",
+    "openedNewest": "Opened the latest session — {{count}} in this project, pick another in the sidebar",
     "notFound": "This VS Code project session no longer exists",
     "busyReason": "The current session is running or awaiting approval. It will continue; choose or create a session to confirm the switch."
   },
@@ -268,6 +269,10 @@
     "sessionCreated": "Session created",
     "attachmentsUnsupported": "Current model does not support attachments",
     "agentWorking": "Agent is working",
+    "activityAutoContinued": "Passed step {{step}} — continuing automatically",
+    "activityAutoContinuedNoStep": "Reached the activity checkpoint — continuing automatically",
+    "backgroundRunning": "\"{{title}}\" is still running in the background",
+    "backgroundAwaitingApproval": "\"{{title}}\" still has a command awaiting approval",
     "waitingCommand": "Waiting for command approval",
     "agentEnded": "Agent finished",
     "noPlanContent": "No executable plan content",
@@ -341,7 +346,12 @@
     "codeChange": "Code changes",
     "runDetails": "Run details",
     "lowPriorityEvents": "Low-priority events",
-    "unknownFile": "Unknown file"
+    "unknownFile": "Unknown file",
+    "subAgentRunning": "Running",
+    "subAgentDone": "Done",
+    "subAgentFailed": "Failed",
+    "subAgentWaiting": "Waiting",
+    "subAgentEmpty": "No sub-agent activity yet"
   },
   "status": {
     "policyBlockedDefault": "Request blocked by policy",
@@ -433,6 +443,8 @@
     "bash": "Command",
     "grep": "Search",
     "todo_write": "Tasks",
+    "question": "Question",
+    "request_mode": "Request mode",
     "plan_exit": "Exit plan"
   },
   "event": {
@@ -526,9 +538,29 @@
   },
   "approval": {
     "commandTitle": "Awaiting approval · Shell command",
+    "viewFullCommand": "View full command",
+    "fullCommandTitle": "Full approval command",
+    "fullCommandDescription": "Review the complete command before choosing an approval action.",
     "permissionTitle": "Awaiting approval · Permission request",
     "pendingChip_one": "{{count}} pending approval",
     "pendingChip_other": "{{count}} pending approvals"
+  },
+  "interaction": {
+    "questionTitle": "Input needed",
+    "customAnswerPlaceholder": "Add context or provide your own answer…",
+    "customAnswerLabel": "Supplemental answer for: {{question}}",
+    "submitAnswers": "Submit answers",
+    "declineAnswer": "Decline to answer",
+    "modeChangeTitle": "Mode change requested",
+    "modeChangeRoute": "Requested mode transition",
+    "modeChangeFallbackReason": "The Agent needs a different operating mode to continue.",
+    "confirmModeChange": "Switch and continue",
+    "modeChanged": "Mode changed; the Agent is continuing",
+    "modeCapability": {
+      "ask": "Ask mode is read-only and can inspect the project before answering.",
+      "plan": "Plan mode is read-only except for the session plan file.",
+      "agent": "Agent mode can modify files and run implementation commands."
+    }
   },
   "dock": {
     "panelLabel": "Side panel",

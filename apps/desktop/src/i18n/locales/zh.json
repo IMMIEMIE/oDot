@@ -130,6 +130,7 @@
     "createInstead": "为该目录再新建一个会话",
     "autoCreating": "未找到匹配会话，正在自动新建",
     "selected": "已切换到 VS Code 项目会话",
+    "openedNewest": "已打开最近的会话——该项目共 {{count}} 个，其余可在侧边栏选择",
     "notFound": "该 VS Code 项目会话已不存在",
     "busyReason": "当前会话正在运行或等待审批。原任务会继续；请选择会话或新建会话以确认切换。"
   },
@@ -265,6 +266,10 @@
     "sessionCreated": "会话已创建",
     "attachmentsUnsupported": "当前模型不支持附件上传",
     "agentWorking": "Agent 正在工作",
+    "activityAutoContinued": "已越过第 {{step}} 步——自动继续中",
+    "activityAutoContinuedNoStep": "已到达活动检查点——自动继续中",
+    "backgroundRunning": "“{{title}}” 仍在后台运行",
+    "backgroundAwaitingApproval": "“{{title}}” 还有命令等待确认",
     "waitingCommand": "等待命令确认",
     "agentEnded": "Agent 已结束",
     "noPlanContent": "没有可执行的计划内容",
@@ -329,7 +334,12 @@
     "codeChange": "代码修改",
     "runDetails": "运行细节",
     "lowPriorityEvents": "低优先级事件",
-    "unknownFile": "未知文件"
+    "unknownFile": "未知文件",
+    "subAgentRunning": "运行中",
+    "subAgentDone": "已完成",
+    "subAgentFailed": "失败",
+    "subAgentWaiting": "等待中",
+    "subAgentEmpty": "子 Agent 暂无活动"
   },
   "status": {
     "policyBlockedDefault": "请求被策略拦截",
@@ -421,6 +431,8 @@
     "bash": "命令",
     "grep": "搜索",
     "todo_write": "任务",
+    "question": "反问",
+    "request_mode": "请求切换模式",
     "plan_exit": "退出计划"
   },
   "event": {
@@ -514,8 +526,28 @@
   },
   "approval": {
     "commandTitle": "等待审批 · 命令执行",
+    "viewFullCommand": "查看完整指令",
+    "fullCommandTitle": "完整审批指令",
+    "fullCommandDescription": "请确认完整内容后选择审批操作。",
     "permissionTitle": "等待审批 · 权限请求",
     "pendingChip": "{{count}} 项待审批"
+  },
+  "interaction": {
+    "questionTitle": "需要你确认方向",
+    "customAnswerPlaceholder": "补充背景，或填写你自己的答案…",
+    "customAnswerLabel": "问题“{{question}}”的补充回答",
+    "submitAnswers": "提交回答",
+    "declineAnswer": "暂不回答",
+    "modeChangeTitle": "Agent 请求切换模式",
+    "modeChangeRoute": "请求的模式切换",
+    "modeChangeFallbackReason": "Agent 需要切换工作模式才能继续。",
+    "confirmModeChange": "切换并继续",
+    "modeChanged": "模式已切换，Agent 正在继续",
+    "modeCapability": {
+      "ask": "问答模式只读，可检查项目后回答问题。",
+      "plan": "计划模式只读，仅允许写入当前会话的计划文件。",
+      "agent": "Agent 模式可修改文件并运行实现命令。"
+    }
   },
   "dock": {
     "panelLabel": "侧边面板",

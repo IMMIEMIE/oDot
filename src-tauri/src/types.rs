@@ -357,6 +357,29 @@ pub struct UpdateSessionModeInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct QuestionAnswerInput {
+    pub id: String,
+    #[serde(default)]
+    pub selected_options: Vec<String>,
+    pub custom_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerToolQuestionInput {
+    pub event_id: String,
+    pub answers: Vec<QuestionAnswerInput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolveModeChangeInput {
+    pub event_id: String,
+    pub approved: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EventRecord {
     pub id: String,
     pub session_id: String,

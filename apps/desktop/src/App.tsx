@@ -29,7 +29,6 @@ import {
   RotateCcw,
   Save,
   Settings,
-  Terminal,
   Trash2,
   Upload,
   Wrench,
@@ -37,6 +36,7 @@ import {
   Zap
 } from "lucide-react";
 import { OdodBotIcon } from "./OdodBotIcon";
+import { PendingInteractionCard } from "./PendingInteractionCard";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -62,6 +62,7 @@ import type {
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
+  answerToolQuestion,
   approveToolCall,
   cancelJob,
   cancelSession,
@@ -93,6 +94,7 @@ import {
   rejectToolCall,
   reportWorkspaceResolution,
   replyPermission,
+  resolveModeChange,
   recoverBackgroundTask,
   recoverSessionFromCheckpoint,
   rollbackSnapshot,
@@ -114,6 +116,7 @@ import {
   type McpToolDefinition,
   type PermissionRequestRecord,
   type PermissionReply,
+  type QuestionAnswer,
   type BridgeClient,
   type ProjectCapabilities,
   type ProviderConfigFileResponse,
@@ -334,8 +337,10 @@ export function App() {
   });
   const timelineEndRef = useRef<HTMLDivElement | null>(null);
   const timelineScrollRef = useRef<HTMLDivElement | null>(null);
+  const pendingApprovalPanelRef = useRef<HTMLElement | null>(null);
   const shouldStickToTimelineBottomRef = useRef(true);
   const promptInputRef = useRef<HTMLDivElement | null>(null);
+  const promptComposerRef = useRef<HTMLDivElement | null>(null);
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
   const modelMenuRef = useRef<HTMLDivElement | null>(null);
   const runConfigGroupRef = useRef<HTMLDivElement | null>(null);
@@ -355,10 +360,16 @@ export function App() {
   const promptDraftHydratedRef = useRef(false);
   const promptDraftUpdatedAtRef = useRef(readPromptDraft()?.updatedAt ?? 0);
   const pendingExternalProjectRootRef = useRef<string | null>(null);
+  const pendingExternalProjectClientIdRef = useRef<string | null>(null);
+  const pendingExternalProjectRequestIdRef = useRef<string | null>(null);
   const appearanceRestoredRef = useRef(false);
   const [isModelMenuOpen, setIsModelMenuOpen] = useState(false);
   const [isRunModeMenuOpen, setIsRunModeMenuOpen] = useState(false);
   const [isShellModeMenuOpen, setIsShellModeMenuOpen] = useState(false);
+  const [isRunConfigMenuOpen, setIsRunConfigMenuOpen] = useState(false);
+  const [composerLayout, setComposerLayout] = useState<"wide" | "compact" | "minimal">(
+    "wide"
+  );
   const [composerReasoningEfforts, setComposerReasoningEfforts] = useState<ReasoningEffort[]>([]);
   const [composerReasoningEffort, setComposerReasoningEffort] =
     useState<ReasoningEffortSetting>("");
@@ -623,6 +634,16 @@ export function App() {
           updateSessionUi(payload.sessionId, { isRealtimeWorking: true });
         }
       }
+      if (payload.event?.type === "run.activity.auto_continued") {
+        const step = valueAsNumber(payload.event.data.step);
+        setSessionNotice(payload.sessionId, {
+          tone: "info",
+          text:
+            step != null
+              ? i18n.t("notice.activityAutoContinued", { step })
+              : i18n.t("notice.activityAutoContinuedNoStep")
+        });
+      }
       if (
         payload.event?.type === "agent.stopped" &&
         payload.event.seq > (stopBaselineSeqsRef.current.get(payload.sessionId) ?? 0)
@@ -642,6 +663,7 @@ export function App() {
       }
       if (
         payload.kind === "session.start" ||
+        payload.kind === "session.title.generated" ||
         payload.kind === "task.created" ||
         payload.kind === "task.completed" ||
         payload.kind === "task.failed" ||
@@ -770,13 +792,13 @@ export function App() {
       ),
     [providers, sessions]
   );
-  const orderedSessions = useMemo(
-    () => orderSessionsByParent(availableSessions),
-    [availableSessions]
+  const projectSessions = useMemo(
+    () => orderSessionsByParent(sessions).filter((session) => !session.parentSessionId),
+    [sessions]
   );
   const projectGroups = useMemo(
-    () => groupSessionsByProject(orderedSessions, bridgeClients),
-    [orderedSessions, bridgeClients]
+    () => groupSessionsByProject(projectSessions, bridgeClients),
+    [projectSessions, bridgeClients]
   );
   const selectedChildSessions = useMemo(
     () =>
@@ -791,6 +813,83 @@ export function App() {
     () => selectedChildSessions.filter((session) => session.status === "active"),
     [selectedChildSessions]
   );
+  // All descendant sub-agent sessions (children, grandchildren, …) of the selected
+  // session. Their events are surfaced inline in the parent timeline and their
+  // pending approvals bubble up into the parent approval bar, so no sub-agent needs
+  // its own sidebar row or a separate session switch.
+  const descendantSessions = useMemo(() => {
+    if (!selectedSessionId) {
+      return [] as SessionRecord[];
+    }
+    const byParent = new Map<string, SessionRecord[]>();
+    for (const session of availableSessions) {
+      if (session.parentSessionId) {
+        const list = byParent.get(session.parentSessionId) ?? [];
+        list.push(session);
+        byParent.set(session.parentSessionId, list);
+      }
+    }
+    const result: SessionRecord[] = [];
+    const seen = new Set<string>();
+    const walk = (parentId: string) => {
+      for (const child of byParent.get(parentId) ?? []) {
+        if (seen.has(child.id)) {
+          continue;
+        }
+        seen.add(child.id);
+        result.push(child);
+        walk(child.id);
+      }
+    };
+    walk(selectedSessionId);
+    return result;
+  }, [availableSessions, selectedSessionId]);
+  const responsesBySessionId = useSessionEventStore(
+    (state) => state.responsesBySessionId
+  );
+  const childPendingToolEvents = useMemo(() => {
+    const out: EventRecord[] = [];
+    for (const child of descendantSessions) {
+      const response = responsesBySessionId[child.id];
+      if (!response) {
+        continue;
+      }
+      const resolved = new Set(
+        response.events
+          .map((event) => valueAsString(event.data.pendingEventId))
+          .filter(Boolean)
+      );
+      for (const event of response.events) {
+        if (event.type === "tool.pending" && !resolved.has(event.id)) {
+          out.push(event);
+        }
+      }
+    }
+    return out;
+  }, [descendantSessions, responsesBySessionId]);
+  const childVisiblePermissions = useMemo(() => {
+    const out: PermissionRequestRecord[] = [];
+    for (const child of descendantSessions) {
+      const response = responsesBySessionId[child.id];
+      if (!response) {
+        continue;
+      }
+      out.push(...visiblePermissionRequests(response.permissions));
+    }
+    return out;
+  }, [descendantSessions, responsesBySessionId]);
+  // Eagerly load events for descendant sub-agent sessions so their activity can be
+  // rendered inline under the parent timeline and their pending approvals surface in
+  // the parent approval bar even while their inline card is collapsed. Live updates
+  // then arrive through the global realtime listener.
+  useEffect(() => {
+    for (const child of descendantSessions) {
+      if (currentSessionEvents(child.id).events.length === 0) {
+        void loadEvents(child.id).catch(() => undefined);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [descendantSessions]);
   const backgroundTaskSessionIds = useMemo(
     () =>
       new Set(
@@ -894,7 +993,25 @@ export function App() {
     () => visiblePermissionRequests(eventsResponse.permissions),
     [eventsResponse.permissions]
   );
-  const pendingApprovalCount = pendingToolEvents.length + visiblePermissions.length;
+  // Merge the selected session's own pending approvals with those raised by its
+  // sub-agents so a single parent-level approval bar governs the whole tree.
+  const allPendingToolEvents = useMemo(
+    () => [...pendingToolEvents, ...childPendingToolEvents],
+    [pendingToolEvents, childPendingToolEvents]
+  );
+  const allVisiblePermissions = useMemo(
+    () => [...visiblePermissions, ...childVisiblePermissions],
+    [visiblePermissions, childVisiblePermissions]
+  );
+  const sessionTitleById = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const session of availableSessions) {
+      map.set(session.id, session.title);
+    }
+    return map;
+  }, [availableSessions]);
+  const pendingApprovalCount =
+    allPendingToolEvents.length + allVisiblePermissions.length;
   const sessionCodeChanges = useMemo(
     () =>
       mergeCodeChangesByPath(
@@ -1195,47 +1312,49 @@ export function App() {
         if (!workspaceRoot) {
           return;
         }
+        const requestedSessionId =
+          payload.activeSessionId ??
+          (payload.sessions.length === 1 ? payload.sessions[0]?.id : null);
         if (
           selectedSessionId &&
+          requestedSessionId === selectedSessionId &&
           normalizeProjectRootKey(projectRoot) === normalizeProjectRootKey(workspaceRoot)
         ) {
+          await reportWorkspaceResolution({
+            action: "selected",
+            workspaceRoot,
+            requestId: payload.requestId,
+            clientId: payload.clientId,
+            activeSessionId: selectedSessionId
+          });
           dismissExternalProjectSessions();
           return;
         }
         await presentPreferredWindow();
-        if (workspaceSwitchBlocked && selectedSessionId) {
-          const deferred = {
-            ...payload,
-            action: "deferredBusy" as const,
-            busyReason: t("externalProjectSessions.busyReason"),
-            activeSessionId: selectedSessionId
-          };
-          setExternalProjectSessions(deferred);
-          saveExternalProjectSessions(deferred, "main");
-          externalProjectSessionsUpdatedAtRef.current =
-            readExternalProjectSessions()?.updatedAt ?? Date.now();
-          void reportWorkspaceResolution({
-            action: "deferredBusy",
-            workspaceRoot,
-            activeSessionId: selectedSessionId,
-            busyReason: deferred.busyReason
+
+        // The current session may still be working or awaiting a command
+        // approval. Switching the view does NOT stop it — the run keeps going in
+        // the backend and stays visible in the sidebar / floating window — so we
+        // never block the switch; we only surface a non-blocking reminder.
+        const backgroundBusy = Boolean(workspaceSwitchBlocked && selectedSessionId);
+        const remindBackground = () => {
+          if (!backgroundBusy) {
+            return;
+          }
+          const runningTitle = selectedSession?.title ?? "";
+          setNotice({
+            tone: "info",
+            text:
+              visiblePermissions.length > 0
+                ? t("notice.backgroundAwaitingApproval", { title: runningTitle })
+                : t("notice.backgroundRunning", { title: runningTitle })
           });
-          return;
-        }
-        if (payload.sessions.length === 1) {
-          dismissExternalProjectSessions();
-          await selectSession(payload.sessions[0]).catch((error) =>
-            reportError(error, payload.sessions[0].id)
-          );
-          void reportWorkspaceResolution({
-            action: "selected",
-            workspaceRoot,
-            activeSessionId: payload.sessions[0].id
-          });
-          return;
-        }
+        };
+
         if (payload.sessions.length === 0) {
           pendingExternalProjectRootRef.current = workspaceRoot;
+          pendingExternalProjectClientIdRef.current = payload.clientId ?? null;
+          pendingExternalProjectRequestIdRef.current = payload.requestId;
           let config: ProviderConfigFileResponse;
           try {
             config = await loadProviderConfig(
@@ -1251,10 +1370,20 @@ export function App() {
             return;
           }
           try {
-            await createExternalProjectSession(workspaceRoot);
+            await createExternalProjectSession(
+              workspaceRoot,
+              payload.clientId,
+              payload.requestId
+            );
             pendingExternalProjectRootRef.current = null;
+            pendingExternalProjectClientIdRef.current = null;
+            pendingExternalProjectRequestIdRef.current = null;
+            expandProjectGroup(workspaceRoot);
+            remindBackground();
           } catch (error) {
             pendingExternalProjectRootRef.current = null;
+            pendingExternalProjectClientIdRef.current = null;
+            pendingExternalProjectRequestIdRef.current = null;
             reportError(error);
             const failedResolution = {
               ...payload,
@@ -1268,15 +1397,45 @@ export function App() {
             void reportWorkspaceResolution({
               action: "error",
               workspaceRoot,
+              requestId: payload.requestId,
+              clientId: payload.clientId,
               busyReason: failedResolution.busyReason
             });
           }
           return;
         }
-        setExternalProjectSessions(payload);
-        saveExternalProjectSessions(payload, "main");
-        externalProjectSessionsUpdatedAtRef.current =
-          readExternalProjectSessions()?.updatedAt ?? Date.now();
+
+        // One or more existing sessions: open the IDE's active session if it
+        // named one, otherwise the most recently updated. Reveal the project's
+        // group in the sidebar so the rest of its history is one click away —
+        // no modal.
+        const target =
+          (requestedSessionId
+            ? payload.sessions.find((item) => item.id === requestedSessionId)
+            : undefined) ??
+          [...payload.sessions].sort((left, right) =>
+            right.updatedAt.localeCompare(left.updatedAt)
+          )[0];
+        dismissExternalProjectSessions();
+        expandProjectGroup(workspaceRoot);
+        await selectSession(target).catch((error) => reportError(error, target.id));
+        await reportWorkspaceResolution({
+          action: "selected",
+          workspaceRoot,
+          requestId: payload.requestId,
+          clientId: payload.clientId,
+          activeSessionId: target.id
+        });
+        if (backgroundBusy) {
+          remindBackground();
+        } else if (payload.sessions.length > 1) {
+          setNotice({
+            tone: "info",
+            text: t("externalProjectSessions.openedNewest", {
+              count: payload.sessions.length
+            })
+          });
+        }
       }
     ).then((dispose) => {
       if (disposed) {
@@ -1358,11 +1517,6 @@ export function App() {
       const session = nextSessions.find((item) => item.id === payload.sessionId);
       if (session) {
         await selectSession(session).catch((error) => reportError(error, session.id));
-        void reportWorkspaceResolution({
-          action: "selected",
-          workspaceRoot: session.projectRoot,
-          activeSessionId: session.id
-        });
       }
     }).then((dispose) => {
       if (disposed) {
@@ -1424,6 +1578,17 @@ export function App() {
     shouldStickToTimelineBottomRef.current = distanceFromBottom < 36;
   }
 
+  function focusPendingApprovalPanel() {
+    const panel = pendingApprovalPanelRef.current;
+    if (!panel) {
+      return;
+    }
+    panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    window.setTimeout(() => {
+      panel.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
+    }, 180);
+  }
+
   useLayoutEffect(() => {
     const input = promptInputRef.current;
     if (!input) {
@@ -1468,7 +1633,7 @@ export function App() {
   }, [isModelMenuOpen]);
 
   useEffect(() => {
-    if (!isRunModeMenuOpen && !isShellModeMenuOpen) {
+    if (!isRunModeMenuOpen && !isShellModeMenuOpen && !isRunConfigMenuOpen) {
       return;
     }
 
@@ -1476,6 +1641,7 @@ export function App() {
       if (!runConfigGroupRef.current?.contains(event.target as Node)) {
         setIsRunModeMenuOpen(false);
         setIsShellModeMenuOpen(false);
+        setIsRunConfigMenuOpen(false);
       }
     }
 
@@ -1483,6 +1649,7 @@ export function App() {
       if (event.key === "Escape") {
         setIsRunModeMenuOpen(false);
         setIsShellModeMenuOpen(false);
+        setIsRunConfigMenuOpen(false);
       }
     }
 
@@ -1492,7 +1659,35 @@ export function App() {
       window.removeEventListener("pointerdown", closeOnOutsidePointer);
       window.removeEventListener("keydown", closeOnEscape);
     };
-  }, [isRunModeMenuOpen, isShellModeMenuOpen]);
+  }, [isRunModeMenuOpen, isShellModeMenuOpen, isRunConfigMenuOpen]);
+
+  useLayoutEffect(() => {
+    const composer = promptComposerRef.current;
+    if (!composer) {
+      return;
+    }
+
+    const syncLayout = (width: number) => {
+      const nextLayout = width < 470 ? "minimal" : width < 720 ? "compact" : "wide";
+      setComposerLayout((current) => (current === nextLayout ? current : nextLayout));
+    };
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (entry) {
+        syncLayout(entry.contentRect.width);
+      }
+    });
+
+    syncLayout(composer.getBoundingClientRect().width);
+    observer.observe(composer);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    setIsRunModeMenuOpen(false);
+    setIsShellModeMenuOpen(false);
+    setIsRunConfigMenuOpen(false);
+  }, [composerLayout]);
 
   useEffect(() => {
     if (isPromptLocked || selectedSessionId) {
@@ -1504,6 +1699,7 @@ export function App() {
     if (isPromptLocked) {
       setIsRunModeMenuOpen(false);
       setIsShellModeMenuOpen(false);
+      setIsRunConfigMenuOpen(false);
     }
   }, [isPromptLocked]);
 
@@ -1671,8 +1867,14 @@ export function App() {
       setNotice({ tone: "success", text: t("notice.configCreated") });
       const pendingRoot = pendingExternalProjectRootRef.current;
       if (pendingRoot) {
-        await createExternalProjectSession(pendingRoot);
+        await createExternalProjectSession(
+          pendingRoot,
+          pendingExternalProjectClientIdRef.current,
+          pendingExternalProjectRequestIdRef.current
+        );
         pendingExternalProjectRootRef.current = null;
+        pendingExternalProjectClientIdRef.current = null;
+        pendingExternalProjectRequestIdRef.current = null;
       }
       setNeedsSetup(false);
     } catch (error) {
@@ -1731,9 +1933,11 @@ export function App() {
       return;
     }
     await selectSession(session);
-    void reportWorkspaceResolution({
+    await reportWorkspaceResolution({
       action: "selected",
       workspaceRoot: session.projectRoot,
+      requestId: externalProjectSessions?.requestId,
+      clientId: externalProjectSessions?.clientId,
       activeSessionId: session.id
     });
     setExternalProjectSessions(null);
@@ -1743,17 +1947,25 @@ export function App() {
     setNotice({ tone: "success", text: t("externalProjectSessions.selected") });
   }
 
-  async function createExternalProjectSession(workspaceRoot: string) {
+  async function createExternalProjectSession(
+    workspaceRoot: string,
+    clientId?: string | null,
+    requestId?: string | null
+  ) {
     const root = workspaceRoot.trim();
     if (!root) {
       return;
     }
     const session = await createSessionForProjectRoot(root);
-    void reportWorkspaceResolution({
-      action: "created",
-      workspaceRoot: root,
-      activeSessionId: session.id
-    });
+    if (clientId && requestId) {
+      await reportWorkspaceResolution({
+        action: "created",
+        workspaceRoot: root,
+        requestId,
+        clientId,
+        activeSessionId: session.id
+      });
+    }
     setExternalProjectSessions(null);
     clearExternalProjectSessions("main");
     externalProjectSessionsUpdatedAtRef.current =
@@ -1766,6 +1978,8 @@ export function App() {
     workspaceRoot: string
   ) {
     pendingExternalProjectRootRef.current = workspaceRoot;
+    pendingExternalProjectClientIdRef.current = payload.clientId ?? null;
+    pendingExternalProjectRequestIdRef.current = payload.requestId;
     const needsSetupResolution = {
       ...payload,
       action: "needsSetup" as const
@@ -1778,7 +1992,9 @@ export function App() {
     setNeedsSetup(true);
     void reportWorkspaceResolution({
       action: "needsSetup",
-      workspaceRoot
+      workspaceRoot,
+      requestId: payload.requestId,
+      clientId: payload.clientId
     });
     await presentPreferredWindow(true);
   }
@@ -1881,8 +2097,16 @@ export function App() {
       return;
     }
     if (workspaceSwitchBlocked && selectedSessionId) {
-      setNotice({ tone: "error", text: t("externalProjectSessions.busyReason") });
-      return;
+      // Don't block the switch — the current run keeps going in the background
+      // and stays visible in the sidebar; just remind the user.
+      const leavingTitle = selectedSession?.title ?? "";
+      setNotice({
+        tone: "info",
+        text:
+          visiblePermissions.length > 0
+            ? t("notice.backgroundAwaitingApproval", { title: leavingTitle })
+            : t("notice.backgroundRunning", { title: leavingTitle })
+      });
     }
     try {
       const allSessions = sessions.length ? sessions : await refreshSessions();
@@ -1894,11 +2118,6 @@ export function App() {
         .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
       if (matching.length > 0) {
         await selectSession(matching[0]);
-        void reportWorkspaceResolution({
-          action: "selected",
-          workspaceRoot: root,
-          activeSessionId: matching[0].id
-        });
         return;
       }
       const config = await loadProviderConfig(
@@ -1908,7 +2127,6 @@ export function App() {
       if (!config || !preferredConfigProviderId(config)) {
         setProjectRoot(root);
         setNeedsSetup(true);
-        void reportWorkspaceResolution({ action: "needsSetup", workspaceRoot: root });
         return;
       }
       await createExternalProjectSession(root);
@@ -2200,7 +2418,16 @@ export function App() {
     setLoadedSkills((current) => current.filter((skill) => skill.path !== path));
   }
 
-  function dismissExternalProjectSessions() {
+  function dismissExternalProjectSessions(reportIgnored = false) {
+    const pending = externalProjectSessions;
+    if (reportIgnored && pending?.clientId && pending.requestId && pending.workspaceRoot.trim()) {
+      void reportWorkspaceResolution({
+        action: "ignored",
+        workspaceRoot: pending.workspaceRoot,
+        requestId: pending.requestId,
+        clientId: pending.clientId
+      }).catch(() => undefined);
+    }
     setExternalProjectSessions(null);
     clearExternalProjectSessions("main");
     externalProjectSessionsUpdatedAtRef.current =
@@ -2220,7 +2447,7 @@ export function App() {
       <div
         className="modalBackdrop"
         role="presentation"
-        onClick={dismissExternalProjectSessions}
+        onClick={() => dismissExternalProjectSessions(true)}
       >
         <section
           className="settingsModal externalProjectSessionModal"
@@ -2243,7 +2470,7 @@ export function App() {
               type="button"
               className="iconButton ghost"
               aria-label={t("externalProjectSessions.dismiss")}
-              onClick={dismissExternalProjectSessions}
+              onClick={() => dismissExternalProjectSessions(true)}
             >
               <X size={16} />
             </button>
@@ -2278,7 +2505,13 @@ export function App() {
                 type="button"
                 className="externalProjectSessionOption externalProjectSessionOption--create"
                 disabled={isCreatingSession}
-                onClick={() => void createExternalProjectSession(workspaceRoot)}
+                onClick={() =>
+                  void createExternalProjectSession(
+                    workspaceRoot,
+                    externalProjectSessions?.clientId,
+                    externalProjectSessions?.requestId
+                  )
+                }
               >
                 <span className="externalProjectSessionTitle">
                   <Plus size={14} />
@@ -2538,10 +2771,10 @@ export function App() {
           : t("notice.agentEnded")
       });
     } catch (error) {
-      if (sessionRunId(sessionId) !== runId) {
-        return;
+      if (sessionRunId(sessionId) === runId) {
+        reportError(error, sessionId);
       }
-      reportError(error, sessionId);
+      throw error;
     } finally {
       if (sessionRunId(sessionId) === runId) {
         updateSessionUi(sessionId, { isContinuing: false, isMutating: false });
@@ -2570,6 +2803,7 @@ export function App() {
     } catch (error) {
       reportError(error, sessionId);
       updateSessionUi(sessionId, { isMutating: false });
+      throw error;
     }
   }
 
@@ -2591,6 +2825,66 @@ export function App() {
       if (sessionRunId(sessionId) === runId) {
         reportError(error, sessionId);
       }
+      throw error;
+    } finally {
+      if (sessionRunId(sessionId) === runId) {
+        updateSessionUi(sessionId, { isContinuing: false, isMutating: false });
+      }
+    }
+  }
+
+  async function handleAnswerQuestion(event: EventRecord, answers: QuestionAnswer[]) {
+    const sessionId = event.sessionId;
+    const runId = beginSessionRun(sessionId);
+    updateSessionUi(sessionId, { isMutating: true, isContinuing: true });
+    setSessionNotice(sessionId, { tone: "info", text: t("notice.agentContinuing") });
+    try {
+      await answerToolQuestion({ eventId: event.id, answers });
+      const response = await continueSession(sessionId);
+      if (sessionRunId(sessionId) !== runId) return;
+      setSessionEventsResponse(sessionId, response);
+      syncSessionRealtimeWorking(sessionId, response);
+      await refreshSessions();
+      setSessionNotice(sessionId, {
+        tone: "success",
+        text: hasUnresolvedPendingTools(response.events)
+          ? t("notice.waitingCommand")
+          : t("notice.agentEnded")
+      });
+    } catch (error) {
+      if (sessionRunId(sessionId) === runId) reportError(error, sessionId);
+      throw error;
+    } finally {
+      if (sessionRunId(sessionId) === runId) {
+        updateSessionUi(sessionId, { isContinuing: false, isMutating: false });
+      }
+    }
+  }
+
+  async function handleResolveModeChange(event: EventRecord, approved: boolean) {
+    const sessionId = event.sessionId;
+    const runId = beginSessionRun(sessionId);
+    updateSessionUi(sessionId, { isMutating: true, isContinuing: true });
+    setSessionNotice(sessionId, { tone: "info", text: t("notice.agentContinuing") });
+    try {
+      await resolveModeChange({ eventId: event.id, approved });
+      const response = await continueSession(sessionId);
+      if (sessionRunId(sessionId) !== runId) return;
+      setSessionEventsResponse(sessionId, response);
+      syncSessionRealtimeWorking(sessionId, response);
+      const nextSessions = await refreshSessions();
+      const sourceSession = nextSessions.find((session) => session.id === sessionId);
+      if (sourceSession && selectedSessionIdRef.current === sessionId) {
+        setMode(sourceSession.mode);
+        setShellMode(sourceSession.shellMode);
+      }
+      setSessionNotice(sessionId, {
+        tone: "success",
+        text: approved ? t("interaction.modeChanged") : t("notice.commandRejected")
+      });
+    } catch (error) {
+      if (sessionRunId(sessionId) === runId) reportError(error, sessionId);
+      throw error;
     } finally {
       if (sessionRunId(sessionId) === runId) {
         updateSessionUi(sessionId, { isContinuing: false, isMutating: false });
@@ -2868,6 +3162,7 @@ export function App() {
   function selectShellMode(nextShellMode: ShellMode) {
     setShellMode(nextShellMode);
     setIsShellModeMenuOpen(false);
+    setIsRunConfigMenuOpen(false);
     if (selectedSessionId) {
       void updateSessionMode({
         sessionId: selectedSessionId,
@@ -2885,6 +3180,7 @@ export function App() {
   function selectAgentMode(nextMode: AgentMode) {
     setMode(nextMode);
     setIsRunModeMenuOpen(false);
+    setIsRunConfigMenuOpen(false);
     if (selectedSessionId) {
       void updateSessionMode({ sessionId: selectedSessionId, mode: nextMode })
         .then((updated) =>
@@ -3196,12 +3492,23 @@ export function App() {
     });
   }
 
-  function renderSessionRow(session: SessionRecord) {
+  // Reveal a project's group in the left tree (used when an IDE opens a project
+  // so its history is visible inline instead of in a modal).
+  function expandProjectGroup(root: string) {
+    const key = normalizeProjectRootKey(root);
+    setCollapsedProjectKeys((current) => {
+      if (!current.has(key)) {
+        return current;
+      }
+      const next = new Set(current);
+      next.delete(key);
+      return next;
+    });
+  }
+
+  function renderSessionRow(session: SessionRecord, boundClients: BridgeClient[] = []) {
     const rowUi = sessionUi(session.id);
     const rowWorking = sessionIsWorkingById(session.id);
-    const switchingAcrossProject =
-      normalizeProjectRootKey(session.projectRoot) !== normalizeProjectRootKey(projectRoot);
-    const selectionDisabled = switchingAcrossProject && workspaceSwitchBlocked;
     return (
       <div
         key={session.id}
@@ -3237,7 +3544,6 @@ export function App() {
           <button
             type="button"
             className="sessionSelectButton"
-            disabled={selectionDisabled}
             onClick={() =>
               void selectSession(session).catch((error) => reportError(error, session.id))
             }
@@ -3251,6 +3557,7 @@ export function App() {
             <small>
               {session.parentSessionId ? t("common.subAgent") : modeLabel(session.mode)} /{" "}
               {shellModeLabel(session.shellMode)}
+              {boundClients.length ? ` · ${ideClientsLabel(boundClients, t)}` : ""}
             </small>
           </button>
         )}
@@ -3333,15 +3640,11 @@ export function App() {
             {recentSessions.map((session) => {
               const working = sessionIsWorkingById(session.id);
               const pendingApproval = sessionHasPendingApproval(session.id);
-              const switchingAcrossProject =
-                normalizeProjectRootKey(session.projectRoot) !==
-                normalizeProjectRootKey(projectRoot);
               return (
                 <button
                   key={session.id}
                   type="button"
                   className="homeRecentRow"
-                  disabled={switchingAcrossProject && workspaceSwitchBlocked}
                   onClick={() =>
                     void selectSession(session).catch((error) =>
                       reportError(error, session.id)
@@ -3389,8 +3692,11 @@ export function App() {
         <div className="projectTree" aria-label={t("nav.projects")}>
           {projectGroups.map((group) => {
             const collapsed = collapsedProjectKeys.has(group.key);
-            const ide = group.ide;
+            const ides = group.ides;
+            const ide = ides[0] ?? null;
             const identity = ide ? ideIdentity(ide.source, t) : null;
+            const anyIdeOnline = ides.some((client) => client.online);
+            const ideLabel = ideClientsLabel(ides, t);
             return (
               <div className="projectGroup" key={group.key}>
                 <div className="projectRow">
@@ -3404,9 +3710,8 @@ export function App() {
                   </button>
                   <button
                     type="button"
-                    className={`projectHeaderButton${ide && !ide.online ? " offline" : ""}`}
+                    className={`projectHeaderButton${ides.length && !anyIdeOnline ? " offline" : ""}`}
                     title={group.root}
-                    disabled={workspaceSwitchBlocked}
                     onClick={() => void switchToWorkspace(group.root)}
                   >
                     <span className="projectHeaderIcon">
@@ -3415,14 +3720,15 @@ export function App() {
                     <span className="projectHeaderBody">
                       <strong>{group.displayName}</strong>
                       <small>
-                        {ide && identity
-                          ? `${identity.name}${ide.online ? "" : ` · ${t("ide.offline")}`}`
-                          : t("session.count", { count: group.sessions.length })}
+                        {ides.length
+                          ? `${ideLabel}${anyIdeOnline ? "" : ` · ${t("ide.offline")}`} · `
+                          : ""}
+                        {t("session.count", { count: group.sessions.length })}
                       </small>
                     </span>
-                    {ide && (
+                    {ides.length > 0 && (
                       <span
-                        className={`ideStatusDot${ide.online ? " online" : ""}`}
+                        className={`ideStatusDot${anyIdeOnline ? " online" : ""}`}
                         aria-hidden="true"
                       />
                     )}
@@ -3447,7 +3753,16 @@ export function App() {
                 </div>
                 {!collapsed && (
                   <div className="projectSessions">
-                    {group.sessions.map((session) => renderSessionRow(session))}
+                    {group.sessions
+                      .filter((session) => !session.parentSessionId)
+                      .map((session) =>
+                        renderSessionRow(
+                          session,
+                          group.ides.filter(
+                            (client) => client.activeSessionId === session.id
+                          )
+                        )
+                      )}
                     {!group.sessions.length && (
                       <EmptyLine text={t("empty.noSessionsInProject")} />
                     )}
@@ -3509,9 +3824,7 @@ export function App() {
               className="pendingApprovalChip"
               type="button"
               title={t("approval.pendingChip", { count: pendingApprovalCount })}
-              onClick={() =>
-                timelineEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" })
-              }
+              onClick={focusPendingApprovalPanel}
             >
               <span className="pendingApprovalPulse" aria-hidden="true" />
               {t("approval.pendingChip", { count: pendingApprovalCount })}
@@ -3589,90 +3902,6 @@ export function App() {
               onRollbackSnapshots={stableRollbackSnapshots}
               onRecoverAgent={stableRecoverAgent}
             />
-            {pendingToolEvents.map((event) => (
-              <div className="inlineApprovalCard" key={event.id}>
-                <header className="inlineApprovalHeader">
-                  <Terminal size={14} />
-                  <strong>{t("approval.commandTitle")}</strong>
-                </header>
-                <div className="inlineApprovalBody">
-                  <code>{pendingCommand(event)}</code>
-                  <div className="inlineApprovalActions">
-                    <button
-                      type="button"
-                      className="inlineApprovalButton primary"
-                      disabled={isMutating}
-                      onClick={() => void handleApprove(event)}
-                    >
-                      <Check size={14} />
-                      {t("common.approve")}
-                    </button>
-                    {isShellPending(event) && (
-                      <button
-                        type="button"
-                        className="inlineApprovalButton"
-                        disabled={isMutating}
-                        onClick={() => void handleApproveAndAllow(event)}
-                      >
-                        <Save size={14} />
-                        {t("common.acceptAndAllowlist")}
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      className="inlineApprovalButton danger"
-                      disabled={isMutating}
-                      onClick={() => void handleReject(event)}
-                    >
-                      <X size={14} />
-                      {t("common.reject")}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            ))}
-            {visiblePermissions.map((request) => (
-              <div className="inlineApprovalCard" key={request.id}>
-                <header className="inlineApprovalHeader">
-                  <KeyRound size={14} />
-                  <strong>{t("approval.permissionTitle")}</strong>
-                </header>
-                <div className="inlineApprovalBody">
-                  <code>
-                    {request.action}: {request.resources.join(", ")}
-                  </code>
-                  <div className="inlineApprovalActions">
-                    <button
-                      type="button"
-                      className="inlineApprovalButton primary"
-                      disabled={isMutating}
-                      onClick={() => void handlePermissionReply(request, "once")}
-                    >
-                      <Check size={14} />
-                      {t("common.allowOnce")}
-                    </button>
-                    <button
-                      type="button"
-                      className="inlineApprovalButton"
-                      disabled={isMutating}
-                      onClick={() => void handlePermissionReply(request, "always")}
-                    >
-                      <Save size={14} />
-                      {t("common.allowAlways")}
-                    </button>
-                    <button
-                      type="button"
-                      className="inlineApprovalButton danger"
-                      disabled={isMutating}
-                      onClick={() => void handlePermissionReply(request, "reject")}
-                    >
-                      <X size={14} />
-                      {t("common.reject")}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            ))}
             {activityPause && (
               <div className="inlineApprovalCard warning">
                 <header className="inlineApprovalHeader">
@@ -3703,6 +3932,84 @@ export function App() {
             <div ref={timelineEndRef} />
           </div>
 
+          {pendingApprovalCount > 0 && (
+            <section
+              ref={pendingApprovalPanelRef}
+              className="pendingApprovalPanel"
+              role="region"
+              aria-label={t("approval.pendingChip", { count: pendingApprovalCount })}
+              aria-live="polite"
+            >
+              {allPendingToolEvents.map((event) => (
+                <PendingInteractionCard
+                  key={event.id}
+                  event={event}
+                  sourceLabel={
+                    event.sessionId !== selectedSessionId
+                      ? sessionTitleById.get(event.sessionId) ?? t("common.subAgent")
+                      : undefined
+                  }
+                  command={pendingCommand(event)}
+                  canAllowlist={isShellPending(event)}
+                  disabled={sessionUi(event.sessionId).isMutating}
+                  onApprove={handleApprove}
+                  onApproveAndAllow={handleApproveAndAllow}
+                  onReject={handleReject}
+                  onAnswer={handleAnswerQuestion}
+                  onResolveMode={handleResolveModeChange}
+                />
+              ))}
+              {allVisiblePermissions.map((request) => (
+                <div className="inlineApprovalCard" key={request.id}>
+                  <header className="inlineApprovalHeader">
+                    <KeyRound size={14} />
+                    <strong>{t("approval.permissionTitle")}</strong>
+                    {request.sessionId !== selectedSessionId && (
+                      <span className="inlineApprovalSubAgentTag">
+                        <Network size={12} />
+                        {sessionTitleById.get(request.sessionId) ?? t("common.subAgent")}
+                      </span>
+                    )}
+                  </header>
+                  <div className="inlineApprovalBody">
+                    <code>
+                      {request.action}: {request.resources.join(", ")}
+                    </code>
+                    <div className="inlineApprovalActions">
+                      <button
+                        type="button"
+                        className="inlineApprovalButton primary"
+                        disabled={sessionUi(request.sessionId).isMutating}
+                        onClick={() => void handlePermissionReply(request, "once")}
+                      >
+                        <Check size={14} />
+                        {t("common.allowOnce")}
+                      </button>
+                      <button
+                        type="button"
+                        className="inlineApprovalButton"
+                        disabled={sessionUi(request.sessionId).isMutating}
+                        onClick={() => void handlePermissionReply(request, "always")}
+                      >
+                        <Save size={14} />
+                        {t("common.allowAlways")}
+                      </button>
+                      <button
+                        type="button"
+                        className="inlineApprovalButton danger"
+                        disabled={sessionUi(request.sessionId).isMutating}
+                        onClick={() => void handlePermissionReply(request, "reject")}
+                      >
+                        <X size={14} />
+                        {t("common.reject")}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </section>
+          )}
+
           {lastError && (
             <div className="errorBanner" role="alert">
               <AlertTriangle size={15} />
@@ -3719,7 +4026,10 @@ export function App() {
             </div>
           )}
           <div className="promptBar">
-            <div className="promptComposer">
+            <div
+              ref={promptComposerRef}
+              className={`promptComposer promptComposer--${composerLayout}`}
+            >
               <input
                 ref={attachmentInputRef}
                 className="promptAttachmentInput"
@@ -3868,6 +4178,7 @@ export function App() {
                       aria-label={t("nav.selectModel")}
                       onClick={openComposerModelMenu}
                     >
+                      <Database className="composerModelCompactIcon" size={17} aria-hidden="true" />
                       <span>{selectedProvider ? selectedModelLabel : t("empty.noModelConfigured")}</span>
                       <ChevronDown size={15} />
                     </button>
@@ -3975,6 +4286,67 @@ export function App() {
                   />
                   </div>
                 <div ref={runConfigGroupRef} className="composerRunConfigGroup">
+                  {composerLayout !== "wide" ? (
+                    <div className="composerRunConfigSelect composerRunConfigSelect--collapsed">
+                      <button
+                        type="button"
+                        className="composerRunConfigButton composerRunConfigButton--collapsed"
+                        disabled={isPromptLocked}
+                        aria-haspopup="menu"
+                        aria-expanded={isRunConfigMenuOpen}
+                        aria-label={`${t("nav.runMode")}: ${modeLabel(mode)}; ${t("nav.commandApproval")}: ${shellModeLabel(shellMode)}`}
+                        title={`${modeLabel(mode)} / ${shellModeLabel(shellMode)}`}
+                        onClick={() => setIsRunConfigMenuOpen((open) => !open)}
+                      >
+                        <Settings size={18} />
+                      </button>
+                      {isRunConfigMenuOpen && !isPromptLocked && (
+                        <div className="composerRunConfigMenu composerRunConfigMenu--collapsed" role="menu">
+                          <div className="composerRunConfigMenuSection">
+                            <strong className="composerRunConfigMenuTitle">{t("nav.runMode")}</strong>
+                            {(["ask", "plan", "agent"] as AgentMode[]).map((item) => {
+                              const isSelected = item === mode;
+                              return (
+                                <button
+                                  type="button"
+                                  key={item}
+                                  className={`composerRunConfigOption ${isSelected ? "active" : ""}`}
+                                  role="menuitemradio"
+                                  aria-checked={isSelected}
+                                  onClick={() => selectAgentMode(item)}
+                                >
+                                  <span>{modeLabel(item)}</span>
+                                  {isSelected && <Check size={14} />}
+                                </button>
+                              );
+                            })}
+                          </div>
+                          <div className="composerRunConfigMenuSection">
+                            <strong className="composerRunConfigMenuTitle">
+                              {t("nav.commandApproval")}
+                            </strong>
+                            {(["manual", "auto"] as ShellMode[]).map((item) => {
+                              const isSelected = item === shellMode;
+                              return (
+                                <button
+                                  type="button"
+                                  key={item}
+                                  className={`composerRunConfigOption ${isSelected ? "active" : ""}`}
+                                  role="menuitemradio"
+                                  aria-checked={isSelected}
+                                  onClick={() => selectShellMode(item)}
+                                >
+                                  <span>{shellModeLabel(item)}</span>
+                                  {isSelected && <Check size={14} />}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <>
                   <div
                     className="composerRunConfigSelect composerRunConfigSelect--mode"
                     title={`${t("nav.runMode")}: ${modeLabel(mode)}`}
@@ -4071,6 +4443,8 @@ export function App() {
                       </div>
                     )}
                   </div>
+                    </>
+                  )}
                 </div>
                 <div className={`composerSubmitCapsule ${isAgentWorking ? "working" : ""}`}>
                   <div className="promptNavGroup">
@@ -5354,15 +5728,36 @@ function ideIdentity(
   };
 }
 
+function ideClientsLabel(
+  clients: BridgeClient[],
+  t: (key: string, vars?: Record<string, string | number>) => string
+) {
+  const counts = new Map<string, number>();
+  for (const client of clients) {
+    const name = client.displayName?.trim() || ideIdentity(client.source, t).name;
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  return Array.from(counts, ([name, count]) => (count > 1 ? `${name} ×${count}` : name)).join(
+    " + "
+  );
+}
+
 type TimelineItemKind =
   | "userPrompt"
   | "assistantReply"
   | "reasoning"
   | "mcpTool"
+  | "subAgent"
   | "codeChange"
   | "codeChangeSummary"
   | "statusSummary"
   | "hiddenDetail";
+
+type TimelineSubAgent = {
+  sessionId: string;
+  description: string;
+  subagentType: string;
+};
 
 type TimelineStatus = "done" | "running" | "waiting" | "failed" | "neutral";
 
@@ -5431,6 +5826,7 @@ type TimelineItem = {
   codeChange?: TimelineCodeChange;
   codeChangeGroup?: TimelineCodeChangeGroup;
   rollbackSnapshotIds?: string[];
+  subAgent?: TimelineSubAgent;
 };
 
 function ContextUsageChip({
@@ -5619,7 +6015,7 @@ function TimelineItemViewImpl({
         </div>
       )}
       <div className="timelineItemBody">
-        {!isReasoningItem && (
+        {!isReasoningItem && item.kind !== "subAgent" && (
           <header className="timelineItemHeader">
             <strong>{item.title}</strong>
             {item.event && <span>#{item.event.seq}</span>}
@@ -5687,6 +6083,10 @@ function TimelineItemViewImpl({
 
         {item.kind === "mcpTool" && item.mcpTool && (
           <McpToolCard tool={item.mcpTool} />
+        )}
+
+        {item.kind === "subAgent" && item.subAgent && (
+          <SubAgentCard subAgent={item.subAgent} status={item.status} />
         )}
 
         {item.kind === "codeChange" && item.codeChange && (
@@ -5990,6 +6390,77 @@ function McpToolCardImpl({ tool }: { tool: TimelineMcpTool }) {
             )}
           </div>
         </details>
+      )}
+    </div>
+  );
+}
+
+function subAgentStatusLabel(status: TimelineStatus) {
+  switch (status) {
+    case "running":
+      return appT("timeline.subAgentRunning");
+    case "failed":
+      return appT("timeline.subAgentFailed");
+    case "waiting":
+      return appT("timeline.subAgentWaiting");
+    default:
+      return appT("timeline.subAgentDone");
+  }
+}
+
+function SubAgentCard({
+  subAgent,
+  status
+}: {
+  subAgent: TimelineSubAgent;
+  status: TimelineStatus;
+}) {
+  const { t } = useTranslation();
+  const [expanded, setExpanded] = useState(false);
+  const childResponse = useSessionEventStore(
+    (state) => state.responsesBySessionId[subAgent.sessionId] ?? EMPTY_EVENTS
+  );
+  const childItems = useMemo(
+    () => buildTimelineItems(childResponse.events, childResponse.snapshots),
+    [childResponse.events, childResponse.snapshots]
+  );
+  const noop = () => undefined;
+  const noopAsync = async () => undefined;
+  return (
+    <div className={`subAgentCard ${status}`}>
+      <button
+        type="button"
+        className="subAgentHeader"
+        onClick={() => setExpanded((value) => !value)}
+      >
+        {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+        <Network size={16} />
+        <span className="subAgentTitle">{subAgent.description}</span>
+        <small className="subAgentType">@{subAgent.subagentType}</small>
+        <span className={`subAgentStatusChip ${status}`}>
+          {subAgentStatusLabel(status)}
+        </span>
+      </button>
+      {expanded && (
+        <div className="subAgentBody">
+          {childItems.length === 0 ? (
+            <p className="statusText">{t("timeline.subAgentEmpty")}</p>
+          ) : (
+            childItems.map((child) => (
+              <TimelineItemView
+                key={child.id}
+                item={child}
+                stream={child.status === "running"}
+                canExecutePlan={false}
+                onExecutePlan={noopAsync}
+                rollbackDisabled
+                onRollbackSnapshot={noop}
+                onRollbackSnapshots={noop}
+                onRecoverAgent={noopAsync}
+              />
+            ))
+          )}
+        </div>
       )}
     </div>
   );
@@ -6571,6 +7042,35 @@ function buildTimelineItems(
         )
       });
       continue;
+    }
+
+    if (event.type === "task.created" || event.type === "task.resumed") {
+      const childSessionId = valueAsString(event.data.sessionId);
+      if (childSessionId) {
+        const result = resultByToolCall.get(valueAsString(event.data.toolCallEventId));
+        const status: TimelineStatus =
+          result?.type === "tool.failed"
+            ? "failed"
+            : result?.type === "tool.success"
+              ? "done"
+              : "running";
+        pushItem({
+          id: event.id,
+          kind: "subAgent",
+          title:
+            valueAsString(event.data.description) || appT("common.subAgent"),
+          status,
+          event,
+          details: [event],
+          subAgent: {
+            sessionId: childSessionId,
+            description:
+              valueAsString(event.data.description) || appT("common.subAgent"),
+            subagentType: valueAsString(event.data.subagentType) || "general"
+          }
+        });
+        continue;
+      }
     }
 
     if (event.type === "tool.called" && isMcpToolEvent(event)) {
@@ -7337,6 +7837,15 @@ function timelineItemIcon(item: TimelineItem) {
   if (item.kind === "mcpTool") {
     return <Network size={16} />;
   }
+  if (item.kind === "subAgent") {
+    if (item.status === "running") {
+      return <Loader2 className="spin" size={16} />;
+    }
+    if (item.status === "failed") {
+      return <AlertTriangle size={16} />;
+    }
+    return <Network size={16} />;
+  }
   if (item.kind === "codeChange" || item.kind === "codeChangeSummary") {
     return <FileCode2 size={16} />;
   }
@@ -7611,6 +8120,7 @@ function sessionEventShowsWork(event: EventRecord) {
   return (
     (event.type === "session.checkpoint.saved" && event.data.status === "running") ||
     event.type === "run.activity.started" ||
+    event.type === "run.activity.auto_continued" ||
     event.type === "session.input.admitted" ||
     event.type === "prompt.submitted" ||
     event.type === "step.started" ||
@@ -7835,6 +8345,9 @@ function normalizeDisplayToolName(value: string) {
   }
   if (normalized === "planexit") {
     return "plan_exit";
+  }
+  if (normalized === "requestmode") {
+    return "request_mode";
   }
   return normalized;
 }
@@ -8615,7 +9128,7 @@ type ProjectGroup = {
   root: string;
   displayName: string;
   sessions: SessionRecord[];
-  ide: BridgeClient | null;
+  ides: BridgeClient[];
 };
 
 // Two-level sidebar model: distinct project directories (keyed by normalized
@@ -8638,7 +9151,7 @@ function groupSessionsByProject(
         root: root.trim(),
         displayName: projectDisplayName(root),
         sessions: [],
-        ide: null
+        ides: []
       };
       groups.set(key, group);
     }
@@ -8658,13 +9171,18 @@ function groupSessionsByProject(
       continue;
     }
     const group = ensure(root);
-    if (!group.ide || ideClientRank(client) > ideClientRank(group.ide)) {
-      group.ide = client;
-      const name = (client.workspaceName ?? "").trim();
-      if (name) {
-        group.displayName = name;
-      }
+    group.ides.push(client);
+    const name = (client.workspaceName ?? "").trim();
+    if (name) {
+      group.displayName = name;
     }
+  }
+
+  for (const group of groups.values()) {
+    group.ides.sort(
+      (left, right) =>
+        ideClientRank(right) - ideClientRank(left) || right.lastSeen - left.lastSeen
+    );
   }
 
   // Stable ordering by each project's earliest session so selecting a session

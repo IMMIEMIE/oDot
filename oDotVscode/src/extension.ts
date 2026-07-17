@@ -53,6 +53,8 @@ let bridgeHeartbeatTimer: NodeJS.Timeout | undefined;
 let lastPublishedWorkspaceRoot = "";
 let bridgeReachable = false;
 let clientId = "";
+let installationId = "";
+let instanceId = "";
 let sequence = 0;
 let windowFocused = true;
 let lastWakeAttempt = 0;
@@ -60,12 +62,14 @@ let protocolWarningShown = false;
 let fallbackWakeAttempted = false;
 
 export async function activate(context: vscode.ExtensionContext) {
-  const persistentClientId =
-    context.workspaceState.get<string>("odot.bridge.clientId") ?? randomUUID();
-  await context.workspaceState.update("odot.bridge.clientId", persistentClientId);
-  // Stable for this window's lifetime so oDot's monitor keeps one roster row per
-  // window across extension restarts, rather than accumulating stale duplicates.
-  clientId = persistentClientId;
+  installationId =
+    context.globalState.get<string>("odot.bridge.installationId") ?? randomUUID();
+  await context.globalState.update("odot.bridge.installationId", installationId);
+  // Each extension host represents one live VS Code window. Keep this id stable
+  // while that host is alive, but never share it through workspaceState with a
+  // second window that opens the same folder.
+  instanceId = randomUUID();
+  clientId = `${sourceName}:${instanceId}`;
   windowFocused = vscode.window.state.focused;
   context.subscriptions.push(
     vscode.commands.registerCommand("odot.sendReferenceToPrompt", sendReferenceToPrompt),
@@ -113,6 +117,9 @@ export async function deactivate() {
       focused: false,
       workspaceRoot: currentWorkspaceFolder()?.uri.fsPath ?? null,
       source: sourceName,
+      displayName: "VS Code",
+      installationId,
+      instanceId,
       sentAt: Date.now()
     });
   } catch {
@@ -151,6 +158,9 @@ async function pollBridgeReachability() {
       focused: windowFocused,
       workspaceRoot: currentWorkspaceFolder()?.uri.fsPath ?? null,
       source: sourceName,
+      displayName: "VS Code",
+      installationId,
+      instanceId,
       sentAt: Date.now()
     });
     ensureProtocolResponse(response);
@@ -177,6 +187,9 @@ async function sendHeartbeat() {
       focused: windowFocused,
       workspaceRoot: currentWorkspaceFolder()?.uri.fsPath ?? null,
       source: sourceName,
+      displayName: "VS Code",
+      installationId,
+      instanceId,
       sentAt: Date.now()
     });
     ensureProtocolResponse(response);
@@ -288,6 +301,9 @@ async function publishWorkspaceSessions(reason: WorkspaceReason, force = false) 
       focused: windowFocused,
       workspaceRoot: folder.uri.fsPath,
       source: sourceName,
+      displayName: "VS Code",
+      installationId,
+      instanceId,
       reason,
       sentAt: Date.now()
     });

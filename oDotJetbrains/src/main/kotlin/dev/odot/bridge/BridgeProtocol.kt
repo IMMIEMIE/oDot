@@ -35,6 +35,9 @@ data class WorkspaceClientRequest(
     val focused: Boolean,
     val workspaceRoot: String?,
     val source: String? = null,
+    val displayName: String? = null,
+    val installationId: String? = null,
+    val instanceId: String? = null,
     val reason: String? = null,
     val sentAt: Long,
 )

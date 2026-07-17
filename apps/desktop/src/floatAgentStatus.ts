@@ -468,8 +468,13 @@ function normalizeFloatAgentStatus(value: unknown): FloatAgentStatusRecord {
 
 function pendingCommand(event: EventRecord) {
   const pending = asRecord(event.data.pending);
+  const questions = Array.isArray(pending.questions) ? pending.questions : [];
+  const firstQuestion = questions.length ? asRecord(questions[0]) : {};
   return (
     valueAsString(pending.command) ||
+    valueAsString(firstQuestion.question) ||
+    valueAsString(pending.question) ||
+    valueAsString(pending.reason) ||
     valueAsString(event.data.command) ||
     appT("event.pendingCommand")
   );

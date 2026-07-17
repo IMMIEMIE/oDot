@@ -13,6 +13,47 @@ export type ShellMode = "manual" | "auto";
 export type SessionInputDelivery = "steer" | "queue";
 export type PermissionReply = "once" | "always" | "reject";
 
+export type QuestionOption = {
+  label: string;
+  description: string;
+};
+
+export type QuestionItem = {
+  id: string;
+  header: string;
+  question: string;
+  multiple: boolean;
+  options: QuestionOption[];
+  allowCustom: true;
+};
+
+export type QuestionSet = {
+  version: 1;
+  kind: "question";
+  questions: QuestionItem[];
+  legacy?: boolean;
+};
+
+export type QuestionAnswer = {
+  id: string;
+  selectedOptions: string[];
+  customText?: string | null;
+};
+
+export type ModeChangeRequest = {
+  version: 1;
+  kind: "mode_change";
+  fromMode: AgentMode;
+  targetMode: AgentMode;
+  reason: string;
+  planPath?: string | null;
+};
+
+export type PendingInteraction =
+  | { kind: "question"; questionSet: QuestionSet }
+  | { kind: "mode_change"; modeChange: ModeChangeRequest }
+  | { kind: "approval" };
+
 export type ShellPolicy = {
   autoAllowlist: string[];
 };
@@ -157,7 +198,11 @@ export type ExternalProjectSessionsPayload = {
   requestId: string;
   action: WorkspaceResolutionAction;
   workspaceRoot: string;
+  clientId?: string | null;
   source?: string | null;
+  displayName?: string | null;
+  installationId?: string | null;
+  instanceId?: string | null;
   busyReason?: string | null;
   activeSessionId?: string | null;
   sessions: SessionRecord[];
@@ -293,9 +338,13 @@ export type BridgeStatus = {
 
 export type BridgeClient = {
   clientId: string;
+  activeSessionId?: string | null;
   workspaceRoot?: string | null;
   workspaceName?: string | null;
   source?: string | null;
+  displayName?: string | null;
+  installationId?: string | null;
+  instanceId?: string | null;
   focused: boolean;
   lastSeen: number;
   online: boolean;
@@ -646,6 +695,22 @@ export async function rejectToolCall(eventId: string): Promise<EventRecord> {
   return invoke<EventRecord>("reject_tool_call", { eventId });
 }
 
+export async function answerToolQuestion(input: {
+  eventId: string;
+  answers: QuestionAnswer[];
+}): Promise<EventRecord> {
+  assertTauri();
+  return invoke<EventRecord>("answer_tool_question", { input });
+}
+
+export async function resolveModeChange(input: {
+  eventId: string;
+  approved: boolean;
+}): Promise<EventRecord> {
+  assertTauri();
+  return invoke<EventRecord>("resolve_mode_change", { input });
+}
+
 export async function replyPermission(input: {
   requestId: string;
   reply: PermissionReply;
@@ -718,6 +783,8 @@ export async function setBridgePort(port: number): Promise<BridgeStatus> {
 export async function reportWorkspaceResolution(input: {
   action: WorkspaceResolutionAction;
   workspaceRoot: string;
+  requestId?: string | null;
+  clientId?: string | null;
   activeSessionId?: string | null;
   busyReason?: string | null;
 }): Promise<ExternalProjectSessionsPayload> {
@@ -725,6 +792,8 @@ export async function reportWorkspaceResolution(input: {
   return invoke<ExternalProjectSessionsPayload>("report_workspace_resolution", {
     action: input.action,
     workspaceRoot: input.workspaceRoot,
+    requestId: input.requestId ?? null,
+    clientId: input.clientId ?? null,
     activeSessionId: input.activeSessionId ?? null,
     busyReason: input.busyReason ?? null
   });

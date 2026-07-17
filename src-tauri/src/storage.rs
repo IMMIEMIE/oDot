@@ -91,6 +91,23 @@ pub(crate) fn init_db(conn: &Connection) -> Result<(), String> {
           updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS ide_workspace_binding (
+          client_id TEXT NOT NULL,
+          source TEXT NOT NULL,
+          installation_id TEXT,
+          instance_id TEXT,
+          workspace_key TEXT NOT NULL,
+          workspace_root TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY(client_id, workspace_key),
+          FOREIGN KEY(session_id) REFERENCES session(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_ide_workspace_binding_reconnect
+          ON ide_workspace_binding(source, installation_id, workspace_key, updated_at DESC);
+
         CREATE TABLE IF NOT EXISTS event (
           id TEXT PRIMARY KEY,
           session_id TEXT NOT NULL,
@@ -374,6 +391,7 @@ pub fn create_session(
     let now = util::now_string();
     let id = Uuid::new_v4().to_string();
     let root = util::ensure_directory(&input.project_root)?;
+    let persisted_root = util::clean_windows_verbatim_path(&root.to_string_lossy());
     let title = input.title.unwrap_or_else(|| "New session".to_string());
 
     conn.execute(
@@ -386,7 +404,7 @@ pub fn create_session(
         params![
             &id,
             &input.parent_session_id,
-            root.to_string_lossy().to_string(),
+            &persisted_root,
             input.mode.as_str(),
             &input.provider_id,
             input.config_path.as_deref().map(str::trim).filter(|value| !value.is_empty()),
@@ -399,6 +417,118 @@ pub fn create_session(
     .map_err(|error| error.to_string())?;
 
     get_session(conn, &id)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdeWorkspaceBinding {
+    pub client_id: String,
+    pub source: String,
+    pub installation_id: Option<String>,
+    pub instance_id: Option<String>,
+    pub workspace_key: String,
+    pub workspace_root: String,
+    pub session_id: String,
+}
+
+pub fn get_ide_workspace_binding(
+    conn: &Connection,
+    client_id: &str,
+    workspace_key: &str,
+) -> Result<Option<IdeWorkspaceBinding>, String> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT b.client_id, b.source, b.installation_id, b.instance_id,
+                   b.workspace_key, b.workspace_root, b.session_id
+            FROM ide_workspace_binding b
+            INNER JOIN session s ON s.id = b.session_id
+            WHERE b.client_id = ?1 AND b.workspace_key = ?2
+            LIMIT 1
+            "#,
+        )
+        .map_err(|error| error.to_string())?;
+    let mut rows = stmt
+        .query(params![client_id, workspace_key])
+        .map_err(|error| error.to_string())?;
+    rows.next()
+        .map_err(|error| error.to_string())?
+        .map(read_ide_workspace_binding)
+        .transpose()
+        .map_err(|error| error.to_string())
+}
+
+pub fn list_ide_workspace_reconnect_bindings(
+    conn: &Connection,
+    source: &str,
+    installation_id: &str,
+    workspace_key: &str,
+) -> Result<Vec<IdeWorkspaceBinding>, String> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT b.client_id, b.source, b.installation_id, b.instance_id,
+                   b.workspace_key, b.workspace_root, b.session_id
+            FROM ide_workspace_binding b
+            INNER JOIN session s ON s.id = b.session_id
+            WHERE b.source = ?1 AND b.installation_id = ?2 AND b.workspace_key = ?3
+            ORDER BY b.updated_at DESC
+            "#,
+        )
+        .map_err(|error| error.to_string())?;
+    let bindings = stmt
+        .query_map(params![source, installation_id, workspace_key], |row| {
+            read_ide_workspace_binding(row)
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| error.to_string())?;
+    Ok(bindings)
+}
+
+pub fn upsert_ide_workspace_binding(
+    conn: &Connection,
+    binding: &IdeWorkspaceBinding,
+) -> Result<(), String> {
+    let now = util::now_string();
+    conn.execute(
+        r#"
+        INSERT INTO ide_workspace_binding
+          (client_id, source, installation_id, instance_id, workspace_key,
+           workspace_root, session_id, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+        ON CONFLICT(client_id, workspace_key) DO UPDATE SET
+          source = excluded.source,
+          installation_id = excluded.installation_id,
+          instance_id = excluded.instance_id,
+          workspace_root = excluded.workspace_root,
+          session_id = excluded.session_id,
+          updated_at = excluded.updated_at
+        "#,
+        params![
+            &binding.client_id,
+            &binding.source,
+            &binding.installation_id,
+            &binding.instance_id,
+            &binding.workspace_key,
+            &binding.workspace_root,
+            &binding.session_id,
+            &now,
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn read_ide_workspace_binding(row: &rusqlite::Row<'_>) -> rusqlite::Result<IdeWorkspaceBinding> {
+    Ok(IdeWorkspaceBinding {
+        client_id: row.get(0)?,
+        source: row.get(1)?,
+        installation_id: row.get(2)?,
+        instance_id: row.get(3)?,
+        workspace_key: row.get(4)?,
+        workspace_root: row.get(5)?,
+        session_id: row.get(6)?,
+    })
 }
 
 pub fn create_child_session(
@@ -1522,10 +1652,11 @@ fn provider_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     let mode: String = row.get(3)?;
     let shell_mode: String = row.get(8)?;
+    let project_root: String = row.get(2)?;
     Ok(SessionRecord {
         id: row.get(0)?,
         parent_session_id: row.get(1)?,
-        project_root: row.get(2)?,
+        project_root: util::clean_windows_verbatim_path(&project_root),
         mode: AgentMode::from_str(&mode).unwrap_or(AgentMode::Ask),
         provider_id: row.get(4)?,
         config_path: row.get(5)?,
@@ -1725,6 +1856,65 @@ mod tests {
         assert_eq!(
             get_provider(&conn, "p/m").unwrap().config_path.as_deref(),
             Some("E:/oDot/custom.json")
+        );
+    }
+
+    #[test]
+    fn session_project_root_hides_windows_verbatim_prefix() {
+        let conn = memory_db();
+        conn.execute(
+            "INSERT INTO session (id, project_root, mode, provider_id, title, status, shell_mode, created_at, updated_at)
+             VALUES ('session-path', '\\\\?\\E:\\项目\\demo', 'agent', 'provider/model', 'Test', 'active', 'auto', '1', '1')",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(
+            get_session(&conn, "session-path").unwrap().project_root,
+            r"E:\项目\demo"
+        );
+    }
+
+    #[test]
+    fn ide_workspace_bindings_round_trip_and_follow_session_deletion() {
+        let conn = memory_db();
+        for session_id in ["session-a", "session-b"] {
+            conn.execute(
+                "INSERT INTO session (id, project_root, mode, provider_id, title, status, shell_mode, created_at, updated_at)
+                 VALUES (?1, 'E:/oDot', 'agent', 'provider/model', ?1, 'active', 'auto', '1', '1')",
+                params![session_id],
+            )
+            .unwrap();
+        }
+        let binding = IdeWorkspaceBinding {
+            client_id: "vscode:window-a".to_string(),
+            source: "vscode".to_string(),
+            installation_id: Some("install-a".to_string()),
+            instance_id: Some("window-a".to_string()),
+            workspace_key: "e:/odot".to_string(),
+            workspace_root: "E:/oDot".to_string(),
+            session_id: "session-a".to_string(),
+        };
+
+        upsert_ide_workspace_binding(&conn, &binding).unwrap();
+        assert_eq!(
+            get_ide_workspace_binding(&conn, "vscode:window-a", "e:/odot")
+                .unwrap()
+                .unwrap(),
+            binding
+        );
+        assert_eq!(
+            list_ide_workspace_reconnect_bindings(&conn, "vscode", "install-a", "e:/odot")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        delete_session(&conn, "session-a").unwrap();
+        assert!(
+            get_ide_workspace_binding(&conn, "vscode:window-a", "e:/odot")
+                .unwrap()
+                .is_none()
         );
     }
 

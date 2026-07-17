@@ -1,7 +1,6 @@
 package dev.odot.bridge
 
 import com.intellij.ide.util.PropertiesComponent
-import com.intellij.openapi.project.Project
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
 
@@ -11,19 +10,21 @@ object BridgeSequence {
     fun next(): Long = counter.incrementAndGet()
 }
 
-/** Stable per-window client id (persisted in project-level PropertiesComponent) so oDot's
- *  monitor keeps a single roster row per window across IDE/plugin restarts. Mirrors the
- *  stable clientId used by the VS Code extension. */
+/** Stable installation identity plus a distinct id for every live project/window service. */
 object ClientIdentity {
-    private const val KEY = "odot.bridge.clientId"
+    private const val INSTALLATION_KEY = "odot.bridge.installationId"
 
-    fun clientId(project: Project): String {
-        val props = PropertiesComponent.getInstance(project)
-        var id = props.getValue(KEY)
+    fun installationId(): String {
+        val props = PropertiesComponent.getInstance()
+        var id = props.getValue(INSTALLATION_KEY)
         if (id.isNullOrBlank()) {
             id = UUID.randomUUID().toString()
-            props.setValue(KEY, id)
+            props.setValue(INSTALLATION_KEY, id)
         }
         return id
     }
+
+    fun newInstanceId(): String = UUID.randomUUID().toString()
+
+    fun clientId(instanceId: String): String = "jetbrains:$instanceId"
 }

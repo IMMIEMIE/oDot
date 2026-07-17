@@ -1,4 +1,4 @@
-use crate::{storage, types::SessionRecord};
+use crate::{storage, types::SessionRecord, util};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -31,6 +31,7 @@ const REAPER_INTERVAL_MS: u64 = 3_000;
 
 static BRIDGE_STATUS: OnceLock<Arc<Mutex<BridgeStatus>>> = OnceLock::new();
 static BRIDGE_RUNTIME: OnceLock<Arc<Mutex<BridgeRuntime>>> = OnceLock::new();
+static WORKSPACE_ACTIVATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -77,6 +78,12 @@ pub struct WorkspaceClientRequest {
     #[serde(default)]
     pub source: Option<String>,
     #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub installation_id: Option<String>,
+    #[serde(default)]
+    pub instance_id: Option<String>,
+    #[serde(default)]
     pub reason: Option<String>,
     #[serde(default)]
     pub sent_at: Option<u64>,
@@ -90,7 +97,15 @@ pub struct WorkspaceResolutionState {
     pub action: String,
     pub workspace_root: String,
     #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
     pub source: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub installation_id: Option<String>,
+    #[serde(default)]
+    pub instance_id: Option<String>,
     #[serde(default)]
     pub busy_reason: Option<String>,
     #[serde(default)]
@@ -137,6 +152,11 @@ struct ClientState {
     focused: bool,
     workspace_root: Option<String>,
     source: Option<String>,
+    display_name: Option<String>,
+    installation_id: Option<String>,
+    instance_id: Option<String>,
+    active_session_id: Option<String>,
+    active_workspace_key: Option<String>,
     last_seen: u64,
 }
 
@@ -144,9 +164,13 @@ struct ClientState {
 #[serde(rename_all = "camelCase")]
 pub struct ClientSnapshot {
     pub client_id: String,
+    pub active_session_id: Option<String>,
     pub workspace_root: Option<String>,
     pub workspace_name: Option<String>,
     pub source: Option<String>,
+    pub display_name: Option<String>,
+    pub installation_id: Option<String>,
+    pub instance_id: Option<String>,
     pub focused: bool,
     pub last_seen: u64,
     pub online: bool,
@@ -158,6 +182,7 @@ struct BridgeRuntime {
     owner_client_id: Option<String>,
     clients: HashMap<String, ClientState>,
     current: Option<WorkspaceResolutionState>,
+    pending_resolutions: HashMap<String, WorkspaceResolutionState>,
 }
 
 impl Default for BridgeRuntime {
@@ -167,6 +192,7 @@ impl Default for BridgeRuntime {
             owner_client_id: None,
             clients: HashMap::new(),
             current: None,
+            pending_resolutions: HashMap::new(),
         }
     }
 }
@@ -307,8 +333,11 @@ pub fn save_port(app: &AppHandle, port: u16) -> Result<BridgeStatus, String> {
 }
 
 pub fn update_resolution(
+    app: &AppHandle,
     action: String,
     workspace_root: String,
+    request_id: Option<String>,
+    client_id: Option<String>,
     active_session_id: Option<String>,
     busy_reason: Option<String>,
 ) -> Result<WorkspaceResolutionState, String> {
@@ -324,24 +353,89 @@ pub fn update_resolution(
     if !ACTIONS.contains(&action.as_str()) {
         return Err(format!("Unsupported workspace resolution action: {action}"));
     }
-    let mut runtime = runtime_cell()
-        .lock()
-        .map_err(|_| "Bridge state is unavailable.".to_string())?;
-    let mut state = runtime.current.clone().unwrap_or(WorkspaceResolutionState {
-        protocol_version: PROTOCOL_VERSION,
-        request_id: Uuid::new_v4().to_string(),
-        action: action.clone(),
-        workspace_root: workspace_root.clone(),
-        source: Some("vscode".to_string()),
-        busy_reason: None,
-        active_session_id: None,
-        sessions: Vec::new(),
-    });
-    state.action = action;
-    state.workspace_root = workspace_root;
-    state.active_session_id = active_session_id;
-    state.busy_reason = busy_reason;
-    runtime.current = Some(state.clone());
+    let assigns_session = matches!(action.as_str(), "selected" | "created");
+    let (state, binding) = {
+        let mut runtime = runtime_cell()
+            .lock()
+            .map_err(|_| "Bridge state is unavailable.".to_string())?;
+        let mut state = if let Some(request_id) = request_id.as_deref() {
+            runtime
+                .pending_resolutions
+                .get(request_id)
+                .cloned()
+                .ok_or_else(|| "Workspace resolution request is stale or unknown.".to_string())?
+        } else {
+            runtime.current.clone().unwrap_or(WorkspaceResolutionState {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: Uuid::new_v4().to_string(),
+                action: action.clone(),
+                workspace_root: workspace_root.clone(),
+                client_id: client_id.clone(),
+                source: None,
+                display_name: None,
+                installation_id: None,
+                instance_id: None,
+                busy_reason: None,
+                active_session_id: None,
+                sessions: Vec::new(),
+            })
+        };
+        if let (Some(expected), Some(actual)) = (state.client_id.as_deref(), client_id.as_deref()) {
+            if expected != actual {
+                return Err("Workspace resolution client does not match the request.".to_string());
+            }
+        }
+        if normalize_project_path(&state.workspace_root) != normalize_project_path(&workspace_root)
+        {
+            return Err("Workspace resolution path does not match the request.".to_string());
+        }
+        state.action = action.clone();
+        state.workspace_root = workspace_root;
+        state.client_id = client_id.clone().or(state.client_id);
+        state.active_session_id = active_session_id.clone();
+        state.busy_reason = busy_reason;
+
+        let mut binding = None;
+        if assigns_session {
+            if let (Some(client_id), Some(session_id)) =
+                (state.client_id.clone(), active_session_id.clone())
+            {
+                if let Some(client) = runtime.clients.get_mut(&client_id) {
+                    client.active_session_id = Some(session_id.clone());
+                    client.active_workspace_key =
+                        Some(normalize_project_path(&state.workspace_root));
+                }
+                binding = Some(storage::IdeWorkspaceBinding {
+                    client_id,
+                    source: state
+                        .source
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    installation_id: state.installation_id.clone(),
+                    instance_id: state.instance_id.clone(),
+                    workspace_key: normalize_project_path(&state.workspace_root),
+                    workspace_root: state.workspace_root.clone(),
+                    session_id,
+                });
+            }
+        }
+        if matches!(
+            action.as_str(),
+            "selected" | "created" | "ignored" | "error"
+        ) {
+            runtime.pending_resolutions.remove(&state.request_id);
+        } else {
+            runtime
+                .pending_resolutions
+                .insert(state.request_id.clone(), state.clone());
+        }
+        runtime.current = Some(state.clone());
+        (state, binding)
+    };
+    if let Some(binding) = binding {
+        let conn = storage::open_db(app)?;
+        storage::upsert_ide_workspace_binding(&conn, &binding)?;
+    }
     Ok(state)
 }
 
@@ -424,6 +518,15 @@ fn route_heartbeat(app: AppHandle, request: HttpRequest) -> String {
         if payload.source.is_some() {
             client.source = payload.source.clone();
         }
+        if payload.display_name.is_some() {
+            client.display_name = payload.display_name.clone();
+        }
+        if payload.installation_id.is_some() {
+            client.installation_id = payload.installation_id.clone();
+        }
+        if payload.instance_id.is_some() {
+            client.instance_id = payload.instance_id.clone();
+        }
         if payload.sequence > client.sequence {
             client.sequence = payload.sequence;
             true
@@ -466,6 +569,9 @@ fn route_disconnect(app: AppHandle, request: HttpRequest) -> String {
             }
         };
         runtime.clients.remove(&payload.client_id);
+        runtime.pending_resolutions.retain(|_, resolution| {
+            resolution.client_id.as_deref() != Some(payload.client_id.as_str())
+        });
         if runtime.owner_client_id.as_deref() == Some(payload.client_id.as_str()) {
             runtime.owner_client_id = None;
         }
@@ -496,8 +602,21 @@ fn route_workspace_activate(app: AppHandle, request: HttpRequest) -> String {
         Ok(root) => root,
         Err(error) => return json_response(400, json!({ "ok": false, "error": error })),
     };
+    let normalized_workspace = normalize_project_path(&canonical_root);
+    // The frontend resolves an activation asynchronously (select/create/setup).
+    // Serialize this route so a focus bounce cannot race through the gap before
+    // the first request has been registered in pending_resolutions.
+    let _activation_guard = match workspace_activation_lock().lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return json_response(
+                500,
+                json!({ "ok": false, "error": "Workspace activation state is unavailable." }),
+            )
+        }
+    };
 
-    {
+    let (runtime_session_id, claimed_session_ids) = {
         let mut runtime = match runtime_cell().lock() {
             Ok(runtime) => runtime,
             Err(_) => {
@@ -533,32 +652,96 @@ fn route_workspace_activate(app: AppHandle, request: HttpRequest) -> String {
             .clients
             .entry(payload.client_id.clone())
             .or_default();
+        let assigned = client
+            .active_workspace_key
+            .as_deref()
+            .filter(|key| *key == normalized_workspace)
+            .and(client.active_session_id.clone());
         client.sequence = payload.sequence;
         client.focused = payload.focused;
         client.workspace_root = Some(canonical_root.clone());
         if payload.source.is_some() {
             client.source = payload.source.clone();
         }
+        if payload.display_name.is_some() {
+            client.display_name = payload.display_name.clone();
+        }
+        if payload.installation_id.is_some() {
+            client.installation_id = payload.installation_id.clone();
+        }
+        if payload.instance_id.is_some() {
+            client.instance_id = payload.instance_id.clone();
+        }
         client.last_seen = now_ms();
-        if runtime
-            .current
-            .as_ref()
-            .is_some_and(|current| project_paths_equal(&current.workspace_root, &canonical_root))
+        if let Some(pending) = runtime
+            .pending_resolutions
+            .values()
+            .find(|resolution| {
+                resolution_matches_client_workspace(
+                    resolution,
+                    &payload.client_id,
+                    &normalized_workspace,
+                )
+            })
+            .cloned()
         {
-            return workspace_response(
-                "ignored",
-                &canonical_root,
-                Vec::new(),
-                runtime.current.clone(),
+            return json_response(
+                200,
+                json!({
+                    "ok": true,
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "deduplicated": true,
+                    "resolution": pending
+                }),
             );
         }
-    }
+        let claimed = runtime
+            .clients
+            .iter()
+            .filter(|(client_id, _)| client_id.as_str() != payload.client_id)
+            .filter_map(|(_, client)| client.active_session_id.clone())
+            .collect::<Vec<_>>();
+        (assigned, claimed)
+    };
 
     let conn = match storage::open_db(&app) {
         Ok(conn) => conn,
         Err(error) => return json_response(500, json!({ "ok": false, "error": error })),
     };
-    let normalized_workspace = normalize_project_path(&canonical_root);
+    let persisted_session_id = match storage::get_ide_workspace_binding(
+        &conn,
+        &payload.client_id,
+        &normalized_workspace,
+    ) {
+        Ok(binding) => binding.map(|binding| binding.session_id),
+        Err(error) => return json_response(500, json!({ "ok": false, "error": error })),
+    };
+    let reconnect_session_id = if runtime_session_id.is_none() && persisted_session_id.is_none() {
+        match (
+            payload.source.as_deref(),
+            payload.installation_id.as_deref(),
+        ) {
+            (Some(source), Some(installation_id)) => {
+                match storage::list_ide_workspace_reconnect_bindings(
+                    &conn,
+                    source,
+                    installation_id,
+                    &normalized_workspace,
+                ) {
+                    Ok(bindings) => available_reconnect_session_id(bindings, &claimed_session_ids),
+                    Err(error) => {
+                        return json_response(500, json!({ "ok": false, "error": error }))
+                    }
+                }
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let assigned_session_id = runtime_session_id
+        .or(persisted_session_id)
+        .or(reconnect_session_id);
     let mut sessions = match storage::list_sessions(&conn) {
         Ok(sessions) => sessions
             .into_iter()
@@ -566,6 +749,39 @@ fn route_workspace_activate(app: AppHandle, request: HttpRequest) -> String {
             .collect::<Vec<_>>(),
         Err(error) => return json_response(500, json!({ "ok": false, "error": error })),
     };
+    if let Some(assigned_session_id) = assigned_session_id.as_deref() {
+        sessions.retain(|session| session.id == assigned_session_id);
+    } else {
+        // A newly connected IDE window owns a fresh conversation even when
+        // another IDE already has a session for the same project directory.
+        sessions.clear();
+    }
+    let assigned_session_id = sessions.first().map(|session| session.id.clone());
+    if let Ok(mut runtime) = runtime_cell().lock() {
+        if let Some(client) = runtime.clients.get_mut(&payload.client_id) {
+            client.active_session_id = assigned_session_id.clone();
+            client.active_workspace_key = assigned_session_id
+                .as_ref()
+                .map(|_| normalized_workspace.clone());
+        }
+    }
+    if let Some(session_id) = assigned_session_id.as_deref() {
+        let binding = storage::IdeWorkspaceBinding {
+            client_id: payload.client_id.clone(),
+            source: payload
+                .source
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            installation_id: payload.installation_id.clone(),
+            instance_id: payload.instance_id.clone(),
+            workspace_key: normalized_workspace.clone(),
+            workspace_root: canonical_root.clone(),
+            session_id: session_id.to_string(),
+        };
+        if let Err(error) = storage::upsert_ide_workspace_binding(&conn, &binding) {
+            return json_response(500, json!({ "ok": false, "error": error }));
+        }
+    }
     sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     let action = resolution_action(sessions.len());
     let state = WorkspaceResolutionState {
@@ -573,13 +789,20 @@ fn route_workspace_activate(app: AppHandle, request: HttpRequest) -> String {
         request_id: Uuid::new_v4().to_string(),
         action: action.to_string(),
         workspace_root: canonical_root,
-        source: Some("vscode".to_string()),
+        client_id: Some(payload.client_id),
+        source: payload.source,
+        display_name: payload.display_name,
+        installation_id: payload.installation_id,
+        instance_id: payload.instance_id,
         busy_reason: None,
-        active_session_id: None,
+        active_session_id: assigned_session_id,
         sessions,
     };
     if let Ok(mut runtime) = runtime_cell().lock() {
         runtime.current = Some(state.clone());
+        runtime
+            .pending_resolutions
+            .insert(state.request_id.clone(), state.clone());
         let roster = snapshot_from(&runtime, now_ms());
         drop(runtime);
         let _ = app.emit(CLIENTS_EVENT, roster);
@@ -608,6 +831,25 @@ fn resolution_action(session_count: usize) -> &'static str {
         1 => "selected",
         _ => "choose",
     }
+}
+
+fn available_reconnect_session_id(
+    bindings: Vec<storage::IdeWorkspaceBinding>,
+    claimed_session_ids: &[String],
+) -> Option<String> {
+    bindings
+        .into_iter()
+        .find(|binding| !claimed_session_ids.contains(&binding.session_id))
+        .map(|binding| binding.session_id)
+}
+
+fn resolution_matches_client_workspace(
+    resolution: &WorkspaceResolutionState,
+    client_id: &str,
+    workspace_key: &str,
+) -> bool {
+    resolution.client_id.as_deref() == Some(client_id)
+        && normalize_project_path(&resolution.workspace_root) == workspace_key
 }
 
 fn route_prompt_references(app: AppHandle, request: HttpRequest) -> String {
@@ -703,19 +945,11 @@ fn canonical_project_path(path: &str) -> Result<String, String> {
 }
 
 fn clean_canonical_path(path: &str) -> String {
-    if cfg!(windows) {
-        if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
-            return format!(r"\\{rest}");
-        }
-        if let Some(rest) = path.strip_prefix(r"\\?\") {
-            return rest.to_string();
-        }
-    }
-    path.to_string()
+    util::clean_windows_verbatim_path(path)
 }
 
 fn normalize_project_path(path: &str) -> String {
-    let mut normalized = path.trim().replace('\\', "/");
+    let mut normalized = util::clean_windows_verbatim_path(path.trim()).replace('\\', "/");
     while normalized.len() > 1 && normalized.ends_with('/') {
         normalized.pop();
     }
@@ -725,6 +959,7 @@ fn normalize_project_path(path: &str) -> String {
     normalized
 }
 
+#[cfg(test)]
 fn project_paths_equal(left: &str, right: &str) -> bool {
     normalize_project_path(left) == normalize_project_path(right)
 }
@@ -1001,6 +1236,10 @@ fn runtime_cell() -> &'static Arc<Mutex<BridgeRuntime>> {
     BRIDGE_RUNTIME.get_or_init(|| Arc::new(Mutex::new(BridgeRuntime::default())))
 }
 
+fn workspace_activation_lock() -> &'static Mutex<()> {
+    WORKSPACE_ACTIVATION_LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1030,9 +1269,13 @@ fn snapshot_from(runtime: &BridgeRuntime, now: u64) -> Vec<ClientSnapshot> {
             let workspace_root = state.workspace_root.clone();
             ClientSnapshot {
                 client_id: client_id.clone(),
+                active_session_id: state.active_session_id.clone(),
                 workspace_name: workspace_root.as_deref().and_then(workspace_name),
                 workspace_root,
                 source: state.source.clone(),
+                display_name: state.display_name.clone(),
+                installation_id: state.installation_id.clone(),
+                instance_id: state.instance_id.clone(),
                 focused: state.focused,
                 last_seen: state.last_seen,
                 online: now.saturating_sub(state.last_seen) <= CLIENT_OFFLINE_MS,
@@ -1081,6 +1324,14 @@ fn spawn_reaper(app: AppHandle) {
                             runtime.owner_client_id = None;
                         }
                     }
+                    let retained_client_ids = runtime.clients.keys().cloned().collect::<Vec<_>>();
+                    runtime.pending_resolutions.retain(|_, resolution| {
+                        resolution
+                            .client_id
+                            .as_ref()
+                            .map(|client_id| retained_client_ids.contains(client_id))
+                            .unwrap_or(true)
+                    });
                 }
                 snapshot_from(&runtime, now)
             };
@@ -1100,6 +1351,10 @@ mod tests {
         let normalized = normalize_project_path(r"C:\Work\Demo\\");
         assert!(!normalized.ends_with('/'));
         assert!(normalized.contains("/Work/") || normalized.contains("/work/"));
+        assert_eq!(
+            normalize_project_path(r"\\?\C:\Work\Demo"),
+            normalize_project_path(r"C:\Work\Demo")
+        );
     }
 
     #[test]
@@ -1153,6 +1408,60 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_never_reuses_a_session_claimed_by_another_live_window() {
+        let binding = |client_id: &str, session_id: &str| storage::IdeWorkspaceBinding {
+            client_id: client_id.to_string(),
+            source: "vscode".to_string(),
+            installation_id: Some("install-a".to_string()),
+            instance_id: Some(client_id.to_string()),
+            workspace_key: "e:/odot".to_string(),
+            workspace_root: "E:/oDot".to_string(),
+            session_id: session_id.to_string(),
+        };
+        let bindings = vec![binding("old-a", "session-a"), binding("old-b", "session-b")];
+
+        assert_eq!(
+            available_reconnect_session_id(bindings, &["session-a".to_string()]).as_deref(),
+            Some("session-b")
+        );
+    }
+
+    #[test]
+    fn pending_resolution_deduplicates_only_the_same_client_and_workspace() {
+        let resolution = WorkspaceResolutionState {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: "request-a".to_string(),
+            action: "created".to_string(),
+            workspace_root: r"C:\Work\Demo".to_string(),
+            client_id: Some("vscode:window-a".to_string()),
+            source: Some("vscode".to_string()),
+            display_name: Some("VS Code".to_string()),
+            installation_id: Some("install-a".to_string()),
+            instance_id: Some("window-a".to_string()),
+            busy_reason: None,
+            active_session_id: None,
+            sessions: Vec::new(),
+        };
+        let workspace_key = normalize_project_path(r"C:\Work\Demo");
+
+        assert!(resolution_matches_client_workspace(
+            &resolution,
+            "vscode:window-a",
+            &workspace_key
+        ));
+        assert!(!resolution_matches_client_workspace(
+            &resolution,
+            "vscode:window-b",
+            &workspace_key
+        ));
+        assert!(!resolution_matches_client_workspace(
+            &resolution,
+            "vscode:window-a",
+            &normalize_project_path(r"C:\Work\Other")
+        ));
+    }
+
+    #[test]
     fn ignores_background_non_owner_and_duplicate_sequences() {
         assert!(!activation_is_allowed(false, false, 2, 1));
         assert!(!activation_is_allowed(true, false, 1, 1));
@@ -1178,7 +1487,9 @@ mod tests {
                 focused: true,
                 workspace_root: Some(r"C:\Work\Fresh".to_string()),
                 source: Some("vscode".to_string()),
+                active_session_id: Some("session-fresh".to_string()),
                 last_seen: now - 2_000,
+                ..ClientState::default()
             },
         );
         runtime.clients.insert(
@@ -1188,7 +1499,9 @@ mod tests {
                 focused: false,
                 workspace_root: Some(r"C:\Work\Stale".to_string()),
                 source: None,
+                active_session_id: None,
                 last_seen: now - (CLIENT_OFFLINE_MS + 5_000),
+                ..ClientState::default()
             },
         );
         let roster = snapshot_from(&runtime, now);
@@ -1197,6 +1510,10 @@ mod tests {
         assert!(roster[0].online);
         assert_eq!(roster[0].workspace_name.as_deref(), Some("Fresh"));
         assert_eq!(roster[0].source.as_deref(), Some("vscode"));
+        assert_eq!(
+            roster[0].active_session_id.as_deref(),
+            Some("session-fresh")
+        );
         let stale = roster.iter().find(|c| c.client_id == "stale").unwrap();
         assert!(!stale.online);
     }

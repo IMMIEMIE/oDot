@@ -1127,6 +1127,8 @@ pub fn normalize_tool_name(name: &str) -> String {
         "bash" => "shell".to_string(),
         "grep" => "search".to_string(),
         "todowrite" => "todo_write".to_string(),
+        "planexit" => "plan_exit".to_string(),
+        "requestmode" => "request_mode".to_string(),
         other => other.to_string(),
     }
 }
